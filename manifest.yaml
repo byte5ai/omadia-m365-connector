@@ -1,0 +1,72 @@
+schema_version: "1"
+
+identity:
+  id: "de.byte5.integration.microsoft365"
+  name: "Microsoft 365 Connector"
+  version: "0.1.0"
+  kind: "integration"
+  domain: "m365"
+  description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
+  authors:
+    - name: "byte5 GmbH"
+      email: "dev@byte5.de"
+      url: "https://byte5.de"
+  license: "Proprietary"
+  categories:
+    - "integration"
+    - "communication"
+
+compat:
+  core: ">=1.0 <2.0"
+  node: ">=20"
+
+lifecycle:
+  entry: "dist/plugin.js"
+
+setup:
+  fields:
+    - key: "microsoft_tenant_id"
+      type: "string"
+      label: "Azure AD Tenant ID"
+      help: "GUID der Tenant-Registration, z.B. 11111111-2222-3333-4444-555555555555."
+      required: true
+      pattern: "^[0-9a-fA-F-]{36}$"
+    - key: "microsoft_app_id"
+      type: "string"
+      label: "App (Client) ID"
+      help: "GUID der Bot-Framework App-Registration."
+      required: true
+      pattern: "^[0-9a-fA-F-]{36}$"
+    - key: "microsoft_app_password"
+      type: "secret"
+      label: "App (Client) Secret"
+      help: "Rotierbar im Azure Portal → App Registration → Certificates & secrets."
+      required: true
+
+playbook:
+  when_to_use: |
+    Wird implizit installiert, wenn ein Microsoft-365-Konsument (Teams-
+    Channel, Calendar-Agent, zukünftig Mail / OneDrive) installiert wird.
+    Endanwender adressieren dieses Paket nicht direkt — es liefert die
+    geteilten Graph-Clients via Service-Registry.
+
+permissions:
+  memory:
+    reads: []
+    writes: []
+  graph:
+    reads: []
+    writes: []
+  network:
+    outbound:
+      - "login.microsoftonline.com"
+      - "graph.microsoft.com"
+  filesystem:
+    scratch: false
+
+integrations:
+  - id: "ms_graph"
+    kind: "http"
+    target: "Microsoft Graph API (App-Credentials + OBO-Token-Flow)"
+    auth_from: "microsoft_app_password"
+    docs: "https://learn.microsoft.com/graph/api/overview"
