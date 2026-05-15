@@ -120,6 +120,63 @@ export class GraphClient {
     };
   }
 
+  /**
+   * Post a Teams Activity Notification (Bell-icon push) into a specific
+   * scope — a Team, a Chat, or a User. Requires the matching
+   * `TeamsActivity.Send.*` permission to be consented on the bot's App
+   * Registration and the activity-type to be declared in the Teams
+   * App-Manifest's `activities.activityTypes[]`.
+   *
+   * Docs:
+   *   /teams/{id}  → TeamsActivity.Send.Group
+   *   /chats/{id}  → TeamsActivity.Send.Chat
+   *   /users/{id}/teamwork → TeamsActivity.Send (User)
+   */
+  async sendActivityNotification(opts: {
+    /**
+     * Graph scope prefix — `/teams/{id}`, `/chats/{id}`, or
+     * `/users/{id}/teamwork`. The caller picks based on which
+     * permission is consented.
+     */
+    scope: string;
+    /** Must match an entry in the App-Manifest's activityTypes. */
+    activityType: string;
+    /** Short text shown under the activity-feed entry. */
+    previewText: string;
+    /** Template-parameter map filled into the activityType's
+     *  templateText placeholders. */
+    templateParameters: ReadonlyArray<{ name: string; value: string }>;
+    /**
+     * Notification topic — either an entity URL (Graph object the user
+     * lands on) or a webUrl (free-form deep link). Teams renders this
+     * as the activity-feed item's destination.
+     */
+    topic: { source: 'entityUrl'; value: string } | { source: 'text'; value: string; webUrl: string };
+  }): Promise<void> {
+    const token = await this.accessToken();
+    const url = `https://graph.microsoft.com/v1.0${opts.scope}/sendActivityNotification`;
+    const body = {
+      topic: opts.topic,
+      activityType: opts.activityType,
+      previewText: { content: opts.previewText },
+      templateParameters: opts.templateParameters,
+    };
+    const response = await this.fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const errBody = await safeBody(response);
+      throw new Error(
+        `graph sendActivityNotification ${String(response.status)} scope=${opts.scope} type=${opts.activityType} body=${truncate(errBody, 300)}`,
+      );
+    }
+  }
+
   private async accessToken(): Promise<string> {
     const now = Date.now();
     const cached = await this.tokenPromise?.catch(() => undefined);
