@@ -1,11 +1,11 @@
 {
   "name": "@omadia/integration-microsoft365",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "description": "Microsoft-Graph-Integration (app-auth client, OBO user-token client, Calendar client, slot cache) for the byte5 Harness. Ships as a kind:integration plugin — provides the 'microsoft365.graph' service (Microsoft365Accessor) consumed by the Teams channel and calendar tools.",
+  "description": "Microsoft-Graph-Integration (app-auth client, OBO user-token client, Calendar client, slot cache) for Omadia. Ships as a kind:integration plugin — provides the 'microsoft365.graph' service (Microsoft365Accessor) consumed by the Teams channel and calendar tools.",
   "license": "MIT",
   "scripts": {
     "build": "tsc",
