@@ -23,6 +23,16 @@ compat:
 lifecycle:
   entry: "dist/plugin.js"
 
+# Builder service-type auto-discovery — see integration-odoo for the full
+# rationale. Registers `microsoft365.graph` into the agent-builder's
+# serviceTypeRegistry on activation so a builder-generated agent can
+# `external_reads` against the Graph accessor without a middleware restart.
+service_types:
+  - service: "microsoft365.graph"
+    type:
+      from: "@omadia/integration-microsoft365"
+      name: "Microsoft365Accessor"
+
 setup:
   guide:
     en: |
