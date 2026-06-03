@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.2.1"
+  version: "0.2.2"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -24,6 +24,60 @@ lifecycle:
   entry: "dist/plugin.js"
 
 setup:
+  guide:
+    en: |
+      ## Get Microsoft 365 credentials
+
+      Register an app in **Microsoft Entra ID** (Azure AD) and grant Microsoft
+      Graph permissions. You need three values: **Tenant ID**, **App (Client)
+      ID**, **App (Client) Secret**. This app is also reused by the Teams channel.
+
+      ### 1. Register the app
+      1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** →
+         **App registrations** → **New registration** → name it → **Register**.
+      2. **Overview** → copy **Directory (tenant) ID** → field **Azure AD Tenant ID**.
+      3. **Overview** → copy **Application (client) ID** → field **App (Client) ID**.
+
+      ### 2. Client secret
+      **Certificates & secrets** → **New client secret** → copy the **Value**
+      immediately (not shown again) → field **App (Client) Secret**.
+
+      ### 3. Graph permissions
+      1. **API permissions** → **Add a permission** → **Microsoft Graph** →
+         **Application permissions**.
+      2. Add what your use case needs (e.g. `Calendars.Read`, `Mail.Read`,
+         `User.Read.All`, `Files.Read.All`).
+      3. Click **Grant admin consent for <Tenant>** (requires an admin).
+
+      > App-only (client-credentials) flow: no user sign-in, access is
+      > tenant-wide within the granted permissions.
+    de: |
+      ## Microsoft-365-Credentials beschaffen
+
+      Registriere eine App in **Microsoft Entra ID** (Azure AD) und vergib
+      Microsoft-Graph-Berechtigungen. Du brauchst drei Werte: **Tenant ID**,
+      **App (Client) ID**, **App (Client) Secret**. Diese App nutzt auch der
+      Teams-Channel.
+
+      ### 1. App registrieren
+      1. [Azure Portal](https://portal.azure.com) → **Microsoft Entra ID** →
+         **App registrations** → **New registration** → benennen → **Register**.
+      2. **Overview** → **Directory (tenant) ID** kopieren → Feld **Azure AD Tenant ID**.
+      3. **Overview** → **Application (client) ID** kopieren → Feld **App (Client) ID**.
+
+      ### 2. Client-Secret
+      **Certificates & secrets** → **New client secret** → den **Value** sofort
+      kopieren (wird nicht erneut angezeigt) → Feld **App (Client) Secret**.
+
+      ### 3. Graph-Berechtigungen
+      1. **API permissions** → **Add a permission** → **Microsoft Graph** →
+         **Application permissions**.
+      2. Je nach Use-Case hinzufügen (z.B. `Calendars.Read`, `Mail.Read`,
+         `User.Read.All`, `Files.Read.All`).
+      3. **Grant admin consent for <Tenant>** klicken (Admin-Rechte nötig).
+
+      > App-Only-Flow (Client-Credentials): keine Benutzer-Anmeldung, Zugriff gilt
+      > mandantenweit im Rahmen der erteilten Berechtigungen.
   fields:
     - key: "microsoft_tenant_id"
       type: "string"
