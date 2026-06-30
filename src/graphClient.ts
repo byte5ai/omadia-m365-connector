@@ -177,6 +177,41 @@ export class GraphClient {
     }
   }
 
+  /**
+   * Resolve a user's primary SMTP email by their AAD object id (app permission `User.Read.All`).
+   * Returns the `mail` field — the addressable SMTP address — and deliberately NOT the
+   * userPrincipalName, which can differ from the real email. null when the user has no mailbox,
+   * the id is unknown, or the read isn't permitted (logged, returns null rather than throwing).
+   * Used by the Teams channel to key a Conductor binding by email even in 1:1 chats, where the
+   * conversation roster does not expose member email.
+   */
+  async getUserMail(aadObjectId: string): Promise<string | null> {
+    const token = await this.accessToken();
+    const url = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(aadObjectId)}?$select=mail,proxyAddresses`;
+    const response = await this.fetchImpl(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      // Bounded: this runs in the Teams hot path (awaited before the chat turn) — a hung Graph/Entra
+      // must never stall the user's first reply. On timeout the fetch rejects → the caller degrades.
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!response.ok) {
+      this.log(`graph getUserMail ${aadObjectId}: ${String(response.status)}`);
+      return null;
+    }
+    const json = (await response.json()) as { mail?: unknown; proxyAddresses?: unknown };
+    if (typeof json.mail === 'string' && json.mail.length > 0) return json.mail;
+    // `mail` is often unpopulated for on-prem-synced users; the primary SMTP is then the
+    // `SMTP:`-prefixed (uppercase = primary) entry in proxyAddresses. `smtp:` are secondary aliases.
+    if (Array.isArray(json.proxyAddresses)) {
+      const primary = json.proxyAddresses.find(
+        (a): a is string => typeof a === 'string' && a.startsWith('SMTP:'),
+      );
+      if (primary) return primary.slice(5);
+    }
+    this.log(`graph getUserMail ${aadObjectId}: 200 but no mail / primary SMTP proxyAddress`);
+    return null;
+  }
+
   private async accessToken(): Promise<string> {
     const now = Date.now();
     const cached = await this.tokenPromise?.catch(() => undefined);
@@ -207,6 +242,8 @@ export class GraphClient {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: params.toString(),
+      // Bounded so a hung Entra token endpoint can't stall a hot-path Graph call (see getUserMail).
+      signal: AbortSignal.timeout(2000),
     });
     if (!response.ok) {
       const body = await safeBody(response);
