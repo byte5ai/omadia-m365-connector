@@ -23,7 +23,9 @@
   },
   "devDependencies": {
     "typescript": "^6.0.2",
-    "@types/node": "^25.6.0"
+    "@types/node": "^25.6.0",
+    "@azure/msal-node": "^2.16.2",
+    "@microsoft/microsoft-graph-client": "^3.0.7"
   },
   "engines": {
     "node": ">=20"

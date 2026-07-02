@@ -19,7 +19,6 @@
     "declarationMap": true,
     "sourceMap": true,
     "composite": true,
-    "baseUrl": ".",
     "paths": {
       "@omadia/plugin-api": ["../odoo-bot/middleware/packages/plugin-api/dist/index.d.ts"]
     }
