@@ -7,6 +7,11 @@
   "types": "dist/index.d.ts",
   "description": "Microsoft-Graph-Integration (app-auth client, OBO user-token client, Calendar client, slot cache) for Omadia. Ships as a kind:integration plugin — provides the 'microsoft365.graph' service (Microsoft365Accessor) consumed by the Teams channel and calendar tools.",
   "license": "MIT",
+  "homepage": "https://github.com/byte5ai/omadia-m365-connector",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/byte5ai/omadia-m365-connector.git"
+  },
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit"
@@ -15,6 +20,10 @@
     "@azure/msal-node": "^2.16.2",
     "@omadia/plugin-api": "*",
     "@microsoft/microsoft-graph-client": "^3.0.7"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2",
+    "@types/node": "^25.6.0"
   },
   "engines": {
     "node": ">=20"
