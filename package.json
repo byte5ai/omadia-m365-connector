@@ -14,7 +14,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "package": "node scripts/build-zip.mjs",
+    "clean": "rm -rf dist out"
   },
   "peerDependencies": {
     "@azure/msal-node": "^2.16.2",
