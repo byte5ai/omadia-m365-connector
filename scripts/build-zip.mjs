@@ -33,13 +33,13 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const pkgRoot = process.cwd();
 
 /** Everything the host needs at runtime. `node_modules` must never be in here. */
-const REQUIRED_FILES = ['manifest.yaml', 'package.json'];
+const REQUIRED_FILES = ['manifest.yaml'];
 const REQUIRED_DIRS = ['dist'];
 const OPTIONAL_FILES = ['README.md', 'LICENSE', 'NOTICE', 'INTEGRATION.md'];
 const OPTIONAL_DIRS = ['assets', 'skills'];
@@ -83,6 +83,21 @@ for (const rel of REQUIRED_FILES) {
   cpSync(src, join(stageDir, rel));
   console.log(`  + ${rel}`);
 }
+
+// --- package.json, without devDependencies ---------------------------------
+// devDependencies are meaningless inside a published artifact — nothing ever
+// installs them from a plugin ZIP — and some of them point at sibling
+// checkouts (`file:../odoo-bot/middleware/...`). Shipping those paths embeds
+// one machine's directory layout in a public artifact, and any host that did
+// run an install against it would fail on a path that exists nowhere but on
+// the machine that cut the release. Every artifact the hub holds today was cut
+// from the monorepo, whose package.json carried no devDependencies at all — so
+// stripping keeps the output matching what has always been published instead
+// of silently changing it on the first release cut from this repo.
+const stagedPkg = { ...pkg };
+delete stagedPkg.devDependencies;
+writeFileSync(join(stageDir, 'package.json'), `${JSON.stringify(stagedPkg, null, 2)}\n`);
+console.log('  + package.json (devDependencies stripped)');
 
 for (const rel of REQUIRED_DIRS) {
   const src = join(pkgRoot, rel);
