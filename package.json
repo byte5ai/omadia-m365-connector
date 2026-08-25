@@ -19,6 +19,9 @@
     "package": "node scripts/build-zip.mjs",
     "clean": "rm -rf dist out .test-build *.tsbuildinfo"
   },
+  "dependencies": {
+    "fflate": "^0.8.3"
+  },
   "peerDependencies": {
     "@azure/msal-node": "^2.16.2",
     "@omadia/plugin-api": "*",
