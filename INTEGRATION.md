@@ -159,6 +159,72 @@ const file = await ms.app.downloadBySharingUrl(sharingUrl);
 // file.body is ArrayBuffer; file.mimeType is the upstream Content-Type.
 ```
 
+## Graph application scopes
+
+Machine-readable list of the Graph **application** permissions this connector
+requests. The baseline set is use-case-driven (see `manifest.yaml`
+`setup.guide`, e.g. `Calendars.Read`, `Mail.Read`, `User.Read.All`,
+`Files.Read.All`); the Teams provisioning capability (`teamsProvisioner@1`,
+spec in [`docs/teams-provisioner.md`](docs/teams-provisioner.md), credentials
+issue [#2](https://github.com/byte5ai/omadia-m365-connector/issues/2))
+extends it by exactly three scopes:
+
+| Scope | Chain step it unlocks |
+|---|---|
+| `Application.ReadWrite.OwnedBy` | `registerApplication` / `addClientSecret` — `POST /applications`, `POST /applications/{id}/addPassword`; per-agent apps stay owned by the connector app |
+| `AppCatalog.ReadWrite.All` | `uploadToCatalog` — `POST /appCatalogs/teamsApps` |
+| `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps` |
+
+### Consent semantics (renewed admin consent)
+
+- Adding any of these scopes to an existing app registration **requires
+  renewed admin consent**: an admin must click **Grant admin consent for
+  &lt;Tenant&gt;** again after the permission change. Consent granted before
+  the change does not cover the new scopes.
+- **Consent sometimes only lands via REST `appRoleAssignments` + restart.**
+  Field-tested failure mode: portal/CLI consent (`az ad app permission
+  admin-consent`) reports success but Graph keeps returning `403`. Fix: grant
+  the app roles directly — `POST
+  /servicePrincipals/{graph-sp-object-id}/appRoleAssignments`
+  (`principalId` = connector SP object id, `appRoleId` = the role id of the
+  missing permission) — then **restart the middleware** so a fresh token is
+  acquired; cached tokens never gain roles retroactively.
+- Missing or unconsented provisioning scopes surface as the typed
+  `ConsentMissingError` (`403`, carries `missingScopes` + `resource`) from
+  `src/teamsProvisioner/errors.ts` — callers get the scope list to render a
+  consent prompt, nobody string-matches Graph error bodies.
+
+### Manifest `setup.guide` wording (handoff to the wiring unit)
+
+`manifest.yaml`'s bilingual `setup.guide` (en **and** de) section
+`### 3. Graph permissions` must gain the following text verbatim — the edit
+itself is executed by the wiring unit so parallel W0b units never collide in
+`manifest.yaml`:
+
+**en** — append after the existing example-permissions step:
+
+> For the Teams provisioning capability (`teamsProvisioner@1`) additionally
+> add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
+> `TeamsAppInstallation.ReadWriteForTeam.All`.
+>
+> Extending an existing app registration requires **renewed admin consent**:
+> click **Grant admin consent for &lt;Tenant&gt;** again. If Graph still
+> answers 403 afterwards, grant the app roles via REST `appRoleAssignments`
+> and restart the middleware — portal/CLI consent sometimes silently fails
+> to apply.
+
+**de** — nach dem bestehenden Beispiel-Berechtigungen-Schritt anfügen:
+
+> Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
+> `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
+> `TeamsAppInstallation.ReadWriteForTeam.All`.
+>
+> Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
+> **erneuten Admin-Consent**: **Grant admin consent for &lt;Tenant&gt;**
+> erneut klicken. Antwortet Graph danach weiterhin mit 403, die App-Rollen
+> per REST `appRoleAssignments` zuweisen und die Middleware neu starten —
+> Portal-/CLI-Consent greift manchmal stillschweigend nicht.
+
 ## Was NICHT geht
 
 - ❌ **Importing the Microsoft Graph SDK directly** (`@microsoft/microsoft-graph-client`)
