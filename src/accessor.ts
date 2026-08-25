@@ -19,6 +19,13 @@ export interface SlotCacheAccessor {
  * Service surface published by `@omadia/integration-microsoft365`
  * under the ServiceRegistry key `microsoft365.graph`.
  *
+ * NOTE: this is one of TWO services the plugin publishes — the per-agent
+ * Teams provisioning surface lives separately as `TeamsProvisionerAccessor`
+ * under the key `teamsProvisioner` (capability `teamsProvisioner@1`, see
+ * `src/teamsProvisioner/index.ts`). Deliberately not folded in here: its
+ * consumers (the middleware agent factory) and permission profile
+ * (`secrets.runtime_write`, ARM egress) differ from the Graph accessor's.
+ *
  * Consumers (Teams channel, calendar tools, future Mail / OneDrive plugins)
  * read from here instead of holding their own Graph-client references:
  *
