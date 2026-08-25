@@ -32,6 +32,39 @@ import type {
   UploadToCatalogInput,
 } from './types.js';
 
+/** Input for the catalog-lookup step ({@link CatalogUploadClient.getCatalogApp}). */
+export interface GetCatalogAppInput {
+  /** Manifest id (`externalId`) of the catalog app to resolve. */
+  readonly teamsAppExternalId: string;
+}
+
+/** Lookup miss — no catalog app carries the requested `externalId`. */
+export interface CatalogAppNotFound {
+  readonly found: false;
+}
+
+/**
+ * Lookup hit. `displayName` / `publishedVersion` are optional on purpose:
+ * a catalog entry can exist (and be installable by `teamsAppId`) while Graph
+ * omits either field, so the lookup never turns a thin-but-real entry into a
+ * miss the way the strict {@link CatalogTeamsApp} parse would.
+ */
+export interface CatalogAppFound {
+  readonly found: true;
+  /** Catalog id (`teamsApp.id`) — what installs reference. */
+  readonly teamsAppId: string;
+  readonly displayName?: string;
+  /**
+   * Manifest version, selected like the upload path: the CURRENT
+   * (`publishingState === 'published'`) appDefinition wins, else the highest
+   * version (numeric-aware dotted compare).
+   */
+  readonly publishedVersion?: string;
+}
+
+/** Result of {@link CatalogUploadClient.getCatalogApp}. */
+export type GetCatalogAppResult = CatalogAppNotFound | CatalogAppFound;
+
 /**
  * Graph APPLICATION permission this step needs. Documented in the
  * scopes/consent unit (`INTEGRATION.md`, `docs/teams-provisioner.md`) —
@@ -135,15 +168,61 @@ export class CatalogUploadClient {
   }
 
   /**
-   * `GET /appCatalogs/teamsApps?$filter=externalId eq '…'` (expanding
-   * `appDefinitions` for the manifest version) — the shared lookup for the
-   * 409 idempotent path and for POST responses too thin to build the result
-   * from. A conflict entry that cannot be found afterwards is an
-   * inconsistency worth failing loudly on, not an outcome.
+   * Resolve an EXISTING catalog app by its manifest id (`externalId`) —
+   * `GET /appCatalogs/teamsApps?$filter=externalId eq '…'`, the same query
+   * (and the same `$expand=appDefinitions` version selection) the 409
+   * idempotent upload path uses, but WITHOUT uploading anything: consumers
+   * that only need the `teamsAppId` of an already-published app (e.g. to
+   * install it into a team) call this instead of round-tripping a package.
+   *
+   * - hit → `{ found: true, teamsAppId, displayName?, publishedVersion? }`
+   * - miss → `{ found: false }` — a plain outcome, never an exception
+   *   (unlike the 409 path, where a vanished entry is an inconsistency).
+   * - 403 → `ConsentMissingError([APP_CATALOG_SCOPE], 'graph')`;
+   *   429 → shared Retry-After backoff → `ProvisioningThrottledError`.
+   */
+  async getCatalogApp(input: GetCatalogAppInput): Promise<GetCatalogAppResult> {
+    const externalId = requireNonEmpty(
+      input.teamsAppExternalId,
+      'teamsAppExternalId',
+    );
+    for (const entry of await this.queryByExternalId(externalId)) {
+      const match = foundCatalogApp(entry, externalId);
+      if (match !== undefined) return match;
+    }
+    this.log(
+      `provisioner appCatalogs.teamsApps.lookup: externalId=${externalId} not in catalog (found=false)`,
+    );
+    return { found: false };
+  }
+
+  /**
+   * The shared lookup for the 409 idempotent path and for POST responses too
+   * thin to build the result from. A conflict entry that cannot be found
+   * afterwards is an inconsistency worth failing loudly on, not an outcome.
    */
   private async resolveByExternalId(
     externalId: string,
   ): Promise<CatalogTeamsApp> {
+    const match = (await this.queryByExternalId(externalId))
+      .map(catalogApp)
+      .find((app) => app !== undefined && app.externalId === externalId);
+    if (match === undefined) {
+      throw new Error(
+        `graph appCatalogs.teamsApps.lookup found no catalog app with externalId=${externalId}`,
+      );
+    }
+    return match;
+  }
+
+  /**
+   * `GET /appCatalogs/teamsApps?$filter=externalId eq '…'` (expanding
+   * `appDefinitions` for the manifest version) — the ONE catalog query behind
+   * both {@link getCatalogApp} and the upload path's re-resolution. OData
+   * string literal escaping (quote doubling) + `encodeURIComponent` keep the
+   * `$filter` injection-safe for arbitrary externalIds.
+   */
+  private async queryByExternalId(externalId: string): Promise<unknown[]> {
     const filter = `externalId eq '${escapeODataString(externalId)}'`;
     const response = await this.http.request({
       resource: 'graph',
@@ -158,22 +237,37 @@ export class CatalogUploadClient {
         `graph appCatalogs.teamsApps.lookup unexpectedly answered ${String(response.status)} for externalId=${externalId}`,
       );
     }
-
-    const match = listEntries(response.json)
-      .map(catalogApp)
-      .find((app) => app !== undefined && app.externalId === externalId);
-    if (match === undefined) {
-      throw new Error(
-        `graph appCatalogs.teamsApps.lookup found no catalog app with externalId=${externalId}`,
-      );
-    }
-    return match;
+    return listEntries(response.json);
   }
 }
 
 /** OData string literal escaping: single quotes double up. */
 function escapeODataString(value: string): string {
   return value.replace(/'/g, "''");
+}
+
+/**
+ * Parse one Graph `teamsApp` into a {@link CatalogAppFound} — lenient on
+ * purpose (only `id` + a matching `externalId` are required); `undefined`
+ * when the entry is not the requested app.
+ */
+function foundCatalogApp(
+  json: unknown,
+  externalId: string,
+): CatalogAppFound | undefined {
+  if (!json || typeof json !== 'object') return undefined;
+  const rec = json as Record<string, unknown>;
+  if (nonEmptyString(rec['externalId']) !== externalId) return undefined;
+  const teamsAppId = nonEmptyString(rec['id']);
+  if (teamsAppId === undefined) return undefined;
+  const displayName = nonEmptyString(rec['displayName']);
+  const publishedVersion = appVersion(rec);
+  return {
+    found: true,
+    teamsAppId,
+    ...(displayName !== undefined ? { displayName } : {}),
+    ...(publishedVersion !== undefined ? { publishedVersion } : {}),
+  };
 }
 
 /** `value` array of a Graph collection response. */

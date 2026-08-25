@@ -408,3 +408,166 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     assert.equal(calls.length, 0);
   });
 });
+
+// getCatalogApp: the upload-free lookup probe — same Graph query (and same
+// published-wins version selection) as the 409 idempotent path, but a miss is
+// a plain { found: false } outcome, never an exception, and no POST happens.
+describe('CatalogUploadClient.getCatalogApp', () => {
+  it('resolves an existing app — published appDefinition wins over other versions', async () => {
+    const { client, calls } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 200,
+        body: {
+          value: [
+            {
+              id: CATALOG_ID,
+              externalId: EXTERNAL_ID,
+              displayName: DISPLAY_NAME,
+              appDefinitions: [
+                { version: '1.0.0', publishingState: 'rejected' },
+                { version: VERSION, publishingState: 'published' },
+                { version: '9.9.9', publishingState: 'submitted' },
+              ],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const result = await client.getCatalogApp({
+      teamsAppExternalId: EXTERNAL_ID,
+    });
+
+    assert.deepEqual(result, {
+      found: true,
+      teamsAppId: CATALOG_ID,
+      displayName: DISPLAY_NAME,
+      publishedVersion: VERSION,
+    });
+
+    // Lookup only — this method must never upload anything.
+    assert.equal(uploadCalls(calls).length, 0);
+    const [lookup] = lookupCalls(calls);
+    assert.ok(lookup, 'expected exactly one GET lookup');
+    assert.ok(lookup.url.includes(`$filter=externalId%20eq%20'${EXTERNAL_ID}'`));
+    assert.ok(lookup.url.includes('$expand=appDefinitions'));
+    assert.ok(lookup.url.includes('publishingState'), '$expand selects publishingState');
+  });
+
+  it('stays a hit when Graph omits displayName and version (lenient parse)', async () => {
+    // The strict CatalogTeamsApp parse would turn this thin-but-real entry
+    // into a miss — the lookup only requires id + matching externalId.
+    const { client } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 200,
+        body: { value: [{ id: CATALOG_ID, externalId: EXTERNAL_ID }] },
+      }),
+    ]);
+
+    const result = await client.getCatalogApp({
+      teamsAppExternalId: EXTERNAL_ID,
+    });
+
+    assert.deepEqual(result, { found: true, teamsAppId: CATALOG_ID });
+  });
+
+  it('answers { found: false } on an empty result — an outcome, not an exception', async () => {
+    const { client, calls } = harness([
+      route(LOOKUP_URL_MATCH, { status: 200, body: { value: [] } }),
+    ]);
+
+    const result = await client.getCatalogApp({
+      teamsAppExternalId: EXTERNAL_ID,
+    });
+
+    assert.deepEqual(result, { found: false });
+    assert.equal(lookupCalls(calls).length, 1);
+    assert.equal(uploadCalls(calls).length, 0);
+  });
+
+  it('ignores entries whose externalId differs (server-side filter not trusted)', async () => {
+    const { client } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 200,
+        body: {
+          value: [
+            { id: 'other-id', externalId: 'someone-else', displayName: 'Other' },
+          ],
+        },
+      }),
+    ]);
+
+    const result = await client.getCatalogApp({
+      teamsAppExternalId: EXTERNAL_ID,
+    });
+    assert.deepEqual(result, { found: false });
+  });
+
+  it("escapes quotes in the externalId (quote doubling + encodeURIComponent) — filter stays injection-safe", async () => {
+    const trickyId = "agent's-app";
+    const { client, calls } = harness([
+      route(LOOKUP_URL_MATCH, { status: 200, body: { value: [] } }),
+    ]);
+
+    const result = await client.getCatalogApp({ teamsAppExternalId: trickyId });
+    assert.deepEqual(result, { found: false });
+
+    const [lookup] = lookupCalls(calls);
+    assert.ok(lookup, 'expected one GET lookup');
+    // encodeURIComponent leaves single quotes as-is, so the doubled quote is
+    // directly visible in the URL: externalId eq 'agent''s-app'.
+    assert.ok(
+      lookup.url.includes("$filter=externalId%20eq%20'agent''s-app'"),
+      `filter must carry the doubled quote, got: ${lookup.url}`,
+    );
+  });
+
+  it('maps 403 to ConsentMissingError carrying the catalog scope (graph)', async () => {
+    const { client } = harness([
+      route(LOOKUP_URL_MATCH, { status: 403, body: { error: { code: 'Forbidden' } } }),
+    ]);
+
+    await assert.rejects(
+      client.getCatalogApp({ teamsAppExternalId: EXTERNAL_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConsentMissingError);
+        assert.ok(err instanceof TeamsProvisionerError);
+        assert.deepEqual(err.missingScopes, [APP_CATALOG_SCOPE]);
+        assert.equal(err.resource, 'graph');
+        return true;
+      },
+    );
+  });
+
+  it('rides the shared 429 backoff and throws ProvisioningThrottledError when exhausted', async () => {
+    const { client, calls, sleeps } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 429,
+        headers: { 'Retry-After': '5' },
+      }),
+    ]);
+
+    await assert.rejects(
+      client.getCatalogApp({ teamsAppExternalId: EXTERNAL_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ProvisioningThrottledError);
+        assert.equal(err.resource, 'graph');
+        assert.equal(err.retryAfterSeconds, 5);
+        return true;
+      },
+    );
+    // max429Retries: 2 → initial attempt + 2 retries, honouring Retry-After.
+    assert.equal(lookupCalls(calls).length, 3);
+    assert.deepEqual(sleeps, [5000, 5000]);
+  });
+
+  it('rejects an empty teamsAppExternalId before any fetch', async () => {
+    const { client, calls } = harness([]);
+
+    await assert.rejects(
+      client.getCatalogApp({ teamsAppExternalId: '  ' }),
+      /invalid_argument: 'teamsAppExternalId'/,
+    );
+    assert.equal(calls.length, 0);
+  });
+});
