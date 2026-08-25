@@ -43,17 +43,64 @@ Graph client via the service registry.
    **Application permissions** → add what your use case needs (e.g.
    `Calendars.Read`, `Mail.Read`, `User.Read.All`, `Files.Read.All`) → **Grant
    admin consent**.
+5. For the Teams provisioning capability (`teamsProvisioner@1` — one bot
+   identity per omadia agent, see
+   [`docs/teams-provisioner.md`](docs/teams-provisioner.md)) additionally add
+   these **application** permissions:
+   - `Application.ReadWrite.OwnedBy` — create the per-agent Entra app
+     registrations and their client secrets (`POST /applications`,
+     `POST /applications/{id}/addPassword`)
+   - `AppCatalog.ReadWrite.All` — upload the generated Teams app packages to
+     the tenant app catalog (`POST /appCatalogs/teamsApps`)
+   - `TeamsAppInstallation.ReadWriteForTeam.All` — install the catalog app
+     into the target team (`POST /teams/{id}/installedApps`)
 
 This is the app-only (client-credentials) flow: no interactive user sign-in;
 access is tenant-wide within the granted permissions. The same app
 registration is reused by the Teams channel plugin.
 
+### Renewed admin consent
+
+Extending the permissions of an **existing** app registration requires
+**renewed admin consent** — previously granted consent does not stretch to
+cover newly added scopes. After every permission change, click **Grant admin
+consent for &lt;Tenant&gt;** again; app-only tokens carry only the app roles
+consented at token-issue time.
+
+Two field-tested gotchas:
+
+- **Portal/CLI consent sometimes silently fails to apply** (observed with
+  `az ad app permission admin-consent`: the command succeeds, Graph keeps
+  answering `403`). In that case grant the app roles directly via REST
+  `appRoleAssignments`, one call per missing permission — on the
+  **connector's own** service principal:
+
+  ```
+  POST /servicePrincipals/{connector-sp-object-id}/appRoleAssignments
+  {
+    "principalId": "{connector-sp-object-id}",
+    "resourceId":  "{graph-sp-object-id}",
+    "appRoleId":   "{app-role-id-of-the-missing-permission}"
+  }
+  ```
+
+  The Microsoft Graph service principal's object id (`resourceId`) is
+  resolved via
+  `GET /servicePrincipals(appId='00000003-0000-0000-c000-000000000000')`.
+  Verify with `GET
+  /servicePrincipals/{connector-sp-object-id}/appRoleAssignments`.
+- **Restart after consent.** Acquired tokens are cached; newly consented
+  roles only appear in a *fresh* token. Restart the middleware (or wait for
+  token expiry) after granting consent, otherwise the `403`s persist even
+  though consent is in place.
+
 ## Build & install
 
 ```bash
 npm install
-npm run typecheck   # tsc --noEmit
+npm run typecheck   # tsc --noEmit (src) + tsc -p tsconfig.tests.json (tests incl. type-level assertions)
 npm run build        # tsc
+npm test             # esbuild-transpiled node:test suite (scripts/test.mjs)
 ```
 
 `@omadia/plugin-api` is a **peer dependency**, provided by the omadia host at

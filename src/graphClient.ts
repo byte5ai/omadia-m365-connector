@@ -19,6 +19,115 @@ export interface GraphClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/** Default scope for app-only Graph tokens (client-credentials flow). */
+export const GRAPH_TOKEN_SCOPE = 'https://graph.microsoft.com/.default';
+
+/** An AAD client-credentials identity (client-secret flow). */
+export interface AadClientCredential {
+  readonly tenantId: string;
+  readonly clientId: string;
+  readonly clientSecret: string;
+}
+
+/** One token request against the v2 client-credentials endpoint. */
+export interface AadTokenRequest extends AadClientCredential {
+  /** Resource audience, e.g. {@link GRAPH_TOKEN_SCOPE} or `https://management.azure.com/.default`. */
+  readonly scope: string;
+  /**
+   * Budget for the token POST. Defaults to 2000 ms — the Teams hot-path
+   * precedent (see `getUserMail`); background flows (provisioning) pass a
+   * longer budget.
+   */
+  readonly timeoutMs?: number;
+}
+
+const TOKEN_EXPIRY_SLACK_MS = 60_000;
+const DEFAULT_TOKEN_TIMEOUT_MS = 2000;
+
+/**
+ * In-process client-credentials token cache, keyed per
+ * (tenantId, clientId, scope) so one instance can serve multiple audiences
+ * (Graph + ARM) and multiple identities (connector app vs. dedicated ARM
+ * service principal). Single-flight per key; entries refresh 60 s before
+ * expiry; a failed fetch clears its entry so the next call retries.
+ *
+ * Generalisation of the former `GraphClient`-private single-token cache —
+ * `GraphClient` now delegates here with the Graph scope.
+ */
+export class AadTokenCache {
+  private readonly fetchImpl: typeof fetch;
+  private readonly cache = new Map<
+    string,
+    Promise<{ token: string; expiresAt: number }>
+  >();
+
+  constructor(opts?: { fetchImpl?: typeof fetch }) {
+    this.fetchImpl = opts?.fetchImpl ?? fetch;
+  }
+
+  async accessToken(req: AadTokenRequest): Promise<string> {
+    const key = `${req.tenantId}\u0000${req.clientId}\u0000${req.scope}`;
+    const now = Date.now();
+    const pending = this.cache.get(key);
+    if (pending) {
+      const cached = await pending.catch(() => undefined);
+      if (cached && cached.expiresAt - TOKEN_EXPIRY_SLACK_MS > now) {
+        return cached.token;
+      }
+    }
+    const fresh = this.fetchToken(req);
+    this.cache.set(key, fresh);
+    try {
+      return (await fresh).token;
+    } catch (err) {
+      this.cache.delete(key);
+      throw err;
+    }
+  }
+
+  private async fetchToken(req: AadTokenRequest): Promise<{
+    token: string;
+    expiresAt: number;
+  }> {
+    const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(req.tenantId)}/oauth2/v2.0/token`;
+    const params = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: req.clientId,
+      client_secret: req.clientSecret,
+      scope: req.scope,
+    });
+    const response = await this.fetchImpl(tokenUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+      // Bounded so a hung Entra token endpoint can't stall the caller (see getUserMail).
+      signal: AbortSignal.timeout(req.timeoutMs ?? DEFAULT_TOKEN_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const body = await safeBody(response);
+      // NEVER include client_secret (or the params string) here.
+      throw new Error(
+        `aad token ${String(response.status)} scope=${req.scope} body=${truncate(body, 200)}`,
+      );
+    }
+    const json = (await response.json()) as {
+      access_token?: unknown;
+      expires_in?: unknown;
+    };
+    if (typeof json.access_token !== 'string' || json.access_token.length === 0) {
+      throw new Error(`aad token: no access_token in response scope=${req.scope}`);
+    }
+    const expiresInSec =
+      typeof json.expires_in === 'number' && Number.isFinite(json.expires_in)
+        ? json.expires_in
+        : 3600;
+    return {
+      token: json.access_token,
+      expiresAt: Date.now() + expiresInSec * 1000,
+    };
+  }
+}
+
 export class GraphClient {
   private readonly tenantId: string;
   private readonly clientId: string;
@@ -26,7 +135,7 @@ export class GraphClient {
   private readonly log: (msg: string) => void;
   private readonly fetchImpl: typeof fetch;
 
-  private tokenPromise: Promise<{ token: string; expiresAt: number }> | undefined;
+  private readonly tokens: AadTokenCache;
 
   constructor(opts: GraphClientOptions) {
     this.tenantId = opts.tenantId;
@@ -38,6 +147,7 @@ export class GraphClient {
         console.error(msg);
       });
     this.fetchImpl = opts.fetchImpl ?? fetch;
+    this.tokens = new AadTokenCache({ fetchImpl: this.fetchImpl });
   }
 
   /**
@@ -213,59 +323,13 @@ export class GraphClient {
   }
 
   private async accessToken(): Promise<string> {
-    const now = Date.now();
-    const cached = await this.tokenPromise?.catch(() => undefined);
-    if (cached && cached.expiresAt - 60_000 > now) return cached.token;
-
-    this.tokenPromise = this.fetchAccessToken();
-    try {
-      const fresh = await this.tokenPromise;
-      return fresh.token;
-    } catch (err) {
-      this.tokenPromise = undefined;
-      throw err;
-    }
-  }
-
-  private async fetchAccessToken(): Promise<{
-    token: string;
-    expiresAt: number;
-  }> {
-    const tokenUrl = `https://login.microsoftonline.com/${encodeURIComponent(this.tenantId)}/oauth2/v2.0/token`;
-    const params = new URLSearchParams({
-      grant_type: 'client_credentials',
-      client_id: this.clientId,
-      client_secret: this.clientSecret,
-      scope: 'https://graph.microsoft.com/.default',
+    // Hot-path default budget (2000 ms) — see AadTokenRequest.timeoutMs.
+    return this.tokens.accessToken({
+      tenantId: this.tenantId,
+      clientId: this.clientId,
+      clientSecret: this.clientSecret,
+      scope: GRAPH_TOKEN_SCOPE,
     });
-    const response = await this.fetchImpl(tokenUrl, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-      // Bounded so a hung Entra token endpoint can't stall a hot-path Graph call (see getUserMail).
-      signal: AbortSignal.timeout(2000),
-    });
-    if (!response.ok) {
-      const body = await safeBody(response);
-      throw new Error(
-        `graph token ${String(response.status)} body=${truncate(body, 200)}`,
-      );
-    }
-    const json = (await response.json()) as {
-      access_token?: unknown;
-      expires_in?: unknown;
-    };
-    if (typeof json.access_token !== 'string' || json.access_token.length === 0) {
-      throw new Error('graph token: no access_token in response');
-    }
-    const expiresInSec =
-      typeof json.expires_in === 'number' && Number.isFinite(json.expires_in)
-        ? json.expires_in
-        : 3600;
-    return {
-      token: json.access_token,
-      expiresAt: Date.now() + expiresInSec * 1000,
-    };
   }
 }
 
@@ -319,7 +383,8 @@ export function encodeSharingUrl(url: string): string {
   return `u!${b64url}`;
 }
 
-async function safeBody(response: Response): Promise<string> {
+/** Read a response body for an error message, tolerating unreadable bodies. */
+export async function safeBody(response: Response): Promise<string> {
   try {
     return await response.text();
   } catch {
@@ -343,7 +408,8 @@ function fileNameFromDisposition(header: string | null): string | undefined {
   return undefined;
 }
 
-function truncate(value: string, max: number): string {
+/** Bound a string for error messages (never dump full API bodies). */
+export function truncate(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
 }

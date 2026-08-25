@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.2.4"
+  version: "0.3.0"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -32,6 +32,20 @@ service_types:
     type:
       from: "@omadia/integration-microsoft365"
       name: "Microsoft365Accessor"
+  # teamsProvisioner@1 (epic byte5ai/omadia#860) — per-agent Teams bot
+  # provisioning (Entra app + Azure bot + app package + catalog + team
+  # install). The registry key is the BARE name; the versioned form lives in
+  # `provides:` below. Consumed by the middleware agent factory.
+  - service: "teamsProvisioner"
+    type:
+      from: "@omadia/integration-microsoft365"
+      name: "TeamsProvisionerAccessor"
+
+# Capability announcement for the resolver — the versioned manifest ref of
+# the `teamsProvisioner` service above (two-constant split, see
+# src/teamsProvisioner/types.ts).
+provides:
+  - "teamsProvisioner@1"
 
 setup:
   guide:
@@ -58,6 +72,16 @@ setup:
       2. Add what your use case needs (e.g. `Calendars.Read`, `Mail.Read`,
          `User.Read.All`, `Files.Read.All`).
       3. Click **Grant admin consent for <Tenant>** (requires an admin).
+
+      For the Teams provisioning capability (`teamsProvisioner@1`) additionally
+      add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
+      `TeamsAppInstallation.ReadWriteForTeam.All`.
+
+      Extending an existing app registration requires **renewed admin consent**:
+      click **Grant admin consent for <Tenant>** again. If Graph still
+      answers 403 afterwards, grant the app roles via REST `appRoleAssignments`
+      and restart the middleware — portal/CLI consent sometimes silently fails
+      to apply.
 
       > App-only (client-credentials) flow: no user sign-in, access is
       > tenant-wide within the granted permissions.
@@ -86,6 +110,16 @@ setup:
          `User.Read.All`, `Files.Read.All`).
       3. **Grant admin consent for <Tenant>** klicken (Admin-Rechte nötig).
 
+      Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
+      `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
+      `TeamsAppInstallation.ReadWriteForTeam.All`.
+
+      Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
+      **erneuten Admin-Consent**: **Grant admin consent for <Tenant>**
+      erneut klicken. Antwortet Graph danach weiterhin mit 403, die App-Rollen
+      per REST `appRoleAssignments` zuweisen und die Middleware neu starten —
+      Portal-/CLI-Consent greift manchmal stillschweigend nicht.
+
       > App-Only-Flow (Client-Credentials): keine Benutzer-Anmeldung, Zugriff gilt
       > mandantenweit im Rahmen der erteilten Berechtigungen.
   fields:
@@ -106,6 +140,40 @@ setup:
       label: "App (Client) Secret"
       help: "Rotierbar im Azure Portal → App Registration → Certificates & secrets."
       required: true
+    # --- teamsProvisioner@1: OPTIONAL ARM fields ---------------------------
+    # Verbatim from TEAMS_PROVISIONER_ARM_SETUP_FIELDS in
+    # src/teamsProvisioner/config.ts (arm-config unit). ALL optional: absence
+    # degrades the capability to registration-only mode (no automatic Azure
+    # bot creation) — it never breaks activation or existing installs.
+    - key: "azure_subscription_id"
+      type: "string"
+      label: "Azure Subscription ID"
+      help: "GUID der Azure-Subscription, in der die Azure-Bot-Ressourcen angelegt werden. Leer lassen für Registration-only-Modus (kein automatisches Bot-Provisioning)."
+      required: false
+      pattern: "^[0-9a-fA-F-]{36}$"
+    - key: "azure_resource_group"
+      type: "string"
+      label: "Azure Resource Group"
+      help: "Name der Resource Group für Microsoft.BotService/botServices. Leer lassen für Registration-only-Modus."
+      required: false
+      pattern: "^[-A-Za-z0-9_.()]{1,90}$"
+    - key: "azure_region"
+      type: "string"
+      label: "Azure Region"
+      help: "ARM-Location der Bot-Ressourcen, für Azure Bot Services üblicherweise 'global'. Leer lassen für Registration-only-Modus."
+      required: false
+      pattern: "^[a-z0-9]{2,32}$"
+    - key: "azure_sp_client_id"
+      type: "string"
+      label: "ARM Service Principal Client ID"
+      help: "Client-ID eines dedizierten Service Principals für management.azure.com. Leer lassen, um die Bot-Framework-App (App (Client) ID + Secret) für ARM wiederzuverwenden."
+      required: false
+      pattern: "^[0-9a-fA-F-]{36}$"
+    - key: "azure_sp_client_secret"
+      type: "secret"
+      label: "ARM Service Principal Client Secret"
+      help: "Client-Secret des dedizierten ARM Service Principals. Leer lassen, um das App (Client) Secret der Bot-Framework-App wiederzuverwenden."
+      required: false
 
 playbook:
   when_to_use: |
@@ -125,8 +193,18 @@ permissions:
     outbound:
       - "login.microsoftonline.com"
       - "graph.microsoft.com"
+      # teamsProvisioner@1 — ARM REST (Microsoft.BotService). Without this
+      # entry the Azure-bot step's egress is denied.
+      - "management.azure.com"
   filesystem:
     scratch: false
+  # teamsProvisioner@1 — the app-registration step persists each generated
+  # bot app password into THIS plugin's vault namespace
+  # (`teams_bot_password:<appId>`, see src/teamsProvisioner/secretStore.ts)
+  # and returns only the opaque secretRef across the service boundary.
+  # Requires the write-capable ctx.secrets (Spec 004).
+  secrets:
+    runtime_write: true
 
 integrations:
   - id: "ms_graph"
@@ -134,3 +212,8 @@ integrations:
     target: "Microsoft Graph API (App-Credentials + OBO-Token-Flow)"
     auth_from: "microsoft_app_password"
     docs: "https://learn.microsoft.com/graph/api/overview"
+  - id: "azure_arm_botservice"
+    kind: "http"
+    target: "Azure Resource Manager (Microsoft.BotService, teamsProvisioner@1 — optional, Registration-only-Modus ohne ARM-Konfiguration)"
+    auth_from: "azure_sp_client_secret"
+    docs: "https://learn.microsoft.com/rest/api/botservice/"
