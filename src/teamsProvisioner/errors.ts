@@ -96,3 +96,25 @@ export class ArmNotConfiguredError extends TeamsProvisionerError {
     this.missingSetupFields = missingSetupFields;
   }
 }
+
+/**
+ * Thrown when a runtime secret write/delete is attempted but the kernel did
+ * not hand out `secrets.set` / `secrets.delete` — i.e. the manifest does not
+ * declare `permissions.secrets.runtime_write` (or the kernel predates
+ * Spec 004). Carries the manifest permission to declare so the operator/dev
+ * message is actionable. Fourth member of the taxonomy (added by the
+ * secret-store unit; the spec's original three classes cover the network
+ * paths, this one covers the vault capability gate).
+ */
+export class CapabilityUnavailableError extends TeamsProvisionerError {
+  /** The manifest permission whose absence caused this. */
+  public readonly missingPermission = 'permissions.secrets.runtime_write';
+  /** Which vault operation was attempted. */
+  public readonly operation: 'set' | 'delete';
+
+  constructor(operation: 'set' | 'delete') {
+    super('capability_unavailable');
+    this.name = 'CapabilityUnavailableError';
+    this.operation = operation;
+  }
+}

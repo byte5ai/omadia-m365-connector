@@ -148,7 +148,7 @@ export class CatalogUploadClient {
     const response = await this.http.request({
       resource: 'graph',
       method: 'GET',
-      url: `${GRAPH_BASE}/appCatalogs/teamsApps?$filter=${encodeURIComponent(filter)}&$expand=appDefinitions($select=version)`,
+      url: `${GRAPH_BASE}/appCatalogs/teamsApps?$filter=${encodeURIComponent(filter)}&$expand=appDefinitions($select=version,publishingState)`,
       step: 'appCatalogs.teamsApps.lookup',
       missingScopesOn403: [APP_CATALOG_SCOPE],
     });
@@ -199,20 +199,54 @@ function catalogApp(json: unknown): CatalogTeamsApp | undefined {
   return { teamsAppId, externalId, displayName, version };
 }
 
-/** Manifest version — from the expanded `appDefinitions`, else top-level. */
+/**
+ * Manifest version — from the expanded `appDefinitions`, else top-level.
+ *
+ * `appDefinitions` holds one entry PER PUBLISHED VERSION of the app, in an
+ * order Graph does not guarantee — taking "the first entry with a version"
+ * would silently report a stale/arbitrary version on the 409 idempotent
+ * path. Selection is therefore deterministic: the CURRENT (`publishingState
+ * === 'published'`) definition wins; when none is marked published, the
+ * highest version (numeric-aware dotted compare) is used.
+ */
 function appVersion(rec: Record<string, unknown>): string | undefined {
   const definitions = rec['appDefinitions'];
   if (Array.isArray(definitions)) {
+    const candidates: { version: string; publishingState: string | undefined }[] =
+      [];
     for (const definition of definitions) {
-      if (definition && typeof definition === 'object') {
-        const version = nonEmptyString(
-          (definition as Record<string, unknown>)['version'],
-        );
-        if (version !== undefined) return version;
-      }
+      if (definition === null || typeof definition !== 'object') continue;
+      const entry = definition as Record<string, unknown>;
+      const version = nonEmptyString(entry['version']);
+      if (version === undefined) continue;
+      candidates.push({
+        version,
+        publishingState: nonEmptyString(entry['publishingState']),
+      });
     }
+    const published = candidates.find(
+      (candidate) => candidate.publishingState === 'published',
+    );
+    if (published !== undefined) return published.version;
+    const highest = [...candidates]
+      .sort((a, b) => compareDottedVersions(a.version, b.version))
+      .pop();
+    if (highest !== undefined) return highest.version;
   }
   return nonEmptyString(rec['version']);
+}
+
+/** Numeric-aware dotted-version compare (`1.10.0` > `1.9.9`); ascending. */
+function compareDottedVersions(a: string, b: string): number {
+  const partsA = a.split('.');
+  const partsB = b.split('.');
+  const length = Math.max(partsA.length, partsB.length);
+  for (let i = 0; i < length; i += 1) {
+    const numA = Number.parseInt(partsA[i] ?? '0', 10) || 0;
+    const numB = Number.parseInt(partsB[i] ?? '0', 10) || 0;
+    if (numA !== numB) return numA - numB;
+  }
+  return a.localeCompare(b);
 }
 
 function nonEmptyString(value: unknown): string | undefined {

@@ -9,6 +9,7 @@ import {
   type AzureBot,
   type BotProvisioningOutcome,
   type Idempotent,
+  type SignInAudience,
   type TenantMode,
 } from '../src/teamsProvisioner/types.js';
 import {
@@ -37,6 +38,25 @@ describe('teamsProvisioner@1 constants', () => {
     assert.equal(SINGLE_TENANT_SIGN_IN_AUDIENCE, 'AzureADMyOrg');
     const modes: readonly TenantMode[] = ['customer', 'home'];
     assert.deepEqual(modes, ['customer', 'home']);
+  });
+
+  it('makes MultiTenant UNEXPRESSIBLE — enforced by the typecheck gate', () => {
+    // TYPE-LEVEL negative assertions. `npm run typecheck` compiles tests/
+    // through tsconfig.tests.json, so each line below can genuinely fail:
+    // if SignInAudience or TenantMode ever gains a wider member, the
+    // corresponding @ts-expect-error becomes UNUSED and tsc errors the gate.
+    // (`npm test` alone would not catch this — esbuild erases types.)
+
+    // @ts-expect-error 'AzureADMultipleOrgs' must never be assignable to SignInAudience
+    const multiTenant: SignInAudience = 'AzureADMultipleOrgs';
+    // @ts-expect-error consumer accounts are equally out of scope
+    const consumer: SignInAudience = 'AzureADandPersonalMicrosoftAccount';
+    // @ts-expect-error TenantMode must not gain a 'multi-tenant' member
+    const mode: TenantMode = 'multi-tenant';
+
+    // The runtime values exist (types are erased) — only the annotations
+    // above carry the assertion. Keep the variables referenced.
+    assert.ok([multiTenant, consumer, mode].every((v) => typeof v === 'string'));
   });
 });
 

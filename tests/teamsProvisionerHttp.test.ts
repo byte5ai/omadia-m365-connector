@@ -62,7 +62,7 @@ function makeResponse(spec: ResponseSpec): Response {
  */
 function mockFetch(routes: Route[], calls: FetchCall[]): typeof fetch {
   const queues = routes.map((r) => ({ ...r, next: 0 }));
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, ...(init ? { init } : {}) });
     if (url.includes('login.microsoftonline.com')) {
@@ -354,6 +354,50 @@ describe('ProvisioningHttp 429 backoff', () => {
     assert.deepEqual(sleeps, [1000, 2000]);
   });
 
+  it('a Retry-After beyond the 60s cap aborts typed instead of sleeping for hours', async () => {
+    // Graph/ARM can hint 'come back tomorrow' (Retry-After: 86400). An
+    // unbounded await inside the provisioning job would hang it for a day —
+    // the cap turns that into the typed reschedule signal, carrying the full
+    // hint for the job runner.
+    const { http, sleeps } = harness([
+      route('/applications', {
+        status: 429,
+        body: {},
+        headers: { 'Retry-After': '86400' },
+      }),
+    ]);
+    const err = await rejection(http.request(CREATE_APP));
+    assert.ok(err instanceof ProvisioningThrottledError);
+    assert.equal(err.retryAfterSeconds, 86400, 'full hint preserved for rescheduling');
+    assert.deepEqual(sleeps, [], 'no multi-hour sleep may be awaited');
+  });
+
+  it('clamps long-running poll pacing hints to the backoff cap', async () => {
+    const OP_URL = 'https://management.azure.com/operations/op-clamp';
+    const { http, sleeps } = harness(
+      [
+        route(
+          '/operations/op-clamp',
+          { status: 202, headers: { 'Retry-After': '86400' } },
+          { status: 200, body: { status: 'Succeeded' } },
+        ),
+        route(
+          'botServices/omadia-agent-hr',
+          { status: 202, headers: { 'Azure-AsyncOperation': OP_URL } },
+          { status: 200, body: { name: 'omadia-agent-hr' } },
+        ),
+      ],
+      { pollIntervalMs: 50 },
+    );
+    const result = await http.request(PUT_BOT);
+    assert.equal(result.kind, 'ok');
+    assert.deepEqual(
+      sleeps,
+      [50, 60_000],
+      'the 86400s pacing hint is clamped to the 60s cap',
+    );
+  });
+
   it('exhausted budget → ProvisioningThrottledError with resource + Retry-After hint', async () => {
     const { http, calls, sleeps } = harness(
       [route('management.azure.com', { status: 429, headers: { 'Retry-After': '3' } })],
@@ -371,10 +415,21 @@ describe('ProvisioningHttp 429 backoff', () => {
 describe('ProvisioningHttp ARM long-running poll mode', () => {
   const OP_URL = 'https://management.azure.com/operations/op-1';
 
-  it('201 + Azure-AsyncOperation → polls until Succeeded, returns the PUT body', async () => {
+  it('201 + Azure-AsyncOperation → polls until Succeeded, re-reads the finished resource', async () => {
+    // The PUT answers with the MID-PROVISIONING representation; returning it
+    // after the operation succeeded would hand callers a stale body (empty
+    // endpoint, provisioningState 'Creating'). The finished resource must be
+    // re-read once the operation reports Succeeded.
     const putBody = {
       name: 'omadia-agent-hr',
-      properties: { provisioningState: 'Creating' },
+      properties: { provisioningState: 'Creating', endpoint: '' },
+    };
+    const finishedBody = {
+      name: 'omadia-agent-hr',
+      properties: {
+        provisioningState: 'Succeeded',
+        endpoint: 'https://example.invalid/api/teams/messages/hr',
+      },
     };
     const { http, calls, sleeps } = harness(
       [
@@ -383,20 +438,63 @@ describe('ProvisioningHttp ARM long-running poll mode', () => {
           { status: 200, body: { status: 'InProgress' } },
           { status: 200, body: { status: 'Succeeded' } },
         ),
-        route('botServices/omadia-agent-hr', {
-          status: 201,
-          body: putBody,
-          headers: { 'Azure-AsyncOperation': OP_URL },
-        }),
+        route(
+          'botServices/omadia-agent-hr',
+          {
+            status: 201,
+            body: putBody,
+            headers: { 'Azure-AsyncOperation': OP_URL },
+          },
+          { status: 200, body: finishedBody },
+        ),
       ],
       { pollIntervalMs: 50 },
     );
     const result = await http.request(PUT_BOT);
     assert.equal(result.kind, 'ok');
     assert.equal(result.status, 201);
-    assert.deepEqual(result.json, putBody);
+    assert.deepEqual(
+      result.json,
+      finishedBody,
+      'the stale pre-poll PUT body must not be returned after the poll',
+    );
     assert.equal(calls.filter((c) => c.url.includes('/operations/op-1')).length, 2);
+    const botCalls = calls.filter((c) => c.url.includes('botServices'));
+    assert.equal(botCalls.length, 2, 'PUT + final re-read GET');
+    assert.equal(botCalls[1]?.init?.method, 'GET');
     assert.deepEqual(sleeps, [50, 50]);
+  });
+
+  it('202 with only a Location header polls the resource shape until terminal', async () => {
+    // ARM's operation-results (Location) endpoint returns the RESOURCE
+    // representation (properties.provisioningState), never a top-level
+    // `status` — selecting the operation-status parser here would poll
+    // forever (major review finding of the http unit).
+    const done = {
+      name: 'omadia-agent-hr',
+      properties: { provisioningState: 'Succeeded' },
+    };
+    const { http, calls } = harness(
+      [
+        route(
+          '/operationresults/loc-1',
+          { status: 200, body: { properties: { provisioningState: 'Creating' } } },
+          { status: 200, body: done },
+        ),
+        route('botServices/omadia-agent-hr', {
+          status: 202,
+          headers: { Location: 'https://management.azure.com/operationresults/loc-1' },
+        }),
+      ],
+      { pollIntervalMs: 5 },
+    );
+    const result = await http.request(PUT_BOT);
+    assert.equal(result.kind, 'ok');
+    assert.deepEqual(result.json, done, 'the Location poll body is the fresh resource');
+    assert.equal(
+      calls.filter((c) => c.url.includes('/operationresults/loc-1')).length,
+      2,
+    );
   });
 
   it('honours Retry-After pacing hints from the 202 and from interim polls', async () => {

@@ -59,6 +59,15 @@ Registration itself (plugin wiring, `src/index.ts` barrel export, manifest
 
 plus two readonly probes: `tenantMode` and `canCreateBots`.
 
+> **Superseded at implementation time.** The SHIPPED service surface is
+> `TeamsProvisionerAccessor` (`src/teamsProvisioner/index.ts`): register-app +
+> add-secret became ONE rolled-back step (`createAppRegistration`) and only
+> the opaque vault `secretRef` (`teams_bot_password:<appId>`) — never
+> `AppClientSecret.secretText` — crosses the service boundary. The sketch
+> above is kept (and exported `@deprecated`) as the reviewed historical
+> contract; resolve the service as
+> `ctx.services.get<TeamsProvisionerAccessor>('teamsProvisioner')`.
+
 ### Idempotency — 409 is not an error
 
 Steps that can hit "already exists" on re-runs (catalog upload via
@@ -83,8 +92,9 @@ snake_case messages). Base class `TeamsProvisionerError` for catch-all.
 | Error | When | Carries |
 |---|---|---|
 | `ConsentMissingError` | Graph/ARM 403, permission or admin consent missing | `missingScopes`, `resource: 'graph' \| 'arm'` — so the middleware factory can fall back (deep-link consent card) |
-| `ProvisioningThrottledError` | 429 backoff budget exhausted | `retryAfterSeconds?`, `resource` |
+| `ProvisioningThrottledError` | 429 backoff budget exhausted, or a Retry-After hint beyond the 60 s backoff cap | `retryAfterSeconds?`, `resource` |
 | `ArmNotConfiguredError` | ARM step demanded while setup fields missing | `missingSetupFields` |
+| `CapabilityUnavailableError` | Vault write/delete attempted but the kernel did not hand out `secrets.set`/`secrets.delete` (manifest lacks `permissions.secrets.runtime_write`) | `missingPermission`, `operation: 'set' \| 'delete'` |
 
 Anything else propagates verbatim (matching `GraphOboClient`). ⚠️ Name
 collision by design: `graphObo.ts` already exports `ConsentRequiredError`

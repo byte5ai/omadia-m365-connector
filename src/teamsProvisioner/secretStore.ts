@@ -30,7 +30,7 @@
 
 import type { SecretsAccessor } from '@omadia/plugin-api';
 
-import { TeamsProvisionerError } from './errors.js';
+import { CapabilityUnavailableError } from './errors.js';
 
 /** Vault-key prefix for provisioned bot app passwords. */
 export const TEAMS_BOT_PASSWORD_SECRET_PREFIX = 'teams_bot_password';
@@ -43,26 +43,10 @@ export const TEAMS_BOT_PASSWORD_SECRET_PREFIX = 'teams_bot_password';
 export type TeamsBotPasswordSecretRef =
   `${typeof TEAMS_BOT_PASSWORD_SECRET_PREFIX}:${string}`;
 
-/**
- * Thrown when a runtime secret write/delete is attempted but the kernel did
- * not hand out `secrets.set` / `secrets.delete` — i.e. the manifest does not
- * declare `permissions.secrets.runtime_write` (or the kernel predates
- * Spec 004). Carries the manifest permission to declare so the operator/dev
- * message is actionable. Part of the `TeamsProvisionerError` taxonomy for
- * the one-`instanceof` catch-all.
- */
-export class CapabilityUnavailableError extends TeamsProvisionerError {
-  /** The manifest permission whose absence caused this. */
-  public readonly missingPermission = 'permissions.secrets.runtime_write';
-  /** Which vault operation was attempted. */
-  public readonly operation: 'set' | 'delete';
-
-  constructor(operation: 'set' | 'delete') {
-    super('capability_unavailable');
-    this.name = 'CapabilityUnavailableError';
-    this.operation = operation;
-  }
-}
+// CapabilityUnavailableError lives in `errors.ts` — the taxonomy home (the
+// spec fixes errors.ts as where every TeamsProvisionerError subclass is
+// defined). Re-exported here so vault-focused callers keep one import site.
+export { CapabilityUnavailableError } from './errors.js';
 
 /**
  * Deterministic vault key for an Entra app's bot password. Same `appId` in →

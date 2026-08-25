@@ -121,7 +121,11 @@ export const TEAMS_PROVISIONER_ARM_SETUP_FIELDS: readonly TeamsProvisionerSetupF
         'Name der Resource Group für Microsoft.BotService/botServices. ' +
         'Leer lassen für Registration-only-Modus.',
       required: false,
-      pattern: '^[-\\w._()]{1,90}$',
+      // Backslash-free on purpose: this literal is copied into manifest.yaml
+      // (double-quoted YAML style), where a bare `\w` escape is a parse error
+      // that would render the WHOLE manifest unloadable. The explicit class
+      // covers the same ASCII set `\w` does.
+      pattern: '^[-A-Za-z0-9_.()]{1,90}$',
     },
     {
       key: AZURE_REGION_FIELD,

@@ -60,7 +60,7 @@ function makeResponse(spec: ResponseSpec): Response {
 /** Route table with per-route response queues (last entry repeats). */
 function mockFetch(routes: Route[], calls: FetchCall[]): typeof fetch {
   const queues = routes.map((r) => ({ ...r, next: 0 }));
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, ...(init ? { init } : {}) });
     if (url.includes('login.microsoftonline.com')) {

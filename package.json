@@ -14,13 +14,10 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.tests.json",
     "test": "node scripts/test.mjs",
     "package": "node scripts/build-zip.mjs",
     "clean": "rm -rf dist out .test-build *.tsbuildinfo"
-  },
-  "dependencies": {
-    "fflate": "^0.8.3"
   },
   "peerDependencies": {
     "@azure/msal-node": "^2.16.2",
@@ -29,6 +26,7 @@
   },
   "devDependencies": {
     "esbuild": "^0.24.0",
+    "fflate": "^0.8.3",
     "typescript": "^6.0.2",
     "@types/node": "^25.6.0",
     "@azure/msal-node": "^2.16.2",

@@ -184,11 +184,14 @@ extends it by exactly three scopes:
 - **Consent sometimes only lands via REST `appRoleAssignments` + restart.**
   Field-tested failure mode: portal/CLI consent (`az ad app permission
   admin-consent`) reports success but Graph keeps returning `403`. Fix: grant
-  the app roles directly — `POST
-  /servicePrincipals/{graph-sp-object-id}/appRoleAssignments`
-  (`principalId` = connector SP object id, `appRoleId` = the role id of the
-  missing permission) — then **restart the middleware** so a fresh token is
-  acquired; cached tokens never gain roles retroactively.
+  the app roles directly on the **connector's own** service principal —
+  `POST /servicePrincipals/{connector-sp-object-id}/appRoleAssignments` with
+  body `{ "principalId": "<connector-sp-object-id>", "resourceId":
+  "<graph-sp-object-id>", "appRoleId": "<role id of the missing permission>" }`
+  (the Graph SP object id comes from `GET
+  /servicePrincipals(appId='00000003-0000-0000-c000-000000000000')`) — then
+  **restart the middleware** so a fresh token is acquired; cached tokens
+  never gain roles retroactively.
 - Missing or unconsented provisioning scopes surface as the typed
   `ConsentMissingError` (`403`, carries `missingScopes` + `resource`) from
   `src/teamsProvisioner/errors.ts` — callers get the scope list to render a

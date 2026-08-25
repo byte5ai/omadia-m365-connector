@@ -59,7 +59,7 @@ function makeResponse(spec: ResponseSpec): Response {
 /** Route table with per-route response queues (last entry repeats). */
 function mockFetch(routes: Route[], calls: FetchCall[]): typeof fetch {
   const queues = routes.map((r) => ({ ...r, next: 0 }));
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, ...(init ? { init } : {}) });
     if (url.includes('login.microsoftonline.com')) {
@@ -154,6 +154,77 @@ function lookupCalls(calls: FetchCall[]): FetchCall[] {
 }
 
 describe('CatalogUploadClient.uploadToCatalog', () => {
+  it('picks the PUBLISHED appDefinition when several versions exist (409 path)', async () => {
+    // Graph documents appDefinitions as one entry PER VERSION, in no
+    // guaranteed order. Taking the first entry would silently report a stale
+    // version on exactly the idempotent path this step exists for (major
+    // review finding). The published definition must win; the $expand also
+    // requests publishingState so the choice is possible.
+    const { client, calls } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 200,
+        body: {
+          value: [
+            {
+              id: CATALOG_ID,
+              externalId: EXTERNAL_ID,
+              displayName: DISPLAY_NAME,
+              appDefinitions: [
+                { version: '1.0.0', publishingState: 'rejected' },
+                { version: VERSION, publishingState: 'published' },
+                { version: '1.0.1', publishingState: 'submitted' },
+              ],
+            },
+          ],
+        },
+      }),
+      route(UPLOAD_URL_MATCH, { status: 409, body: { error: { code: 'Conflict' } } }),
+    ]);
+
+    const result = await client.uploadToCatalog({
+      packageZip: PACKAGE_ZIP,
+      externalId: EXTERNAL_ID,
+    });
+
+    assert.equal(result.outcome, 'already-existed');
+    assert.equal(result.value.version, VERSION, 'published definition wins');
+    const [lookup] = lookupCalls(calls);
+    assert.ok(lookup?.url.includes('publishingState'), '$expand selects publishingState');
+  });
+
+  it('falls back to the highest version when no definition is marked published', async () => {
+    const { client } = harness([
+      route(LOOKUP_URL_MATCH, {
+        status: 200,
+        body: {
+          value: [
+            {
+              id: CATALOG_ID,
+              externalId: EXTERNAL_ID,
+              displayName: DISPLAY_NAME,
+              appDefinitions: [
+                { version: '1.9.9' },
+                { version: '1.10.0' },
+                { version: '1.2.3' },
+              ],
+            },
+          ],
+        },
+      }),
+      route(UPLOAD_URL_MATCH, { status: 409, body: {} }),
+    ]);
+
+    const result = await client.uploadToCatalog({
+      packageZip: PACKAGE_ZIP,
+      externalId: EXTERNAL_ID,
+    });
+    assert.equal(
+      result.value.version,
+      '1.10.0',
+      'numeric-aware compare, not first-entry or lexicographic',
+    );
+  });
+
   it('POSTs the raw zip and returns created from a full 201 body (no lookup)', async () => {
     const { client, calls } = harness([
       route(LOOKUP_URL_MATCH, { status: 500, body: { error: 'must not be called' } }),

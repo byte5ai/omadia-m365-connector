@@ -46,6 +46,15 @@ const ARM_TOKEN_SCOPE = 'https://management.azure.com/.default';
 const DEFAULT_MAX_429_RETRIES = 3;
 /** Fallback backoff base when a 429 arrives WITHOUT Retry-After (doubles per attempt). */
 const DEFAULT_BACKOFF_BASE_MS = 1000;
+/**
+ * Upper bound for any single Retry-After-derived wait. Graph/ARM can emit
+ * hints of hours (or an HTTP-date far in the future); sleeping that long
+ * inside a provisioning job is an unbounded hang. A 429 hint above this cap
+ * aborts with {@link ProvisioningThrottledError} carrying the full
+ * `retryAfterSeconds` so the job runner (byte5ai/omadia#864) reschedules;
+ * long-running-poll pacing hints are clamped to the cap instead.
+ */
+const MAX_BACKOFF_MS = 60_000;
 /** Provisioning is a background job, not the Teams hot path — token POSTs get 10 s. */
 const TOKEN_TIMEOUT_MS = 10_000;
 /** Per-request budgets: Graph verbs are quick; ARM PUTs are long-running. */
@@ -265,6 +274,19 @@ export class ProvisioningHttp {
           );
         }
         const delayMs = this.throttleDelayMs(response, attempt);
+        if (delayMs > MAX_BACKOFF_MS) {
+          // A wait beyond the cap is a "come back much later" signal, not a
+          // backoff — surface it typed so the job runner can reschedule
+          // instead of holding an awaited sleep for hours.
+          const bodyText = await safeBody(response);
+          throw new ProvisioningThrottledError(
+            req.resource,
+            lastRetryAfterSeconds,
+            new Error(
+              `${req.resource} ${req.step} 429 Retry-After ${String(delayMs)}ms exceeds the ${String(MAX_BACKOFF_MS)}ms backoff cap body=${truncate(bodyText, 200)}`,
+            ),
+          );
+        }
         this.log(
           `provisioner ${req.step}: 429, retrying in ${String(delayMs)}ms (attempt ${String(attempt + 1)}/${String(this.max429Retries + 1)})`,
         );
@@ -297,11 +319,22 @@ export class ProvisioningHttp {
     initial: Response,
   ): Promise<ProvisioningOkResponse> {
     const initialJson = await safeJson(initial);
-    const asyncUrl =
-      initial.headers.get('azure-asyncoperation') ??
-      initial.headers.get('location');
+    const asyncOperationUrl = initial.headers.get('azure-asyncoperation');
+    const locationUrl = initial.headers.get('location');
+    const pollUrl = asyncOperationUrl ?? locationUrl ?? req.url;
+    /**
+     * Which body SHAPE the poll target answers with: the
+     * `Azure-AsyncOperation` endpoint returns an operation-status document
+     * (top-level `status`), while a `Location` target (ARM operation-results)
+     * and the resource URL itself return the RESOURCE representation
+     * (`properties.provisioningState`). The parser is selected by this kind
+     * — with the other shape accepted as fallback — so a Location-only 202
+     * can terminate instead of polling forever on the wrong parser.
+     */
+    const pollKind: 'operation' | 'resource' =
+      asyncOperationUrl !== null ? 'operation' : 'resource';
 
-    if (!asyncUrl) {
+    if (asyncOperationUrl === null && locationUrl === null) {
       const state = provisioningState(initialJson);
       if (state === undefined || state.toLowerCase() === 'succeeded') {
         return {
@@ -316,14 +349,13 @@ export class ProvisioningHttp {
     const initialRetryAfter = retryAfterSeconds(initial);
     let nextWaitMs =
       initialRetryAfter !== undefined
-        ? initialRetryAfter * 1000
+        ? Math.min(initialRetryAfter * 1000, MAX_BACKOFF_MS)
         : this.pollIntervalMs;
 
     for (let attempt = 0; attempt < this.maxPollAttempts; attempt += 1) {
       await this.sleep(nextWaitMs);
       nextWaitMs = this.pollIntervalMs;
 
-      const pollUrl = asyncUrl ?? req.url;
       const token = await this.accessToken(req.resource);
       const poll = await this.fetchImpl(pollUrl, {
         method: 'GET',
@@ -334,9 +366,12 @@ export class ProvisioningHttp {
       });
 
       if (poll.status === 429 || poll.status === 202) {
-        // Not terminal yet — honour the API's own pacing hint when present.
+        // Not terminal yet — honour the API's own pacing hint when present,
+        // clamped so an hours-long hint cannot hang the provisioning job.
         const hinted = retryAfterSeconds(poll);
-        if (hinted !== undefined) nextWaitMs = hinted * 1000;
+        if (hinted !== undefined) {
+          nextWaitMs = Math.min(hinted * 1000, MAX_BACKOFF_MS);
+        }
         continue;
       }
       if (!poll.ok) {
@@ -347,16 +382,19 @@ export class ProvisioningHttp {
       }
 
       const json = await safeJson(poll);
-      const status = asyncUrl ? operationStatus(json) : provisioningState(json);
+      const status =
+        pollKind === 'operation'
+          ? (operationStatus(json) ?? provisioningState(json))
+          : (provisioningState(json) ?? operationStatus(json));
       const terminal = status?.toLowerCase();
       if (terminal === 'succeeded') {
-        // The PUT response usually carries the resource representation; for
-        // the resource-URL fallback the freshest body is the poll itself. A
-        // bodiless 202 + async operation re-GETs the finished resource.
+        // Resource-shaped polls (Location target or the resource URL itself)
+        // already carry the finished resource — the poll body IS the
+        // freshest representation. An operation-status body is not the
+        // resource, and the pre-poll PUT body is known-stale by the time the
+        // operation succeeds, so that path always re-GETs the resource.
         const finalJson =
-          asyncUrl === null
-            ? json
-            : (initialJson ?? (await this.fetchResource(req)));
+          pollKind === 'resource' ? json : await this.fetchResource(req);
         return {
           kind: 'ok',
           status: initial.status,

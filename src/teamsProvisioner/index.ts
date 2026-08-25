@@ -253,6 +253,7 @@ export {
   ConsentMissingError,
   ProvisioningThrottledError,
   ArmNotConfiguredError,
+  CapabilityUnavailableError,
 } from './errors.js';
 
 export {
@@ -279,7 +280,6 @@ export type {
 } from './config.js';
 
 export {
-  CapabilityUnavailableError,
   TEAMS_BOT_PASSWORD_SECRET_PREFIX,
   appIdFromSecretRef,
   secretRefForApp,

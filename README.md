@@ -72,10 +72,22 @@ Two field-tested gotchas:
 - **Portal/CLI consent sometimes silently fails to apply** (observed with
   `az ad app permission admin-consent`: the command succeeds, Graph keeps
   answering `403`). In that case grant the app roles directly via REST
-  `appRoleAssignments` — `POST
-  /servicePrincipals/{graph-sp-object-id}/appRoleAssignments` with the
-  connector's service principal as `principalId` and the app-role id of each
-  missing permission — and verify with `GET
+  `appRoleAssignments`, one call per missing permission — on the
+  **connector's own** service principal:
+
+  ```
+  POST /servicePrincipals/{connector-sp-object-id}/appRoleAssignments
+  {
+    "principalId": "{connector-sp-object-id}",
+    "resourceId":  "{graph-sp-object-id}",
+    "appRoleId":   "{app-role-id-of-the-missing-permission}"
+  }
+  ```
+
+  The Microsoft Graph service principal's object id (`resourceId`) is
+  resolved via
+  `GET /servicePrincipals(appId='00000003-0000-0000-c000-000000000000')`.
+  Verify with `GET
   /servicePrincipals/{connector-sp-object-id}/appRoleAssignments`.
 - **Restart after consent.** Acquired tokens are cached; newly consented
   roles only appear in a *fresh* token. Restart the middleware (or wait for
@@ -86,8 +98,9 @@ Two field-tested gotchas:
 
 ```bash
 npm install
-npm run typecheck   # tsc --noEmit
+npm run typecheck   # tsc --noEmit (src) + tsc -p tsconfig.tests.json (tests incl. type-level assertions)
 npm run build        # tsc
+npm test             # esbuild-transpiled node:test suite (scripts/test.mjs)
 ```
 
 `@omadia/plugin-api` is a **peer dependency**, provided by the omadia host at

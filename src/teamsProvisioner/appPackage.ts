@@ -24,13 +24,13 @@
  * (`manifest.json`, `color.png`, `outline.png`); the manifest references the
  * icons by those fixed names. No filesystem is touched — this connector's
  * manifest declares `permissions.filesystem.scratch: false` — so the ZIP is
- * produced with `fflate` (this package's single runtime dependency) and
- * returned as a buffer.
+ * produced fully in memory by the dependency-free writer in `zip.ts`
+ * (`node:zlib` deflate; see that module's doc for why no runtime dependency
+ * is possible here) and returned as a buffer.
  */
 
-import { strToU8, zipSync } from 'fflate';
-
 import { TeamsProvisionerError } from './errors.js';
+import { createZip } from './zip.js';
 
 /** Archive entry name of the rendered manifest. */
 export const APP_PACKAGE_MANIFEST_ENTRY = 'manifest.json';
@@ -124,13 +124,13 @@ export function buildAppPackage(input: BuildAppPackageInput): Uint8Array {
     throw new AppPackageError(iconProblems);
   }
 
-  return zipSync(
-    {
-      [APP_PACKAGE_MANIFEST_ENTRY]: strToU8(rendered),
-      [APP_PACKAGE_COLOR_ICON_ENTRY]: icons.color,
-      [APP_PACKAGE_OUTLINE_ICON_ENTRY]: icons.outline,
-    },
-    { level: 9, mtime: APP_PACKAGE_ENTRY_MTIME },
+  return createZip(
+    [
+      { name: APP_PACKAGE_MANIFEST_ENTRY, data: new TextEncoder().encode(rendered) },
+      { name: APP_PACKAGE_COLOR_ICON_ENTRY, data: icons.color },
+      { name: APP_PACKAGE_OUTLINE_ICON_ENTRY, data: icons.outline },
+    ],
+    APP_PACKAGE_ENTRY_MTIME,
   );
 }
 

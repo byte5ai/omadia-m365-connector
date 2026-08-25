@@ -156,7 +156,7 @@ setup:
       label: "Azure Resource Group"
       help: "Name der Resource Group für Microsoft.BotService/botServices. Leer lassen für Registration-only-Modus."
       required: false
-      pattern: "^[-\\w._()]{1,90}$"
+      pattern: "^[-A-Za-z0-9_.()]{1,90}$"
     - key: "azure_region"
       type: "string"
       label: "Azure Region"

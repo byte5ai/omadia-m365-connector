@@ -43,6 +43,7 @@ import type { ProvisioningHttp, ProvisioningOkResponse } from './http.js';
 import {
   storeAppPassword,
   deleteAppPassword,
+  secretRefForApp,
   type TeamsBotPasswordSecretRef,
 } from './secretStore.js';
 import {
@@ -169,7 +170,18 @@ export class AppRegistrationClient {
     input: CreateAppRegistrationInput,
   ): Promise<Idempotent<ProvisionedAppRegistration>> {
     requireNonEmpty(input.displayName, 'displayName');
+    if (input.uniqueName !== undefined) {
+      requireUniqueName(input.uniqueName);
+    }
     const { registration, outcome } = await this.registerApplication(input);
+
+    // Captured BEFORE the vault write: on the uniqueName-reuse path
+    // storeAppPassword OVERWRITES a prior run's entry, and a rollback must
+    // restore that entry instead of destroying a credential this call did
+    // not create. The value stays local — never logged, never returned.
+    const priorSecretValue = await this.secrets.get(
+      secretRefForApp(registration.appId),
+    );
 
     let secretRef: TeamsBotPasswordSecretRef | undefined;
     let secretKeyId: string | undefined;
@@ -196,7 +208,13 @@ export class AppRegistrationClient {
         },
       };
     } catch (err) {
-      await this.rollbackPartialCreate(registration, outcome, secretRef, secretKeyId);
+      await this.rollbackPartialCreate(
+        registration,
+        outcome,
+        secretRef,
+        secretKeyId,
+        priorSecretValue,
+      );
       throw err;
     }
   }
@@ -296,7 +314,7 @@ export class AppRegistrationClient {
     const existing = await this.http.request({
       resource: 'graph',
       method: 'GET',
-      url: `${GRAPH_BASE}/applications(uniqueName='${escapeODataQuotes(input.uniqueName)}')`,
+      url: `${GRAPH_BASE}/applications(uniqueName='${encodeURIComponent(escapeODataQuotes(input.uniqueName))}')`,
       step: 'applications.findByUniqueName',
       missingScopesOn403: [APP_REGISTRATION_SCOPE],
     });
@@ -361,21 +379,34 @@ export class AppRegistrationClient {
    * Best-effort rollback after a partial create. Only artifacts of THIS call
    * are touched: a registration found via `uniqueName` (`'already-existed'`)
    * is never deleted — its freshly added password credential is removed
-   * instead. Rollback failures are logged (never the secret), the caller
-   * rethrows the original error.
+   * instead, and a vault entry the call OVERWROTE (rather than created) is
+   * restored to its previous value instead of deleted. Rollback failures are
+   * logged (never a secret value), the caller rethrows the original error.
    */
   private async rollbackPartialCreate(
     registration: AppRegistration,
     outcome: IdempotentOutcome,
     secretRef: TeamsBotPasswordSecretRef | undefined,
     secretKeyId: string | undefined,
+    priorSecretValue: string | undefined,
   ): Promise<void> {
     if (secretRef !== undefined) {
       try {
-        await deleteAppPassword(this.secrets, secretRef);
+        if (priorSecretValue !== undefined) {
+          // The vault key existed before this call — storeAppPassword
+          // overwrote it. Deleting would destroy a credential this call did
+          // not create; restore the pre-call value instead.
+          await storeAppPassword(
+            this.secrets,
+            registration.appId,
+            priorSecretValue,
+          );
+        } else {
+          await deleteAppPassword(this.secrets, secretRef);
+        }
       } catch (err) {
         this.log(
-          `provisioner rollback: vault delete of '${secretRef}' failed: ${String(err)}`,
+          `provisioner rollback: vault ${priorSecretValue !== undefined ? 'restore' : 'delete'} of '${secretRef}' failed: ${String(err)}`,
         );
       }
     }
@@ -454,6 +485,24 @@ function requireAppId(appId: string): string {
     );
   }
   return appId;
+}
+
+/**
+ * `uniqueName` is an idempotency key that ends up in an OData alternate-key
+ * URL path. Mirroring {@link requireAppId}, anything that could break the
+ * URL or the OData literal — whitespace, quotes, parens, path separators,
+ * `#`/`?`/`%`/`&`/`+` — is rejected up front (belt) even though the lookup
+ * additionally percent-encodes the value (braces).
+ */
+function requireUniqueName(uniqueName: string): string {
+  requireNonEmpty(uniqueName, 'uniqueName');
+  if (/[\s'"()/\\#?%&+]/.test(uniqueName)) {
+    throw new Error(
+      "invalid_argument: 'uniqueName' must not contain whitespace, quotes, " +
+        'parentheses, slashes or URL metacharacters (#, ?, %, &, +)',
+    );
+  }
+  return uniqueName;
 }
 
 /** OData string-literal escaping for alternate-key lookups (`'` → `''`). */

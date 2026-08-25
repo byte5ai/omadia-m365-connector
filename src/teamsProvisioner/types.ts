@@ -78,7 +78,14 @@ export interface AppRegistration {
   readonly uniqueName?: string;
 }
 
-/** A client secret added via `addPassword`. `secretText` is shown exactly once. */
+/**
+ * A client secret added via `addPassword`. `secretText` is shown exactly once.
+ *
+ * @deprecated Part of the pre-implementation {@link TeamsProvisioner} sketch.
+ * The SHIPPED service (`TeamsProvisionerAccessor`) never returns cleartext
+ * secrets across the service boundary — `createAppRegistration` persists the
+ * password to the vault and returns only the opaque `secretRef`.
+ */
 export interface AppClientSecret {
   /** The secret value — persist immediately, Graph never returns it again. */
   readonly secretText: string;
@@ -139,7 +146,14 @@ export interface TeamAppInstallation {
   readonly installationId?: string;
 }
 
-/** Input for the Entra app-registration step. */
+/**
+ * Input for the Entra app-registration step.
+ *
+ * @deprecated Part of the pre-implementation {@link TeamsProvisioner} sketch.
+ * The shipped `TeamsProvisionerAccessor` merges register-app + add-secret
+ * into one rolled-back step — use `CreateAppRegistrationInput`
+ * (`src/teamsProvisioner/appRegistration.ts`) instead.
+ */
 export interface RegisterApplicationInput {
   readonly displayName: string;
   /**
@@ -149,7 +163,12 @@ export interface RegisterApplicationInput {
   readonly uniqueName: string;
 }
 
-/** Input for the client-secret step. */
+/**
+ * Input for the client-secret step.
+ *
+ * @deprecated Part of the pre-implementation {@link TeamsProvisioner} sketch —
+ * see {@link RegisterApplicationInput}.
+ */
 export interface AddClientSecretInput {
   /** Directory object id of the app registration (NOT the client id). */
   readonly appObjectId: string;
@@ -185,13 +204,18 @@ export interface InstallToTeamInput {
 }
 
 /**
- * The `teamsProvisioner@1` service surface. One step per method; the caller
- * (agent factory, byte5ai/omadia#863) owns ordering, persistence and retries
- * across steps. Every method may throw the typed errors from `errors.ts`
- * (`ConsentMissingError` on 403, `ProvisioningThrottledError` on exhausted
- * 429 backoff, `ArmNotConfiguredError` when ARM is demanded but unset);
- * any other transport/AAD failure propagates verbatim, matching the
- * `GraphOboClient` precedent.
+ * The ORIGINAL spec sketch of the `teamsProvisioner@1` service surface.
+ *
+ * @deprecated NOT what the service registry publishes. The shipped surface is
+ * `TeamsProvisionerAccessor` (`src/teamsProvisioner/index.ts`), which
+ * deliberately supersedes this sketch: register-app + add-secret are ONE
+ * rolled-back step (`createAppRegistration`) and only the vault `secretRef`
+ * — never `AppClientSecret.secretText` — crosses the service boundary.
+ * Resolve the service as
+ * `ctx.services.get<TeamsProvisionerAccessor>('teamsProvisioner')`; coding
+ * against THIS interface compiles but fails at runtime (`registerApplication`
+ * does not exist on the published object). Kept only as the historical
+ * contract the W0b wave was reviewed against.
  */
 export interface TeamsProvisioner {
   /** Where this provisioner registers apps. */

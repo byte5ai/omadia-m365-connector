@@ -60,7 +60,7 @@ function makeResponse(spec: ResponseSpec): Response {
 /** Route table with per-route response queues (last entry repeats). */
 function mockFetch(routes: Route[], calls: FetchCall[]): typeof fetch {
   const queues = routes.map((r) => ({ ...r, next: 0 }));
-  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+  return (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const url = String(input);
     calls.push({ url, ...(init ? { init } : {}) });
     if (url.includes('login.microsoftonline.com')) {
@@ -250,6 +250,26 @@ describe('createAppRegistration — 409 idempotency', () => {
     assert.ok(lookup, 'expected the uniqueName alternate-key lookup');
   });
 
+  it('rejects a uniqueName with URL/OData metacharacters before any network call', async () => {
+    // The uniqueName lands in the OData alternate-key URL path; '#', '?',
+    // '/', quotes and whitespace would silently truncate or reroute the
+    // lookup (major review finding). Rejected up front, and the lookup URL
+    // additionally percent-encodes the value.
+    const { client, calls } = harness(HAPPY_ROUTES());
+    for (const uniqueName of [
+      'omadia agent#1',
+      'agents/hr?x=1',
+      "od'ata",
+      'a+b&c',
+    ]) {
+      const err = await rejection(
+        client.createAppRegistration({ ...CREATE_INPUT, uniqueName }),
+      );
+      assert.match((err as Error).message, /invalid_argument: 'uniqueName'/);
+    }
+    assert.equal(calls.length, 0, 'validation happens before any fetch');
+  });
+
   it('409 without a uniqueName cannot be resolved and rejects', async () => {
     const routes: Route[] = [
       route('/applications', { status: 409, body: { error: 'conflict' } }),
@@ -336,6 +356,32 @@ describe('createAppRegistration — rollback of partial failures', () => {
     assert.match((err as Error).message, /servicePrincipals\.create 500/);
     assert.equal(vault.size, 0, 'rollback must remove the stored secret');
     assert.ok(graphCalls(calls).some((c) => c.init?.method === 'DELETE'));
+  });
+
+  it('restores an OVERWRITTEN vault entry on rollback instead of deleting it', async () => {
+    // Re-run over an existing registration: run 1 stored password P1 at the
+    // deterministic key; this call overwrites it with P2, then fails at the
+    // service principal. The rollback must put P1 back — deleting the entry
+    // would destroy a credential this call did not create (blocker finding
+    // of the app-registration unit review).
+    const routes: Route[] = [
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/removePassword', { status: 204 }),
+      route('/servicePrincipals', { status: 500, body: { error: 'boom' } }),
+      route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+      route('/applications', { status: 409, body: {} }),
+    ];
+    const { client, vault } = harness(routes);
+    const PRIOR_SECRET = 'prior-run-password-p1';
+    vault.set(SECRET_REF, PRIOR_SECRET);
+
+    await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.equal(
+      vault.get(SECRET_REF),
+      PRIOR_SECRET,
+      'the pre-call vault value must be restored, not deleted',
+    );
   });
 
   it('pre-existing app is NOT deleted on rollback — only its new credential', async () => {
