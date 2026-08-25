@@ -123,6 +123,10 @@ export type {
   ReuseAppCredential,
   TeamsProvisionerSetupField,
   // Step inputs/results on the accessor surface.
+  CatalogAppFound,
+  CatalogAppNotFound,
+  GetCatalogAppInput,
+  GetCatalogAppResult,
   CreateAppRegistrationInput,
   DeleteAppRegistrationInput,
   DeleteAppRegistrationOutcome,

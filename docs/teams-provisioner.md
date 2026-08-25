@@ -68,6 +68,23 @@ plus two readonly probes: `tenantMode` and `canCreateBots`.
 > contract; resolve the service as
 > `ctx.services.get<TeamsProvisionerAccessor>('teamsProvisioner')`.
 
+### Catalog lookup — `getCatalogApp` (since 0.3.1)
+
+`getCatalogApp({ teamsAppExternalId })` on the shipped
+`TeamsProvisionerAccessor` resolves an EXISTING catalog app by its manifest id
+(`externalId`) **without uploading a package** — for consumers that only need
+the `teamsAppId` of an already-published app (e.g. to drive `installToTeam`).
+It reuses the exact query of the 409 idempotent upload path
+(`GET /appCatalogs/teamsApps?$filter=externalId eq '…'` with
+`$expand=appDefinitions($select=version,publishingState)`; quote-doubling +
+`encodeURIComponent` keep the filter injection-safe) and the same version
+selection: the `published` appDefinition wins, else the highest version.
+
+Result: `{ found: false }` (a plain outcome, never an exception) or
+`{ found: true, teamsAppId, displayName?, publishedVersion? }`. Errors map
+like every catalog call: 403 → `ConsentMissingError(['AppCatalog.ReadWrite.All'], 'graph')`,
+exhausted 429 backoff → `ProvisioningThrottledError`.
+
 ### Idempotency — 409 is not an error
 
 Steps that can hit "already exists" on re-runs (catalog upload via

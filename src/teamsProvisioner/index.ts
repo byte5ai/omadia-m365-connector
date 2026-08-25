@@ -44,7 +44,11 @@ import {
   type DeleteBotResult,
   type GetBotResult,
 } from './botService.js';
-import { CatalogUploadClient } from './catalog.js';
+import {
+  CatalogUploadClient,
+  type GetCatalogAppInput,
+  type GetCatalogAppResult,
+} from './catalog.js';
 import { isArmConfigured, type ArmConfigResult } from './config.js';
 import { ProvisioningHttp } from './http.js';
 import {
@@ -127,6 +131,13 @@ export interface TeamsProvisionerAccessor {
   uploadToCatalog(
     input: UploadToCatalogInput,
   ): Promise<Idempotent<CatalogTeamsApp>>;
+
+  /**
+   * Lookup probe for step 4 — resolve an EXISTING catalog app by manifest id
+   * (`externalId`) without uploading a package. `{ found: false }` is a plain
+   * outcome, never an exception.
+   */
+  getCatalogApp(input: GetCatalogAppInput): Promise<GetCatalogAppResult>;
 
   /** Chain step 5 — install the catalog app into one team. */
   installToTeam(
@@ -213,6 +224,7 @@ export function createTeamsProvisioner(
     deleteBot: (botName) => bots.deleteBot(botName),
     getBot: (botName) => bots.getBot(botName),
     uploadToCatalog: (input) => catalog.uploadToCatalog(input),
+    getCatalogApp: (input) => catalog.getCatalogApp(input),
     installToTeam: (input) => installs.installToTeam(input),
   };
 }
@@ -301,6 +313,13 @@ export type {
   AppPackageParams,
   BuildAppPackageInput,
 } from './appPackage.js';
+
+export type {
+  CatalogAppFound,
+  CatalogAppNotFound,
+  GetCatalogAppInput,
+  GetCatalogAppResult,
+} from './catalog.js';
 
 export type {
   BotDeletedResult,
