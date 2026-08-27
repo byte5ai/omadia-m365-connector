@@ -173,7 +173,7 @@ extends it by exactly three scopes:
 |---|---|
 | `Application.ReadWrite.OwnedBy` | `registerApplication` / `addClientSecret` — `POST /applications`, `POST /applications/{id}/addPassword`; per-agent apps stay owned by the connector app |
 | `AppCatalog.ReadWrite.All` | `uploadToCatalog` — `POST /appCatalogs/teamsApps` |
-| `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps` |
+| `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps`; since 0.4.0 also `uninstallFromTeam` — `GET /teams/{id}/installedApps` + `DELETE /teams/{id}/installedApps/{installationId}` |
 
 ### Consent semantics (renewed admin consent)
 

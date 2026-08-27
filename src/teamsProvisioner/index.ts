@@ -54,6 +54,8 @@ import { ProvisioningHttp } from './http.js';
 import {
   TeamInstallClient,
   type InstallToTeamRequest,
+  type UninstallFromTeamInput,
+  type UninstallFromTeamResult,
 } from './install.js';
 import type {
   AppRegistration,
@@ -143,6 +145,22 @@ export interface TeamsProvisionerAccessor {
   installToTeam(
     input: InstallToTeamRequest,
   ): Promise<Idempotent<TeamAppInstallation>>;
+
+  /**
+   * Reverse of {@link installToTeam} (since 0.4.0, byte5ai/omadia#900) —
+   * remove the catalog app from one team, keyed by the same
+   * (teamId, teamsAppId) pair. Idempotent: an app that is not installed
+   * answers `{ outcome: 'already-absent' }` instead of throwing.
+   *
+   * Consumers must FEATURE-DETECT this method (`typeof
+   * provisioner.uninstallFromTeam === 'function'`): the middleware mirrors
+   * this contract structurally rather than importing it, so a middleware
+   * running against a connector < 0.4.0 has to keep its old
+   * not-supported branch.
+   */
+  uninstallFromTeam(
+    input: UninstallFromTeamInput,
+  ): Promise<UninstallFromTeamResult>;
 }
 
 /** Everything {@link createTeamsProvisioner} needs — assembled by `activate()`. */
@@ -226,6 +244,7 @@ export function createTeamsProvisioner(
     uploadToCatalog: (input) => catalog.uploadToCatalog(input),
     getCatalogApp: (input) => catalog.getCatalogApp(input),
     installToTeam: (input) => installs.installToTeam(input),
+    uninstallFromTeam: (input) => installs.uninstallFromTeam(input),
   };
 }
 
@@ -335,4 +354,7 @@ export type {
   InstallToTeamRequest,
   ResourceSpecificPermission,
   ResourceSpecificPermissionType,
+  UninstallFromTeamInput,
+  UninstallFromTeamOutcome,
+  UninstallFromTeamResult,
 } from './install.js';

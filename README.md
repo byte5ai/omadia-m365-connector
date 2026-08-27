@@ -53,7 +53,9 @@ Graph client via the service registry.
    - `AppCatalog.ReadWrite.All` — upload the generated Teams app packages to
      the tenant app catalog (`POST /appCatalogs/teamsApps`)
    - `TeamsAppInstallation.ReadWriteForTeam.All` — install the catalog app
-     into the target team (`POST /teams/{id}/installedApps`)
+     into the target team (`POST /teams/{id}/installedApps`) and, since
+     0.4.0, remove it again (`GET /teams/{id}/installedApps` +
+     `DELETE /teams/{id}/installedApps/{installationId}`)
 
 This is the app-only (client-credentials) flow: no interactive user sign-in;
 access is tenant-wide within the granted permissions. The same app

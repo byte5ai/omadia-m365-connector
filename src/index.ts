@@ -146,5 +146,8 @@ export type {
   InstallToTeamRequest,
   ResourceSpecificPermission,
   ResourceSpecificPermissionType,
+  UninstallFromTeamInput,
+  UninstallFromTeamOutcome,
+  UninstallFromTeamResult,
   TeamsBotPasswordSecretRef,
 } from './teamsProvisioner/index.js';

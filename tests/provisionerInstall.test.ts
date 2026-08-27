@@ -297,3 +297,244 @@ describe('TeamInstallClient.installToTeam', () => {
     assert.equal(calls.length, 0);
   });
 });
+
+// The uninstall direction (byte5ai/omadia#900): Graph deletes an installation
+// by INSTALLATION id, so it is a lookup-then-DELETE pair. "Not installed" —
+// whether the lookup misses or the DELETE races into a 404 — is the
+// idempotent 'already-absent' success, never an exception. 403/429 ride the
+// same shared paths as the install direction.
+
+/** Only the lookup GETs (they carry a query string). */
+function lookupCalls(calls: FetchCall[]): FetchCall[] {
+  return calls.filter(
+    (c) => c.url.includes(INSTALL_URL_MATCH) && c.url.includes('$filter='),
+  );
+}
+
+/** Only the DELETEs of a concrete installation. */
+function deleteCalls(calls: FetchCall[]): FetchCall[] {
+  return calls.filter((c) => c.init?.method === 'DELETE');
+}
+
+/** A lookup response body carrying one matching installation. */
+const foundBody = (
+  installationId = INSTALLATION_ID,
+  teamsAppId = TEAMS_APP_ID,
+): unknown => ({
+  value: [{ id: installationId, teamsApp: { id: teamsAppId } }],
+});
+
+describe('TeamInstallClient.uninstallFromTeam', () => {
+  it('resolves the installation id, DELETEs it, and reports uninstalled', async () => {
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, { status: 200, body: foundBody() }),
+      route(`${INSTALL_URL_MATCH}/${INSTALLATION_ID}`, { status: 204 }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'uninstalled');
+    assert.deepEqual(result.value, {
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+      installationId: INSTALLATION_ID,
+    });
+
+    const [lookup] = lookupCalls(calls);
+    assert.ok(lookup, 'expected one lookup GET');
+    assert.equal(lookup.init?.method, 'GET');
+    assert.equal(
+      lookup.url,
+      `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/installedApps` +
+        `?$expand=teamsApp&$filter=${encodeURIComponent(`teamsApp/id eq '${TEAMS_APP_ID}'`)}`,
+    );
+
+    const [del] = deleteCalls(calls);
+    assert.ok(del, 'expected one DELETE');
+    assert.equal(
+      del.url,
+      `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/installedApps/${INSTALLATION_ID}`,
+    );
+  });
+
+  it('reports already-absent WITHOUT deleting when the lookup finds nothing', async () => {
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, { status: 200, body: { value: [] } }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'already-absent');
+    assert.deepEqual(result.value, { teamId: TEAM_ID, teamsAppId: TEAMS_APP_ID });
+    assert.ok(!('installationId' in result.value));
+    assert.equal(lookupCalls(calls).length, 1);
+    assert.equal(deleteCalls(calls).length, 0, 'must not DELETE on a lookup miss');
+  });
+
+  it('ignores lookup entries whose expanded teamsApp is a different app', async () => {
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, {
+        status: 200,
+        // A tenant that ignores $filter must not make us delete the wrong one.
+        body: { value: [{ id: 'other-installation', teamsApp: { id: 'other-app' } }] },
+      }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'already-absent');
+    assert.equal(deleteCalls(calls).length, 0);
+  });
+
+  it('treats a 404 on the DELETE as already-absent (removal race)', async () => {
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, { status: 200, body: foundBody() }),
+      route(`${INSTALL_URL_MATCH}/${INSTALLATION_ID}`, {
+        status: 404,
+        body: { error: { code: 'NotFound' } },
+      }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'already-absent');
+    assert.equal(result.value.installationId, INSTALLATION_ID);
+    assert.equal(deleteCalls(calls).length, 1);
+  });
+
+  it('treats a 404 on the lookup (team gone) as already-absent', async () => {
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, {
+        status: 404,
+        body: { error: { code: 'NotFound' } },
+      }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'already-absent');
+    assert.equal(deleteCalls(calls).length, 0);
+  });
+
+  it("escapes OData quotes in the teamsAppId filter (quote doubling)", async () => {
+    const nastyAppId = "app' or id ne '";
+    const { client, calls } = harness([
+      route(`${INSTALL_URL_MATCH}?`, { status: 200, body: { value: [] } }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: nastyAppId,
+    });
+
+    assert.equal(result.outcome, 'already-absent');
+    const [lookup] = lookupCalls(calls);
+    assert.ok(lookup, 'expected one lookup GET');
+    const filter = new URL(lookup.url).searchParams.get('$filter');
+    assert.equal(filter, "teamsApp/id eq 'app'' or id ne '''");
+  });
+
+  it('maps 403 to ConsentMissingError carrying the install scope (graph)', async () => {
+    const { client } = harness([
+      route(`${INSTALL_URL_MATCH}?`, {
+        status: 403,
+        body: { error: { code: 'Forbidden' } },
+      }),
+    ]);
+
+    await assert.rejects(
+      client.uninstallFromTeam({ teamId: TEAM_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConsentMissingError);
+        assert.ok(err instanceof TeamsProvisionerError);
+        assert.deepEqual(err.missingScopes, [TEAM_INSTALL_SCOPE]);
+        assert.equal(err.resource, 'graph');
+        return true;
+      },
+    );
+  });
+
+  it('maps a 403 on the DELETE itself to ConsentMissingError too', async () => {
+    const { client } = harness([
+      route(`${INSTALL_URL_MATCH}?`, { status: 200, body: foundBody() }),
+      route(`${INSTALL_URL_MATCH}/${INSTALLATION_ID}`, { status: 403 }),
+    ]);
+
+    await assert.rejects(
+      client.uninstallFromTeam({ teamId: TEAM_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConsentMissingError);
+        assert.deepEqual(err.missingScopes, [TEAM_INSTALL_SCOPE]);
+        return true;
+      },
+    );
+  });
+
+  it('retries 429 honouring Retry-After, then uninstalls', async () => {
+    const { client, calls, sleeps } = harness([
+      route(
+        `${INSTALL_URL_MATCH}?`,
+        { status: 429, headers: { 'Retry-After': '5' } },
+        { status: 200, body: foundBody() },
+      ),
+      route(`${INSTALL_URL_MATCH}/${INSTALLATION_ID}`, { status: 204 }),
+    ]);
+
+    const result = await client.uninstallFromTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'uninstalled');
+    assert.equal(lookupCalls(calls).length, 2);
+    assert.deepEqual(sleeps, [5000]);
+  });
+
+  it('throws ProvisioningThrottledError when the 429 budget is exhausted', async () => {
+    const { client } = harness([
+      route(`${INSTALL_URL_MATCH}?`, {
+        status: 429,
+        headers: { 'Retry-After': '3' },
+      }),
+    ]);
+
+    await assert.rejects(
+      client.uninstallFromTeam({ teamId: TEAM_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ProvisioningThrottledError);
+        assert.equal(err.resource, 'graph');
+        assert.equal(err.retryAfterSeconds, 3);
+        return true;
+      },
+    );
+  });
+
+  it('rejects empty teamId / teamsAppId before any fetch', async () => {
+    const { client, calls } = harness([]);
+
+    await assert.rejects(
+      client.uninstallFromTeam({ teamId: '  ', teamsAppId: TEAMS_APP_ID }),
+      /invalid_argument: 'teamId'/,
+    );
+    await assert.rejects(
+      client.uninstallFromTeam({ teamId: TEAM_ID, teamsAppId: '' }),
+      /invalid_argument: 'teamsAppId'/,
+    );
+    assert.equal(calls.length, 0);
+  });
+});

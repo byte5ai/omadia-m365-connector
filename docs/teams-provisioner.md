@@ -85,6 +85,40 @@ Result: `{ found: false }` (a plain outcome, never an exception) or
 like every catalog call: 403 → `ConsentMissingError(['AppCatalog.ReadWrite.All'], 'graph')`,
 exhausted 429 backoff → `ProvisioningThrottledError`.
 
+### Team uninstall — `uninstallFromTeam` (since 0.4.0)
+
+`uninstallFromTeam({ teamId, teamsAppId })` on the shipped
+`TeamsProvisionerAccessor` is the reverse of `installToTeam`
+(byte5ai/omadia#900): it removes an agent's Teams app from ONE team, keyed by
+the same `(teamId, teamsAppId)` pair the install is idempotent on.
+
+Graph deletes an installation by its **installation id**, not by the catalog
+app id, so the step is a lookup-then-DELETE pair:
+
+1. `GET /teams/{teamId}/installedApps?$expand=teamsApp&$filter=teamsApp/id eq '…'`
+   — quote-doubling + `encodeURIComponent` keep the filter injection-safe, and
+   the returned entries are re-checked against `teamsApp.id` client-side so a
+   tenant that ignores `$filter` cannot make us delete the wrong installation.
+2. `DELETE /teams/{teamId}/installedApps/{installationId}`.
+
+Result: `{ outcome: 'uninstalled' | 'already-absent', value: TeamAppInstallation }`.
+**"Not installed" is success, never an exception** — the lookup missing, the
+lookup answering 404 (team gone) and the DELETE answering 404 (another
+remover won the race) all collapse into `'already-absent'`; only the first of
+those has no `installationId` to report. The literal deviates from the
+`'already-deleted'` of the app-registration / bot rollbacks on purpose:
+nothing is destroyed here, an app that was never in the team is simply absent.
+
+Errors map like the install direction: 403 →
+`ConsentMissingError(['TeamsAppInstallation.ReadWriteForTeam.All'], 'graph')`
+(the same scope covers reading and removing an installation), exhausted 429
+backoff → `ProvisioningThrottledError`.
+
+> **Consumers must feature-detect.** The middleware mirrors this contract
+> structurally rather than importing it, so a middleware talking to a
+> connector `< 0.4.0` must keep its not-supported branch
+> (`typeof provisioner.uninstallFromTeam === 'function'`) instead of crashing.
+
 ### Idempotency — 409 is not an error
 
 Steps that can hit "already exists" on re-runs (catalog upload via
