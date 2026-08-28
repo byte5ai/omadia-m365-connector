@@ -8,9 +8,14 @@ import {
 import { ProvisioningHttp } from '../src/teamsProvisioner/http.js';
 import {
   ConsentMissingError,
+  DelegatedConsentRequiredError,
+  DelegatedSignInRequiredError,
+  DelegatedTokenExpiredError,
   ProvisioningThrottledError,
   TeamsProvisionerError,
+  isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
+import { APP_CATALOG_DELEGATED_SCOPE } from '../src/teamsProvisioner/delegatedAuth.js';
 
 // The catalog-upload step: POST /appCatalogs/teamsApps behind the shared
 // ProvisioningHttp choke point — 409 re-resolves the existing entry by
@@ -86,6 +91,13 @@ const DISPLAY_NAME = 'Agent Bot';
 const VERSION = '1.4.2';
 // Any buffer works — deliberately NOT a real zip (no buildAppPackage dependency).
 const PACKAGE_ZIP = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x2a]);
+/**
+ * Since 0.6.0 the upload is DELEGATED-ONLY (byte5ai/omadia#924): Graph does not
+ * support application permissions for POST /appCatalogs/teamsApps, so every
+ * upload here carries a user token. The catalog LOOKUP stays app-only, which is
+ * why the 409 re-resolution below still works without one.
+ */
+const DELEGATED_TOKEN = 'delegated-user-access-token';
 
 const UPLOAD_URL = 'https://graph.microsoft.com/v1.0/appCatalogs/teamsApps';
 // The lookup is the same collection URL plus the $filter — match it FIRST
@@ -184,6 +196,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
 
     assert.equal(result.outcome, 'already-existed');
@@ -217,6 +230,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
     assert.equal(
       result.value.version,
@@ -243,6 +257,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
 
     assert.equal(result.outcome, 'created');
@@ -252,7 +267,9 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     assert.ok(call, 'expected one upload POST');
     assert.equal(call.url, UPLOAD_URL);
     const headers = call.init?.headers as Record<string, string>;
-    assert.equal(headers['Authorization'], 'Bearer tok');
+    // The DELEGATED token, not the app-only one from the token cache: Graph
+    // refuses application permissions for this verb (byte5ai/omadia#924).
+    assert.equal(headers['Authorization'], `Bearer ${DELEGATED_TOKEN}`);
     assert.equal(headers['content-type'], 'application/zip');
     assert.deepEqual(new Uint8Array(call.init?.body as Uint8Array), PACKAGE_ZIP);
     assert.equal(lookupCalls(calls).length, 0);
@@ -276,6 +293,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
 
     assert.equal(result.outcome, 'created');
@@ -296,6 +314,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
 
     assert.equal(result.outcome, 'already-existed');
@@ -317,12 +336,21 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     ]);
 
     await assert.rejects(
-      client.uploadToCatalog({ packageZip: PACKAGE_ZIP, externalId: EXTERNAL_ID }),
+      client.uploadToCatalog({
+        packageZip: PACKAGE_ZIP,
+        externalId: EXTERNAL_ID,
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
       new RegExp(`found no catalog app with externalId=${EXTERNAL_ID}`),
     );
   });
 
-  it('maps 403 to ConsentMissingError carrying the catalog scope (graph)', async () => {
+  it('maps 403 to DelegatedConsentRequiredError, not the app-only ConsentMissingError', async () => {
+    // Since 0.6.0 this call carries a USER token, so a 403 can no longer mean
+    // "the connector app is missing an app role" — it means the tenant never
+    // consented to the delegated scope on the PUBLISHER app. Reporting the
+    // app-only error here would send an operator to fix the wrong registration
+    // (byte5ai/omadia#924).
     const { client } = harness([
       route(UPLOAD_URL_MATCH, {
         status: 403,
@@ -331,16 +359,101 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     ]);
 
     await assert.rejects(
-      client.uploadToCatalog({ packageZip: PACKAGE_ZIP, externalId: EXTERNAL_ID }),
+      client.uploadToCatalog({
+        packageZip: PACKAGE_ZIP,
+        externalId: EXTERNAL_ID,
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
       (err: unknown) => {
-        assert.ok(err instanceof ConsentMissingError);
-        // Same typed family as installToTeam → the agent factory gets ONE
-        // fallback branch (byte5ai/omadia#863-865).
+        assert.ok(err instanceof DelegatedConsentRequiredError);
+        assert.ok(!(err instanceof ConsentMissingError));
+        // Still one catchable family for the agent factory.
         assert.ok(err instanceof TeamsProvisionerError);
-        assert.deepEqual(err.missingScopes, [APP_CATALOG_SCOPE]);
-        assert.equal(err.resource, 'graph');
+        assert.deepEqual(err.requiredScopes, [APP_CATALOG_DELEGATED_SCOPE]);
+        assert.equal(err.step, 'appCatalogs.teamsApps.publish');
+        assert.ok(err.adminConsentUrl.length > 0);
+        // The app-only 403 the http layer raised is preserved as the cause,
+        // so nothing diagnostic is lost in the translation.
+        assert.ok((err as { cause?: unknown }).cause instanceof ConsentMissingError);
         return true;
       },
+    );
+  });
+
+  it('maps 401 to DelegatedTokenExpiredError, flagged as refresh-recoverable', async () => {
+    // A user token that aged out mid-flight is fixed by a refresh, with no
+    // human involved — a different remedy from every other failure here, so it
+    // must be a different error.
+    const { client } = harness([
+      route(UPLOAD_URL_MATCH, {
+        status: 401,
+        body: { error: { code: 'InvalidAuthenticationToken' } },
+      }),
+    ]);
+
+    await assert.rejects(
+      client.uploadToCatalog({
+        packageZip: PACKAGE_ZIP,
+        externalId: EXTERNAL_ID,
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof DelegatedTokenExpiredError);
+        assert.equal(err.reason, 'access-token-expired');
+        assert.equal(err.recoverableByRefresh, true);
+        return true;
+      },
+    );
+  });
+
+  it('refuses an upload with NO delegated token before it reaches Graph', async () => {
+    // The app-only upload is known-unsupported, so spending a Graph call to
+    // learn that again would only produce a misleading 403. Refuse locally, and
+    // do so with the one error whose remedy is "start the device-code sign-in".
+    const { client, calls } = harness([
+      route(UPLOAD_URL_MATCH, { status: 201, body: {} }),
+    ]);
+
+    await assert.rejects(
+      client.uploadToCatalog({ packageZip: PACKAGE_ZIP, externalId: EXTERNAL_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof DelegatedSignInRequiredError);
+        assert.ok(err instanceof TeamsProvisionerError);
+        assert.equal(err.step, 'appCatalogs.teamsApps.publish');
+        assert.deepEqual(err.requiredScopes, [APP_CATALOG_DELEGATED_SCOPE]);
+        assert.ok(!isTransientProvisioningFailure(err), 'never retryable');
+        return true;
+      },
+    );
+    assert.equal(catalogCalls(calls).length, 0, 'no Graph call may be made');
+  });
+
+  it('sends the DELEGATED token on the upload and the APP-ONLY token on the lookup', async () => {
+    // The asymmetry is the design: only the upload is delegated-only, so a
+    // missing/stale user token degrades exactly one operation instead of
+    // blinding the provisioner to what is already published.
+    const { client, calls } = harness([
+      route(LOOKUP_URL_MATCH, LOOKUP_HIT),
+      route(UPLOAD_URL_MATCH, { status: 409 }),
+    ]);
+
+    await client.uploadToCatalog({
+      packageZip: PACKAGE_ZIP,
+      externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
+    });
+
+    const [upload] = uploadCalls(calls);
+    const [lookup] = lookupCalls(calls);
+    assert.ok(upload && lookup);
+    assert.equal(
+      (upload.init?.headers as Record<string, string>)['Authorization'],
+      `Bearer ${DELEGATED_TOKEN}`,
+    );
+    assert.equal(
+      (lookup.init?.headers as Record<string, string>)['Authorization'],
+      'Bearer tok',
+      'the catalog lookup must keep using the app-only token',
     );
   });
 
@@ -365,6 +478,7 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const result = await client.uploadToCatalog({
       packageZip: PACKAGE_ZIP,
       externalId: EXTERNAL_ID,
+      delegatedAccessToken: DELEGATED_TOKEN,
     });
 
     assert.equal(result.outcome, 'created');
@@ -382,7 +496,11 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     ]);
 
     await assert.rejects(
-      client.uploadToCatalog({ packageZip: PACKAGE_ZIP, externalId: EXTERNAL_ID }),
+      client.uploadToCatalog({
+        packageZip: PACKAGE_ZIP,
+        externalId: EXTERNAL_ID,
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
       (err: unknown) => {
         assert.ok(err instanceof ProvisioningThrottledError);
         assert.equal(err.resource, 'graph');
@@ -398,11 +516,19 @@ describe('CatalogUploadClient.uploadToCatalog', () => {
     const { client, calls } = harness([]);
 
     await assert.rejects(
-      client.uploadToCatalog({ packageZip: PACKAGE_ZIP, externalId: '  ' }),
+      client.uploadToCatalog({
+        packageZip: PACKAGE_ZIP,
+        externalId: '  ',
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
       /invalid_argument: 'externalId'/,
     );
     await assert.rejects(
-      client.uploadToCatalog({ packageZip: new Uint8Array(0), externalId: EXTERNAL_ID }),
+      client.uploadToCatalog({
+        packageZip: new Uint8Array(0),
+        externalId: EXTERNAL_ID,
+        delegatedAccessToken: DELEGATED_TOKEN,
+      }),
       /invalid_argument: 'packageZip'/,
     );
     assert.equal(calls.length, 0);

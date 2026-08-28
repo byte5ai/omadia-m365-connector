@@ -50,8 +50,14 @@ Graph client via the service registry.
    - `Application.ReadWrite.OwnedBy` — create the per-agent Entra app
      registrations and their client secrets (`POST /applications`,
      `POST /applications/{id}/addPassword`)
-   - `AppCatalog.ReadWrite.All` — upload the generated Teams app packages to
-     the tenant app catalog (`POST /appCatalogs/teamsApps`)
+   - `AppCatalog.ReadWrite.All` — **resolve** apps in the tenant app catalog
+     (`GET /appCatalogs/teamsApps`). Since 0.6.0 this app permission no longer
+     covers the *upload*: Graph documents application permissions for
+     `POST /appCatalogs/teamsApps` as **"Not supported."**, and the field test
+     confirms it — the same token that resolves a catalog app is refused for
+     the upload no matter what is consented. The upload runs on a **delegated**
+     token instead, acquired once per tenant through a device-code sign-in. See
+     [`docs/teams-provisioner-delegated-publish.md`](docs/teams-provisioner-delegated-publish.md).
    - `TeamsAppInstallation.ReadWriteForTeam.All` — install the catalog app
      into the target team (`POST /teams/{id}/installedApps`) and, since
      0.4.0, remove it again (`GET /teams/{id}/installedApps` +

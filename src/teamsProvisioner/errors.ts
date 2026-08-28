@@ -276,6 +276,159 @@ export class BotHandleUnavailableError extends TeamsProvisionerError {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Delegated catalog-publish taxonomy (byte5ai/omadia#924).
+//
+// `POST /appCatalogs/teamsApps` is DELEGATED-ONLY — Graph documents
+// application permissions as "Not supported." for that verb, and the field
+// test confirmed it: the same app-only token that RESOLVES a catalog app is
+// rejected for the UPLOAD even with `AppCatalog.ReadWrite.All` assigned as an
+// app role. No amount of admin consent changes that.
+//
+// So exactly one step of the chain runs on a user token, and the middleware
+// has to tell three failure modes apart because each carries a DIFFERENT
+// operator instruction:
+//
+//   - {@link DelegatedSignInRequiredError}  → "no admin has signed in yet"
+//     → start the device-code flow.
+//   - {@link DelegatedConsentRequiredError} → "signed in, but the tenant never
+//     consented to the delegated scope" → send an admin to the consent URL.
+//   - {@link DelegatedTokenExpiredError}    → "the stored token stopped
+//     working" → refresh, or sign in again when the refresh token is dead too.
+//
+// Collapsing these into one error is what makes an operator retry the wrong
+// remedy three times — hence three classes.
+// ---------------------------------------------------------------------------
+
+/**
+ * The delegated catalog upload was attempted without a delegated token.
+ *
+ * Neither a misconfiguration nor transient: it means no tenant admin has
+ * completed the one-time device-code sign-in yet. The caller's next move is to
+ * start that flow — never to retry the upload.
+ */
+export class DelegatedSignInRequiredError extends TeamsProvisionerError {
+  /** Which step needs the user token, e.g. `appCatalogs.teamsApps.publish`. */
+  public readonly step: string;
+  /** Delegated scopes the sign-in has to acquire. */
+  public readonly requiredScopes: readonly string[];
+
+  constructor(step: string, requiredScopes: readonly string[]) {
+    super(
+      `delegated_sign_in_required: '${step}' needs a delegated (user) access ` +
+        'token. Microsoft Graph does not support application permissions for ' +
+        'publishing to the tenant app catalog, so one tenant admin has to ' +
+        'complete the device-code sign-in once. Required delegated scope(s): ' +
+        requiredScopes.join(', '),
+    );
+    this.name = 'DelegatedSignInRequiredError';
+    this.step = step;
+    this.requiredScopes = requiredScopes;
+  }
+}
+
+/**
+ * A delegated call was rejected because the TENANT has not consented to the
+ * delegated scope — distinct from "nobody signed in" and from "token expired".
+ *
+ * `AppCatalog.ReadWrite.All` is an admin-consent-required delegated scope, so a
+ * non-admin sign-in — or a tenant whose user-consent policy is "do not allow
+ * user consent" — lands here. {@link adminConsentUrl} is the exact link to hand
+ * an admin; it carries only the public client id, never a secret.
+ */
+export class DelegatedConsentRequiredError extends TeamsProvisionerError {
+  /** Delegated scopes that lack tenant consent. */
+  public readonly requiredScopes: readonly string[];
+  /** Tenant-wide admin-consent URL for the publisher app (secret-free). */
+  public readonly adminConsentUrl: string;
+  /** Which step was rejected. */
+  public readonly step: string;
+
+  constructor(
+    step: string,
+    requiredScopes: readonly string[],
+    adminConsentUrl: string,
+    cause?: unknown,
+  ) {
+    super(
+      `delegated_consent_required: '${step}' was rejected because the tenant ` +
+        'has not granted admin consent for the delegated scope(s) ' +
+        `${requiredScopes.join(', ')}. Send a Global Administrator (or Cloud ` +
+        'Application Administrator) to the consent URL carried on this error, ' +
+        'then retry — signing in again is not enough on its own.',
+      cause,
+    );
+    this.name = 'DelegatedConsentRequiredError';
+    this.step = step;
+    this.requiredScopes = requiredScopes;
+    this.adminConsentUrl = adminConsentUrl;
+  }
+}
+
+/**
+ * The stored delegated credential no longer works. Two flavours, and the
+ * caller's response differs:
+ *
+ * - `'access-token-expired'` — the access token aged out (~1 h). Recoverable
+ *   WITHOUT a human: exchange the refresh token.
+ * - `'refresh-token-invalid'` — Entra rejected the refresh token
+ *   (`invalid_grant`): revoked, password changed, re-evaluated by Conditional
+ *   Access, or simply unused past its inactivity window. A human has to sign
+ *   in again.
+ */
+export class DelegatedTokenExpiredError extends TeamsProvisionerError {
+  public readonly reason: 'access-token-expired' | 'refresh-token-invalid';
+  /** `true` when a refresh exchange can fix this without a human. */
+  public readonly recoverableByRefresh: boolean;
+
+  constructor(
+    reason: 'access-token-expired' | 'refresh-token-invalid',
+    cause?: unknown,
+  ) {
+    super(
+      reason === 'access-token-expired'
+        ? 'delegated_token_expired: the delegated access token has expired — ' +
+            'exchange the stored refresh token for a fresh one and retry'
+        : 'delegated_token_expired: Entra rejected the stored refresh token ' +
+            '(revoked, expired, or invalidated by a credential/policy change) ' +
+            '— a tenant admin has to complete the device-code sign-in again',
+      cause,
+    );
+    this.name = 'DelegatedTokenExpiredError';
+    this.reason = reason;
+    this.recoverableByRefresh = reason === 'access-token-expired';
+  }
+}
+
+/**
+ * The device-code protocol itself failed in a way that is neither "still
+ * waiting" nor an ordinary terminal outcome.
+ *
+ * The three EXPECTED terminal states (`authorization_pending`,
+ * `expired_token`, `authorization_declined`) are deliberately NOT errors —
+ * they surface as the poll result's discriminant so the caller renders a
+ * status instead of catching. This class covers the rest: a malformed handle,
+ * an unregistered/mis-typed client, a tenant that blocks device code flow via
+ * Conditional Access, or a token endpoint answering something unparseable.
+ */
+export class DeviceCodeFlowError extends TeamsProvisionerError {
+  /** OAuth `error` field when Entra sent one, e.g. `invalid_client`. */
+  public readonly oauthError?: string;
+  /** HTTP status of the devicecode/token response, when there was one. */
+  public readonly status?: number;
+
+  constructor(
+    message: string,
+    detail?: { readonly oauthError?: string; readonly status?: number },
+    cause?: unknown,
+  ) {
+    super(`device_code_flow_failed: ${message}`, cause);
+    this.name = 'DeviceCodeFlowError';
+    if (detail?.oauthError !== undefined) this.oauthError = detail.oauthError;
+    if (detail?.status !== undefined) this.status = detail.status;
+  }
+}
+
 /**
  * HTTP statuses that mean "the same call can succeed later": throttling,
  * request timeouts and the 5xx family. Deliberately NOT 404 — a bare
@@ -305,6 +458,14 @@ export function isTransientProvisioningFailure(err: unknown): boolean {
   if (err instanceof DirectoryReplicationError) return true;
   // A taken global bot handle is a verdict, not a hiccup — never retry it.
   if (err instanceof BotHandleUnavailableError) return false;
+  // Every delegated-auth failure needs a DIFFERENT action (sign in, consent,
+  // refresh) — none of them is fixed by replaying the identical call, so they
+  // are listed explicitly rather than left to the message-pattern fallback
+  // below, which could match one of their explanatory sentences by accident.
+  if (err instanceof DelegatedSignInRequiredError) return false;
+  if (err instanceof DelegatedConsentRequiredError) return false;
+  if (err instanceof DelegatedTokenExpiredError) return false;
+  if (err instanceof DeviceCodeFlowError) return false;
   if (err instanceof ProvisioningRequestError) {
     return TRANSIENT_HTTP_STATUSES.has(err.status);
   }

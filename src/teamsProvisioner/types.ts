@@ -194,6 +194,22 @@ export interface UploadToCatalogInput {
   readonly packageZip: Uint8Array;
   /** Manifest id — used for the pre-flight `externalId` lookup on 409. */
   readonly externalId: string;
+  /**
+   * SECRET. Delegated (user) access token for `POST /appCatalogs/teamsApps`.
+   *
+   * REQUIRED IN PRACTICE, optional in the type (byte5ai/omadia#924): Graph
+   * supports this verb for delegated permissions only, so an app-only upload is
+   * refused no matter which app roles are consented. The field stays optional
+   * so the interface remains signature-compatible for consumers compiled
+   * against an older connector — omitting it does not fail to compile, it
+   * throws the typed `DelegatedSignInRequiredError` at call time, which is the
+   * signal telling the caller to start the device-code sign-in.
+   *
+   * Prefer `TeamsProvisionerAccessor.uploadToCatalogDelegated`, which takes the
+   * whole stored token set and hands back a refreshed one; this field is the
+   * low-level seam for a caller that already holds a fresh access token.
+   */
+  readonly delegatedAccessToken?: string;
 }
 
 /** Input for the team-install step. */

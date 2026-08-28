@@ -54,9 +54,24 @@ import {
 } from './botService.js';
 import {
   CatalogUploadClient,
+  type DelegatedCatalogUploadResult,
   type GetCatalogAppInput,
   type GetCatalogAppResult,
+  type UploadToCatalogDelegatedInput,
 } from './catalog.js';
+import {
+  DelegatedAuthClient,
+  adminConsentUrl,
+  describeSignInStatus,
+  revokeInstructions,
+  type DelegatedRevokeResult,
+  type DelegatedSignInStatus,
+  type DelegatedTokenSet,
+  type DeviceCodeFlowHandle,
+  type DeviceCodePollResult,
+  type DeviceCodeStart,
+} from './delegatedAuth.js';
+import { PublisherAppClient } from './publisherApp.js';
 import { isArmConfigured, type ArmConfigResult } from './config.js';
 import {
   TeamLookupClient,
@@ -147,10 +162,102 @@ export interface TeamsProvisionerAccessor {
   /** Probe an existing bot resource by handle. */
   getBot(botName: string): Promise<GetBotResult>;
 
-  /** Chain step 4 — publish the app package into the tenant catalog. */
+  /**
+   * Chain step 4 — publish the app package into the tenant catalog.
+   *
+   * SINCE 0.6.0 this step needs a DELEGATED access token in
+   * `input.delegatedAccessToken` (byte5ai/omadia#924). Graph supports
+   * `POST /appCatalogs/teamsApps` for delegated permissions only, so the
+   * app-only call this used to make is refused by the service regardless of
+   * consent. The parameter shape is unchanged — the field is optional — but a
+   * call without a token now throws `DelegatedSignInRequiredError` instead of
+   * reaching Graph.
+   *
+   * Prefer {@link uploadToCatalogDelegated}, which takes the stored token set
+   * and handles the refresh.
+   */
   uploadToCatalog(
     input: UploadToCatalogInput,
   ): Promise<Idempotent<CatalogTeamsApp>>;
+
+  /**
+   * Chain step 4, the form a caller with STORED credentials wants (since
+   * 0.6.0): refresh the delegated access token when stale, publish, and return
+   * the possibly-rotated token set for persistence.
+   *
+   * FEATURE-DETECT it (`typeof provisioner.uploadToCatalogDelegated ===
+   * 'function'`) — same reason as {@link uninstallFromTeam}: the middleware
+   * mirrors this contract structurally rather than importing it.
+   */
+  uploadToCatalogDelegated(
+    input: UploadToCatalogDelegatedInput,
+  ): Promise<DelegatedCatalogUploadResult>;
+
+  /**
+   * Begin the one-time admin sign-in that makes catalog publishing possible
+   * (since 0.6.0, byte5ai/omadia#924).
+   *
+   * Provisions the tenant's publisher app on first use (idempotent, no secret,
+   * one delegated scope) and starts an RFC 8628 device-code flow against it.
+   * Show `userCode` and `verificationUri` to the operator; keep `flowHandle`
+   * like a password and feed it to {@link pollDelegatedSignIn}.
+   *
+   * Call it only when the operator is ready — the code expires ~15 minutes
+   * from this call, not from when they read it.
+   */
+  startDelegatedSignIn(input?: {
+    /** Portal/consent-screen name of the publisher app. */
+    readonly displayName?: string;
+  }): Promise<DeviceCodeStart>;
+
+  /**
+   * Continue a device-code sign-in (since 0.6.0). Costs no Graph call — every
+   * piece of state lives in the handle, so any process/instance can poll a flow
+   * another one started.
+   *
+   * `'pending'` carries the interval to wait; `'succeeded'` carries the tokens
+   * to persist; `'expired'` and `'declined'` are terminal and need a new flow.
+   * Read `reason` on `'declined'` before blaming the admin — a tenant that
+   * blocks device code flow by Conditional Access lands there too.
+   */
+  pollDelegatedSignIn(input: {
+    readonly flowHandle: DeviceCodeFlowHandle;
+  }): Promise<DeviceCodePollResult>;
+
+  /**
+   * What the stored credential currently is (since 0.6.0). Synchronous and
+   * side-effect free — it inspects what the caller passes in and makes no
+   * network call, because a status widget must not cost a token round trip.
+   */
+  getDelegatedSignInStatus(input: {
+    /** The persisted token set, or `undefined` when nobody has signed in. */
+    readonly tokens?: DelegatedTokenSet;
+  }): DelegatedSignInStatus;
+
+  /**
+   * Renew a stored credential explicitly (since 0.6.0). Returns the ROTATED
+   * token set — persist it, or Entra's rotation eventually strands the caller
+   * on a dead refresh token.
+   */
+  refreshDelegatedToken(input: {
+    readonly tokens: DelegatedTokenSet;
+  }): Promise<DelegatedTokenSet>;
+
+  /**
+   * End the delegated sign-in (since 0.6.0).
+   *
+   * Honest about its limits: the connector holds no tokens, so revoking is
+   * primarily the caller DISCARDING what it stored — that is what the result
+   * instructs. Server-side revocation is deliberately not attempted here.
+   * Removing the tenant grant needs `DelegatedPermissionGrant.ReadWrite.All`,
+   * which this connector does not have and should not get for one upload; and
+   * deleting the publisher app would reserve its `uniqueName` for 30 days and
+   * lock the tenant out of signing in again (byte5ai/omadia#916). The result
+   * therefore carries the portal URL where an admin can withdraw consent.
+   */
+  revokeDelegatedSignIn(input: {
+    readonly tokens?: DelegatedTokenSet;
+  }): DelegatedRevokeResult;
 
   /**
    * Lookup probe for step 4 — resolve an EXISTING catalog app by manifest id
@@ -269,7 +376,45 @@ export function createTeamsProvisioner(
       : {}),
   });
   const bots = new BotServiceClient({ http, armConfig, log: options.log });
-  const catalog = new CatalogUploadClient({ http, log: options.log });
+
+  // Delegated publish plumbing (byte5ai/omadia#924). The publisher app is
+  // resolved LAZILY, on the first sign-in — activation stays side-effect free,
+  // so an install that never publishes a Teams app never registers one.
+  const publisherApps = new PublisherAppClient({
+    http,
+    tenantId: options.graphCredential.tenantId,
+    log: options.log,
+    ...(options.sleep !== undefined ? { replication: { sleep: options.sleep } } : {}),
+  });
+  /**
+   * A delegated-auth client bound to whichever publisher app a token set names.
+   *
+   * Deriving it from the TOKENS rather than from a resolved publisher app is
+   * what lets refresh and status work with no Graph call at all — and it keeps
+   * a credential minted against an older publisher app renewable instead of
+   * silently pointed at a new one.
+   */
+  const authFor = (tenantId: string, clientId: string): DelegatedAuthClient =>
+    new DelegatedAuthClient({
+      tenantId,
+      clientId,
+      log: options.log,
+      ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+      ...(options.sleep !== undefined ? { sleep: options.sleep } : {}),
+    });
+
+  const catalog = new CatalogUploadClient({
+    http,
+    log: options.log,
+    delegatedAuth: {
+      ensureFreshToken: (tokens) =>
+        authFor(tokens.tenantId, tokens.clientId).ensureFreshToken(tokens),
+      adminConsentUrlFor: (tokens) =>
+        tokens !== undefined
+          ? adminConsentUrl(tokens.tenantId, tokens.clientId)
+          : `run startDelegatedSignIn to obtain the admin-consent URL for tenant ${options.graphCredential.tenantId}`,
+    },
+  });
   const installs = new TeamInstallClient({ http, log: options.log });
   const teamLookup = new TeamLookupClient({ http, log: options.log });
 
@@ -285,7 +430,31 @@ export function createTeamsProvisioner(
     deleteBot: (botName) => bots.deleteBot(botName),
     getBot: (botName) => bots.getBot(botName),
     uploadToCatalog: (input) => catalog.uploadToCatalog(input),
+    uploadToCatalogDelegated: (input) => catalog.uploadToCatalogDelegated(input),
     getCatalogApp: (input) => catalog.getCatalogApp(input),
+    startDelegatedSignIn: async (input) => {
+      const publisher = await publisherApps.ensurePublisherApp(input ?? {});
+      return authFor(
+        publisher.value.tenantId,
+        publisher.value.appId,
+      ).startDeviceCode();
+    },
+    pollDelegatedSignIn: (input) =>
+      // The handle carries tenant + client id, so the constructor arguments
+      // here are placeholders the poll never reads. Passing the connector's
+      // own tenant keeps the object well-formed without a Graph lookup.
+      authFor(
+        options.graphCredential.tenantId,
+        options.graphCredential.clientId,
+      ).pollDeviceCode(input),
+    getDelegatedSignInStatus: (input) => describeSignInStatus(input.tokens),
+    refreshDelegatedToken: (input) =>
+      authFor(input.tokens.tenantId, input.tokens.clientId).refresh({
+        refreshToken: input.tokens.refreshToken,
+        tenantId: input.tokens.tenantId,
+        clientId: input.tokens.clientId,
+      }),
+    revokeDelegatedSignIn: (input) => revokeInstructions(input.tokens),
     installToTeam: (input) => installs.installToTeam(input),
     uninstallFromTeam: (input) => installs.uninstallFromTeam(input),
     getTeam: (input) => teamLookup.getTeam(input),
@@ -333,9 +502,52 @@ export {
   ProvisioningRequestError,
   UniqueNameReservedError,
   BotHandleUnavailableError,
+  // Delegated catalog-publish taxonomy (byte5ai/omadia#924).
+  DelegatedSignInRequiredError,
+  DelegatedConsentRequiredError,
+  DelegatedTokenExpiredError,
+  DeviceCodeFlowError,
   DELETED_ITEM_RETENTION_DAYS,
   isTransientProvisioningFailure,
 } from './errors.js';
+
+// Delegated catalog publishing (byte5ai/omadia#924). The DelegatedAuthClient
+// and PublisherAppClient classes stay internal — the accessor is the surface.
+export {
+  APP_CATALOG_DELEGATED_SCOPE,
+  APP_CATALOG_DELEGATED_PERMISSION_ID,
+  DELEGATED_PUBLISH_SCOPES,
+  GRAPH_RESOURCE_APP_ID,
+  adminConsentUrl,
+  coversCatalogPublish,
+  describeSignInStatus,
+  isAccessTokenStale,
+  revokeInstructions,
+} from './delegatedAuth.js';
+export type {
+  DelegatedAccount,
+  DelegatedRevokeResult,
+  DelegatedSignInStatus,
+  DelegatedSignedInStatus,
+  DelegatedSignedOutStatus,
+  DelegatedTokenSet,
+  DeviceCodeDeclined,
+  DeviceCodeExpired,
+  DeviceCodeFlowHandle,
+  DeviceCodePending,
+  DeviceCodePollResult,
+  DeviceCodeStart,
+  DeviceCodeSucceeded,
+} from './delegatedAuth.js';
+
+export {
+  PUBLISHER_APP_DISPLAY_NAME,
+  PUBLISHER_APP_UNIQUE_NAME_PREFIX,
+  publisherAppUniqueName,
+} from './publisherApp.js';
+export type { PublisherApp } from './publisherApp.js';
+
+export { redactSecrets, redactUnknown, REDACTED } from './redact.js';
 
 export {
   ARM_MANAGEMENT_HOST,
@@ -386,8 +598,11 @@ export type {
 export type {
   CatalogAppFound,
   CatalogAppNotFound,
+  DelegatedCatalogUploadResult,
+  DelegatedUploadAuthority,
   GetCatalogAppInput,
   GetCatalogAppResult,
+  UploadToCatalogDelegatedInput,
 } from './catalog.js';
 
 export { TEAM_READ_SCOPE } from './teamLookup.js';

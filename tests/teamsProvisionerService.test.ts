@@ -278,9 +278,46 @@ describe('createTeamsProvisioner — capability assembly', () => {
       'getCatalogApp',
       'installToTeam',
       'uninstallFromTeam',
+      // Delegated catalog publishing (0.6.0, byte5ai/omadia#924).
+      'uploadToCatalogDelegated',
+      'startDelegatedSignIn',
+      'pollDelegatedSignIn',
+      'getDelegatedSignInStatus',
+      'refreshDelegatedToken',
+      'revokeDelegatedSignIn',
     ] as const) {
       assert.equal(typeof provisioner[step], 'function', `missing step ${step}`);
     }
+  });
+
+  it('stays side-effect free: no Graph call until a step runs', async () => {
+    // The publisher app is provisioned LAZILY, on the first sign-in. Resolving
+    // it during activation would make every install register an app it may
+    // never use — and would make activation fail on a Graph hiccup.
+    const { ctx } = fakeContext();
+    const armConfig = await readArmConfig(ctx, {
+      clientId: APP_ID,
+      clientSecret: APP_SECRET,
+    });
+    const provisioner = createTeamsProvisioner({
+      graphCredential: {
+        tenantId: TENANT,
+        clientId: APP_ID,
+        clientSecret: APP_SECRET,
+      },
+      armConfig,
+      secrets: ctx.secrets,
+      fetchImpl: trapFetch,
+      log: () => {},
+    });
+
+    // The pure members answer without touching the network at all.
+    const signedOut = provisioner.getDelegatedSignInStatus({});
+    assert.equal(signedOut.signedIn, false);
+    assert.equal(
+      provisioner.revokeDelegatedSignIn({}).outcome,
+      'not-signed-in',
+    );
   });
 });
 
@@ -315,7 +352,8 @@ describe('manifest.yaml / package.json hub edits', () => {
   it('bumps the version in BOTH files without drift', () => {
     // 0.5.3 — `teamsProvisioner@1.getTeam`, the team-name lookup.
     // 0.5.4 — the global bot-handle verdict + the stricter handle grammar (#921).
-    assert.equal(pkg.version, '0.5.4');
+    // 0.6.0 — delegated catalog publishing via device code (#924).
+    assert.equal(pkg.version, '0.6.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
