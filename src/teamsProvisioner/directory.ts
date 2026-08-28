@@ -266,11 +266,12 @@ function parseDeletedApplication(item: unknown): DeletedApplication | undefined 
 /**
  * Bring a soft-deleted application back out of the recycle bin.
  *
- * `POST /directory/deletedItems/{id}/restore` is the ONLY way to free a
- * reserved `uniqueName` before the retention window ends — a purge keeps the
- * name reserved too. Restoring returns the ORIGINAL object (same appId, same
- * uniqueName), which is exactly what re-provisioning the same agent slug is
- * supposed to yield.
+ * Restoring returns the ORIGINAL object — same appId, same uniqueName — which
+ * is exactly what re-provisioning the same agent slug is supposed to yield,
+ * and it is the only recovery that keeps the identity intact. (A permanent
+ * delete of the recycle-bin entry also frees the name, verified against a
+ * live tenant, but it destroys the app and its appId along with it — the
+ * operator's escape hatch, not the provisioner's.)
  *
  * Throws on failure; the caller turns that into the explanatory
  * `UniqueNameReservedError`.
