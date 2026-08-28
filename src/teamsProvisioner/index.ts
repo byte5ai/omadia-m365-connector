@@ -101,8 +101,13 @@ export interface TeamsProvisionerAccessor {
   /**
    * Chain step 1+2 — register (or find via `uniqueName`) the SingleTenant
    * Entra app, rotate a client secret into the vault (only the `secretRef`
-   * is returned) and ensure the service principal exists. Rolled back on
-   * partial failure.
+   * is returned) and ensure the service principal exists.
+   *
+   * Idempotent and interruption-friendly: a taken `uniqueName` adopts the
+   * existing registration, Entra's replication windows are polled through,
+   * and rollback of a partial failure is narrow — never on a transient error,
+   * never deleting a registration that carries a `uniqueName`
+   * (byte5ai/omadia#916).
    */
   createAppRegistration(
     input: CreateAppRegistrationInput,

@@ -221,13 +221,18 @@ export class AppRegistrationClient {
    * `secretRef` is returned), and ensure the service principal exists.
    *
    * The `Idempotent` outcome reflects the REGISTRATION: `'already-existed'`
-   * means the app was found via `uniqueName` — the secret is still rotated
-   * (deterministic vault key, intended overwrite) and the service principal
-   * still ensured.
+   * means the app was found via `uniqueName` (possibly restored from the
+   * recycle bin) — the secret is still rotated (deterministic vault key,
+   * intended overwrite) and the service principal still ensured.
    *
-   * On a partial failure everything this call created is rolled back
-   * (app registration and/or vault entry and/or password credential),
-   * best-effort with logging, and the ORIGINAL error is rethrown.
+   * Safe to re-run, and interruption-friendly: `onRegistrationCreated` fires
+   * the moment the registration exists so the caller can persist `appId`
+   * before anything else can fail.
+   *
+   * On a partial failure the ORIGINAL error is always rethrown, and what gets
+   * undone is deliberately narrow (byte5ai/omadia#916): a TRANSIENT failure
+   * undoes nothing, and a registration carrying a `uniqueName` is never
+   * deleted — see {@link rollbackPartialCreate}.
    */
   async createAppRegistration(
     input: CreateAppRegistrationInput,

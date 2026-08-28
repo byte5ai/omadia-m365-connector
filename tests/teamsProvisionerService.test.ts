@@ -313,7 +313,7 @@ describe('manifest.yaml / package.json hub edits', () => {
   ) as { version: string };
 
   it('bumps the version in BOTH files without drift', () => {
-    assert.equal(pkg.version, '0.5.1');
+    assert.equal(pkg.version, '0.5.2');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
