@@ -26,6 +26,14 @@
  * audiences (`graph.microsoft.com/.default` vs `management.azure.com/.default`)
  * and the optional dedicated ARM service principal never collide.
  *
+ * ONE EXCEPTION, and only one: `ProvisioningRequest.bearerToken`
+ * (byte5ai/omadia#924). `POST /appCatalogs/teamsApps` is delegated-only in
+ * Graph — application permissions are documented as "Not supported." and the
+ * field test confirms the upload is refused for an app-only token that the
+ * catalog LOOKUP accepts. That one verb therefore carries a user token supplied
+ * by the caller. It is never cached here and never falls back to the app
+ * identity, so the two auth modes cannot be confused at runtime.
+ *
  * Invariants: token-based REST only (no `az` CLI, no child_process, no msal —
  * msal stays confined to the delegated OBO flow in `graphObo.ts`); error
  * messages NEVER contain the client secret or a bearer token, bodies are
@@ -44,6 +52,20 @@ import {
   ProvisioningRequestError,
   ProvisioningThrottledError,
 } from './errors.js';
+import { redactSecrets } from './redact.js';
+
+/**
+ * Bound AND scrub a response body before it may appear in a message.
+ *
+ * `truncate` alone was enough while every credential this layer handled was a
+ * client secret it never read back. Since the delegated catalog upload
+ * (byte5ai/omadia#924) a bearer token travels on requests here, and a 4xx body
+ * — or an identity-platform body reached through this path — can echo one. The
+ * redaction runs on the ERROR path only, so the success path pays nothing.
+ */
+function safeDetail(bodyText: string): string {
+  return truncate(redactSecrets(bodyText), 200);
+}
 
 /** Which API a request targets — also the audience key for token + errors. */
 export type ProvisioningResource = 'graph' | 'arm';
@@ -113,6 +135,19 @@ export interface ProvisioningRequest {
   };
   /** Scopes reported when this call answers 403 (→ ConsentMissingError). */
   readonly missingScopesOn403: readonly string[];
+  /**
+   * Use THIS bearer token instead of the app-only one from the token cache.
+   *
+   * Exists for exactly one verb: `POST /appCatalogs/teamsApps`, which Graph
+   * supports for DELEGATED permissions only (byte5ai/omadia#924). Everything
+   * else stays app-only, so this stays an opt-in override rather than a mode.
+   *
+   * SECRET. Never logged, never put into an error message, never cached — the
+   * caller owns this token's lifetime and this layer only forwards it. When
+   * set, no client-credentials token is requested at all, so a delegated call
+   * cannot silently fall back to the app identity that Graph would refuse.
+   */
+  readonly bearerToken?: string;
   /** Override the resource-default request budget (ms). */
   readonly timeoutMs?: number;
   /**
@@ -272,7 +307,9 @@ export class ProvisioningHttp {
     let lastRetryAfterSeconds: number | undefined;
 
     for (let attempt = 0; ; attempt += 1) {
-      const token = await this.accessToken(req.resource);
+      // An explicit bearer token REPLACES the app-only one; it is never merged
+      // with it and never cached (byte5ai/omadia#924).
+      const token = req.bearerToken ?? (await this.accessToken(req.resource));
       const headers: Record<string, string> = {
         Authorization: `Bearer ${token}`,
       };
@@ -318,7 +355,7 @@ export class ProvisioningHttp {
           req.missingScopesOn403,
           req.resource,
           new Error(
-            `${req.resource} ${req.step} 403 body=${truncate(bodyText, 200)}`,
+            `${req.resource} ${req.step} 403 body=${safeDetail(bodyText)}`,
           ),
         );
       }
@@ -330,7 +367,7 @@ export class ProvisioningHttp {
             req.resource,
             lastRetryAfterSeconds,
             new Error(
-              `${req.resource} ${req.step} 429 after ${String(attempt + 1)} attempts body=${truncate(bodyText, 200)}`,
+              `${req.resource} ${req.step} 429 after ${String(attempt + 1)} attempts body=${safeDetail(bodyText)}`,
             ),
           );
         }
@@ -343,7 +380,7 @@ export class ProvisioningHttp {
             req.resource,
             lastRetryAfterSeconds,
             new Error(
-              `${req.resource} ${req.step} 429 Retry-After ${String(delayMs)}ms exceeds the ${String(MAX_BACKOFF_MS)}ms backoff cap body=${truncate(bodyText, 200)}`,
+              `${req.resource} ${req.step} 429 Retry-After ${String(delayMs)}ms exceeds the ${String(MAX_BACKOFF_MS)}ms backoff cap body=${safeDetail(bodyText)}`,
             ),
           );
         }
@@ -358,7 +395,7 @@ export class ProvisioningHttp {
         req.resource,
         req.step,
         response.status,
-        `${req.resource} ${req.step} ${String(response.status)} ${req.method} ${truncate(req.url, 120)} body=${truncate(bodyText, 200)}`,
+        `${req.resource} ${req.step} ${String(response.status)} ${req.method} ${truncate(req.url, 120)} body=${safeDetail(bodyText)}`,
       );
     }
   }
@@ -418,7 +455,7 @@ export class ProvisioningHttp {
       await this.sleep(nextWaitMs);
       nextWaitMs = this.pollIntervalMs;
 
-      const token = await this.accessToken(req.resource);
+      const token = req.bearerToken ?? (await this.accessToken(req.resource));
       const poll = await this.fetchImpl(pollUrl, {
         method: 'GET',
         headers: { Authorization: `Bearer ${token}` },
@@ -442,7 +479,7 @@ export class ProvisioningHttp {
           req.resource,
           `${req.step} poll`,
           poll.status,
-          `${req.resource} ${req.step} poll ${String(poll.status)} body=${truncate(bodyText, 200)}`,
+          `${req.resource} ${req.step} poll ${String(poll.status)} body=${safeDetail(bodyText)}`,
         );
       }
 
@@ -469,7 +506,7 @@ export class ProvisioningHttp {
       }
       if (terminal === 'failed' || terminal === 'canceled') {
         throw new Error(
-          `${req.resource} ${req.step} long-running operation ${terminal} body=${truncate(JSON.stringify(json ?? ''), 200)}`,
+          `${req.resource} ${req.step} long-running operation ${terminal} body=${safeDetail(JSON.stringify(json ?? ''))}`,
         );
       }
     }
@@ -481,7 +518,7 @@ export class ProvisioningHttp {
 
   /** Final GET of the just-provisioned resource (bodiless 202 async path). */
   private async fetchResource(req: ProvisioningRequest): Promise<unknown> {
-    const token = await this.accessToken(req.resource);
+    const token = req.bearerToken ?? (await this.accessToken(req.resource));
     const response = await this.fetchImpl(req.url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
@@ -495,7 +532,7 @@ export class ProvisioningHttp {
         req.resource,
         `${req.step} final read`,
         response.status,
-        `${req.resource} ${req.step} final read ${String(response.status)} body=${truncate(bodyText, 200)}`,
+        `${req.resource} ${req.step} final read ${String(response.status)} body=${safeDetail(bodyText)}`,
       );
     }
     return safeJson(response);

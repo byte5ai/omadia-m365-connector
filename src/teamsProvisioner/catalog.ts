@@ -9,6 +9,20 @@
  * plain `Uint8Array` parameter — no compile/test dependency on the packaging
  * unit; any buffer works.
  *
+ * THE UPLOAD IS THE ONE DELEGATED STEP OF THE WHOLE CHAIN (byte5ai/omadia#924).
+ * Graph documents application permissions for `POST /appCatalogs/teamsApps` as
+ * "Not supported.", and the field test matches: with a single app-only token
+ * the catalog LOOKUP below succeeds while the UPLOAD is rejected, although
+ * `AppCatalog.ReadWrite.All` is assigned as an app role and consented. No
+ * consent fixes it, because it is not a consent problem. So the upload carries
+ * a delegated (user) token — acquired once per tenant through the device-code
+ * flow in `delegatedAuth.ts` — and EVERYTHING ELSE in this module, including
+ * the `externalId` lookup on the idempotent 409 path, stays app-only.
+ *
+ * The asymmetry is deliberate and worth keeping: it means a stale or missing
+ * user token degrades exactly one operation instead of blinding the provisioner
+ * to what is already in the catalog.
+ *
  * IDEMPOTENCY — 409 is success, but NOT a bare swallow. Graph answers 409
  * when an app with the same manifest id (`externalId`) is already published.
  * The shared http layer maps that to its `{ kind: 'conflict' }` signal and
@@ -19,13 +33,28 @@
  *
  * All HTTP goes through the shared {@link ProvisioningHttp} choke point (one
  * token cache, Retry-After-honouring 429 backoff → `ProvisioningThrottledError`
- * when exhausted, 403 → `ConsentMissingError` carrying
- * {@link APP_CATALOG_SCOPE}) — the typed 403 is load-bearing: the middleware
- * agent factory (byte5ai/omadia#863-865) branches on it to fall back. This
- * module opens no second token cache and does no fetch of its own.
+ * when exhausted, 403 → `ConsentMissingError`). The typed 403 is load-bearing:
+ * the middleware agent factory (byte5ai/omadia#863-865) branches on it to fall
+ * back. This module opens no second token cache and does no fetch of its own.
+ *
+ * The DELEGATED publish translates that 403 one step further, into
+ * `DelegatedConsentRequiredError` — on that path an app role was never
+ * involved, so reporting a missing APPLICATION permission would point the
+ * operator at the wrong registration entirely.
  */
 
-import type { ProvisioningHttp } from './http.js';
+import {
+  APP_CATALOG_DELEGATED_SCOPE,
+  type DelegatedTokenSet,
+} from './delegatedAuth.js';
+import {
+  DelegatedConsentRequiredError,
+  DelegatedSignInRequiredError,
+  DelegatedTokenExpiredError,
+  ProvisioningRequestError,
+  ConsentMissingError,
+} from './errors.js';
+import type { ProvisioningHttp, ProvisioningResponse } from './http.js';
 import type {
   CatalogTeamsApp,
   Idempotent,
@@ -74,6 +103,62 @@ export const APP_CATALOG_SCOPE = 'AppCatalog.ReadWrite.All';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const ZIP_CONTENT_TYPE = 'application/zip';
+/** Step label of the delegated publish — reused across its typed errors. */
+const UPLOAD_STEP = 'appCatalogs.teamsApps.publish';
+/**
+ * Fallback for DelegatedConsentRequiredError.adminConsentUrl when this client
+ * was built without a delegated-auth client (only reachable via the low-level
+ * uploadToCatalog seam). A sentence beats an empty string: the caller still has
+ * to show an operator SOMETHING actionable.
+ */
+const UNKNOWN_CONSENT_URL_HINT =
+  '(resolve the publisher app first — call startDelegatedSignIn to obtain the admin-consent URL)';
+
+/** Result of the token-carrying upload — the credential may have rotated. */
+export interface DelegatedCatalogUploadResult {
+  /** Same idempotent outcome as the app-only surface used to produce. */
+  readonly app: Idempotent<CatalogTeamsApp>;
+  /**
+   * The token set to persist. `refreshed` says whether it CHANGED — a caller
+   * that ignores it and never writes back will eventually force a needless
+   * second admin sign-in, because Entra rotates the refresh token.
+   */
+  readonly tokens: DelegatedTokenSet;
+  readonly refreshed: boolean;
+}
+
+/**
+ * What the catalog client needs from the delegated-auth layer.
+ *
+ * A narrow port rather than the `DelegatedAuthClient` class: the publisher app's
+ * client id is only known once a token set exists, so both members take the
+ * tokens as an argument instead of being bound at construction time. That keeps
+ * the provisioner constructible without a Graph round trip — activation must
+ * stay side-effect free.
+ */
+export interface DelegatedUploadAuthority {
+  /** Refresh a stale access token; `refreshed` says whether it changed. */
+  ensureFreshToken(tokens: DelegatedTokenSet): Promise<{
+    readonly tokens: DelegatedTokenSet;
+    readonly refreshed: boolean;
+  }>;
+  /**
+   * Admin-consent URL for the publisher app these tokens belong to. Called on
+   * the failure path only; `undefined` tokens (the low-level seam) yield an
+   * actionable sentence instead.
+   */
+  adminConsentUrlFor(tokens: DelegatedTokenSet | undefined): string;
+}
+
+/** Input for {@link CatalogUploadClient.uploadToCatalogDelegated}. */
+export interface UploadToCatalogDelegatedInput {
+  /** The zipped Teams app package. */
+  readonly packageZip: Uint8Array;
+  /** Manifest id — used for the pre-flight `externalId` lookup on 409. */
+  readonly externalId: string;
+  /** SECRET. The stored delegated credential, refreshed here when stale. */
+  readonly tokens: DelegatedTokenSet;
+}
 
 export interface CatalogUploadClientOptions {
   /**
@@ -82,6 +167,12 @@ export interface CatalogUploadClientOptions {
    * open a second token cache.
    */
   readonly http: Pick<ProvisioningHttp, 'request'>;
+  /**
+   * Delegated-auth client for the upload's user token. Optional so the module
+   * stays constructible (and testable) without one; `uploadToCatalogDelegated`
+   * then reports the missing sign-in the same way a missing token does.
+   */
+  readonly delegatedAuth?: DelegatedUploadAuthority;
   readonly log?: (msg: string) => void;
 }
 
@@ -92,15 +183,51 @@ export interface CatalogUploadClientOptions {
  */
 export class CatalogUploadClient {
   private readonly http: Pick<ProvisioningHttp, 'request'>;
+  private readonly delegatedAuth?: DelegatedUploadAuthority;
   private readonly log: (msg: string) => void;
 
   constructor(opts: CatalogUploadClientOptions) {
     this.http = opts.http;
+    if (opts.delegatedAuth !== undefined) this.delegatedAuth = opts.delegatedAuth;
     this.log =
       opts.log ??
       ((msg: string): void => {
         console.error(msg);
       });
+  }
+
+  /**
+   * The upload as a caller holding a STORED credential wants it: refresh the
+   * access token when it is stale, publish, and hand the (possibly rotated)
+   * token set back for persistence.
+   *
+   * This is the method the middleware should call. {@link uploadToCatalog}
+   * remains the lower-level seam for a caller that already has a fresh access
+   * token in hand.
+   *
+   * @throws {DelegatedTokenExpiredError} `'refresh-token-invalid'` — the stored
+   *   credential is dead; an admin must sign in again.
+   * @throws {DelegatedConsentRequiredError} tenant consent is missing or was
+   *   withdrawn; the error carries the admin-consent URL.
+   */
+  async uploadToCatalogDelegated(
+    input: UploadToCatalogDelegatedInput,
+  ): Promise<DelegatedCatalogUploadResult> {
+    if (this.delegatedAuth === undefined) {
+      throw new DelegatedSignInRequiredError(UPLOAD_STEP, [
+        APP_CATALOG_DELEGATED_SCOPE,
+      ]);
+    }
+    const { tokens, refreshed } = await this.delegatedAuth.ensureFreshToken(
+      input.tokens,
+    );
+    const app = await this.publishAndResolve(
+      input.packageZip,
+      tokens.accessToken,
+      requireNonEmpty(input.externalId, 'externalId'),
+      tokens,
+    );
+    return { app, tokens, refreshed };
   }
 
   /**
@@ -114,10 +241,19 @@ export class CatalogUploadClient {
    * - 409 → `'already-existed'` (same `externalId` already published) —
    *   success, never an exception. The existing entry is re-resolved by
    *   `externalId` so both outcomes carry an identical value shape.
-   * - 403 → `ConsentMissingError([APP_CATALOG_SCOPE], 'graph')` from the
-   *   http layer, so the agent factory gets ONE typed fallback branch.
+   * - 401 → `DelegatedTokenExpiredError('access-token-expired')` — the user
+   *   token aged out mid-flight; refresh and retry.
+   * - 403 → `DelegatedConsentRequiredError` carrying the admin-consent URL.
+   *   The app-only `ConsentMissingError` cannot apply here: the call did not
+   *   use an app identity, so telling an operator to grant an app role would
+   *   send them to fix something that was never the problem.
    * - 429 → retried by the http layer honouring `Retry-After`; exhausted
    *   budget → `ProvisioningThrottledError`.
+   *
+   * @throws {DelegatedSignInRequiredError} when no delegated token was passed.
+   *   Distinct from every other failure on purpose: it means "nobody has signed
+   *   in yet", whose remedy is a device-code flow, not a retry and not a
+   *   permission change.
    */
   async uploadToCatalog(
     input: UploadToCatalogInput,
@@ -131,19 +267,54 @@ export class CatalogUploadClient {
         "invalid_argument: 'packageZip' must be a non-empty Uint8Array",
       );
     }
+    const delegatedAccessToken = input.delegatedAccessToken;
+    if (
+      typeof delegatedAccessToken !== 'string' ||
+      delegatedAccessToken.length === 0
+    ) {
+      // Refusing BEFORE the request, not after Graph's 403: an app-only upload
+      // is known to be unsupported, and letting it go out would spend a Graph
+      // call to produce a misleading "consent missing" answer.
+      throw new DelegatedSignInRequiredError(UPLOAD_STEP, [
+        APP_CATALOG_DELEGATED_SCOPE,
+      ]);
+    }
 
-    const response = await this.http.request({
-      resource: 'graph',
-      method: 'POST',
-      url: `${GRAPH_BASE}/appCatalogs/teamsApps`,
-      step: 'appCatalogs.teamsApps.publish',
-      rawBody: { bytes: input.packageZip, contentType: ZIP_CONTENT_TYPE },
-      missingScopesOn403: [APP_CATALOG_SCOPE],
-    });
+    return this.publishAndResolve(
+      input.packageZip,
+      delegatedAccessToken,
+      externalId,
+      undefined,
+    );
+  }
+
+  /**
+   * Publish, then normalise both outcomes onto the identical
+   * {@link CatalogTeamsApp} shape — shared by the low-level and the
+   * token-carrying entry points so the 409 semantics can never drift apart.
+   */
+  private async publishAndResolve(
+    packageZip: Uint8Array,
+    delegatedAccessToken: string,
+    externalId: string,
+    tokens: DelegatedTokenSet | undefined,
+  ): Promise<Idempotent<CatalogTeamsApp>> {
+    if (!(packageZip instanceof Uint8Array) || packageZip.byteLength === 0) {
+      throw new Error(
+        "invalid_argument: 'packageZip' must be a non-empty Uint8Array",
+      );
+    }
+
+    const response = await this.publish(
+      packageZip,
+      delegatedAccessToken,
+      externalId,
+      tokens,
+    );
 
     if (response.kind === 'conflict') {
       this.log(
-        `provisioner appCatalogs.teamsApps.publish: externalId=${externalId} already in catalog (409 → already-existed)`,
+        `provisioner ${UPLOAD_STEP}: externalId=${externalId} already in catalog (409 → already-existed)`,
       );
       return {
         outcome: 'already-existed',
@@ -165,6 +336,54 @@ export class CatalogUploadClient {
       outcome: 'created',
       value: await this.resolveByExternalId(externalId),
     };
+  }
+
+  /**
+   * The one delegated Graph write, with its 401/403 answers translated into
+   * the delegated taxonomy.
+   *
+   * The translation is the point. Left alone, the shared http layer maps a 403
+   * to `ConsentMissingError` naming an APPLICATION permission — correct for
+   * every other step, actively misleading for this one, where the fix is a
+   * tenant grant on the publisher app and not an app role on the connector.
+   * A 401 likewise arrives as a generic request error when it actually means
+   * "your user token aged out; refresh it".
+   */
+  private async publish(
+    packageZip: Uint8Array,
+    delegatedAccessToken: string,
+    externalId: string,
+    tokens: DelegatedTokenSet | undefined,
+  ): Promise<ProvisioningResponse> {
+    try {
+      return await this.http.request({
+        resource: 'graph',
+        method: 'POST',
+        url: `${GRAPH_BASE}/appCatalogs/teamsApps`,
+        step: UPLOAD_STEP,
+        rawBody: { bytes: packageZip, contentType: ZIP_CONTENT_TYPE },
+        // SECRET — forwarded, never cached, never logged by the http layer.
+        bearerToken: delegatedAccessToken,
+        missingScopesOn403: [APP_CATALOG_DELEGATED_SCOPE],
+      });
+    } catch (err) {
+      if (err instanceof ConsentMissingError) {
+        throw new DelegatedConsentRequiredError(
+          UPLOAD_STEP,
+          [APP_CATALOG_DELEGATED_SCOPE],
+          this.delegatedAuth?.adminConsentUrlFor(tokens) ??
+            UNKNOWN_CONSENT_URL_HINT,
+          err,
+        );
+      }
+      if (err instanceof ProvisioningRequestError && err.status === 401) {
+        throw new DelegatedTokenExpiredError('access-token-expired', err);
+      }
+      this.log(
+        `provisioner ${UPLOAD_STEP}: publishing externalId=${externalId} failed`,
+      );
+      throw err;
+    }
   }
 
   /**

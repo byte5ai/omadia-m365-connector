@@ -172,9 +172,43 @@ extends it by exactly three scopes:
 | Scope | Chain step it unlocks |
 |---|---|
 | `Application.ReadWrite.OwnedBy` | `registerApplication` / `addClientSecret` — `POST /applications`, `POST /applications/{id}/addPassword`; per-agent apps stay owned by the connector app |
-| `AppCatalog.ReadWrite.All` | `uploadToCatalog` — `POST /appCatalogs/teamsApps` |
+| `AppCatalog.ReadWrite.All` | `getCatalogApp` and the idempotent 409 re-resolution — `GET /appCatalogs/teamsApps`. Since 0.6.0 it does **not** cover `uploadToCatalog`: Graph lists application permissions for `POST /appCatalogs/teamsApps` as "Not supported.", so that one step needs a DELEGATED token (below) |
 | `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps`; since 0.4.0 also `uninstallFromTeam` — `GET /teams/{id}/installedApps` + `DELETE /teams/{id}/installedApps/{installationId}` |
 | `Team.ReadBasic.All` | `getTeam` (since 0.5.0) — `GET /teams/{id}?$select=id,displayName`; resolves a team id to a NAME so consumers can label a team instead of printing its GUID. Optional in practice: without consent the lookup 403s and the consumer keeps showing the id |
+
+### The one delegated step: catalog upload (since 0.6.0)
+
+`POST /appCatalogs/teamsApps` is **delegated-only**. Graph's
+[Publish teamsApp](https://learn.microsoft.com/en-us/graph/api/teamsapp-publish)
+reference lists application permissions as **"Not supported."**, and the field
+test matches: with one app-only token the catalog *lookup* succeeds while the
+*upload* is rejected, although `AppCatalog.ReadWrite.All` is assigned as an app
+role and consented. No amount of consent changes that, because it is not a
+consent problem.
+
+So the connector registers a separate, minimal **publisher app** (public client,
+no client secret, exactly the delegated `AppCatalog.ReadWrite.All` scope) and one
+tenant admin signs into it **once** via the OAuth 2.0 device authorization grant.
+Every agent provisioned afterwards publishes automatically — there is no manual
+per-agent upload.
+
+| Delegated scope | Chain step it unlocks |
+|---|---|
+| `AppCatalog.ReadWrite.All` (delegated, admin consent required) | `uploadToCatalog` / `uploadToCatalogDelegated` — `POST /appCatalogs/teamsApps` |
+
+Two things worth knowing before rolling this out:
+
+- **`AppCatalog.Submit` is not enough**, despite being Graph's least-privileged
+  delegated permission for the endpoint — its own note says it submits apps for
+  review only and cannot publish to the catalog.
+- **Conditional Access can block the device code flow entirely.** Microsoft
+  recommends blocking it wherever possible and Entra ships an "authentication
+  flows" condition for exactly that. In such a tenant the poll returns
+  `{ status: 'declined' }` with an AADSTS code in `reason`. The narrow fix is a
+  policy exception for the publisher app.
+
+Full rationale, the publisher-app shape, the consent paths and the token
+lifecycle: [`docs/teams-provisioner-delegated-publish.md`](docs/teams-provisioner-delegated-publish.md).
 
 ### Consent semantics (renewed admin consent)
 
