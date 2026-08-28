@@ -174,6 +174,7 @@ extends it by exactly three scopes:
 | `Application.ReadWrite.OwnedBy` | `registerApplication` / `addClientSecret` — `POST /applications`, `POST /applications/{id}/addPassword`; per-agent apps stay owned by the connector app |
 | `AppCatalog.ReadWrite.All` | `uploadToCatalog` — `POST /appCatalogs/teamsApps` |
 | `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps`; since 0.4.0 also `uninstallFromTeam` — `GET /teams/{id}/installedApps` + `DELETE /teams/{id}/installedApps/{installationId}` |
+| `Team.ReadBasic.All` | `getTeam` (since 0.5.0) — `GET /teams/{id}?$select=id,displayName`; resolves a team id to a NAME so consumers can label a team instead of printing its GUID. Optional in practice: without consent the lookup 403s and the consumer keeps showing the id |
 
 ### Consent semantics (renewed admin consent)
 

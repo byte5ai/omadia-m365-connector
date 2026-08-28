@@ -56,6 +56,11 @@ Graph client via the service registry.
      into the target team (`POST /teams/{id}/installedApps`) and, since
      0.4.0, remove it again (`GET /teams/{id}/installedApps` +
      `DELETE /teams/{id}/installedApps/{installationId}`)
+   - `Team.ReadBasic.All` — since 0.5.0, resolve a team id to its display name
+     (`GET /teams/{id}?$select=id,displayName`) so consumers can show operators
+     a team NAME instead of a GUID. Read-only, and the narrowest scope that
+     answers the question. Without it the lookup 403s and consumers fall back
+     to the id — nothing else in the chain depends on it.
 
 This is the app-only (client-credentials) flow: no interactive user sign-in;
 access is tenant-wide within the granted permissions. The same app
