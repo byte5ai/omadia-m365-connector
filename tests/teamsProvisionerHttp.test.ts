@@ -576,3 +576,79 @@ describe('ProvisioningHttp ARM long-running poll mode', () => {
     assert.deepEqual(sleeps, [25, 25]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// byte5ai/omadia#916 — some APIs report a duplicate without a 409. Entra
+// answers a taken `uniqueName` on POST /applications with 400
+// Request_BadRequest, which the choke point must map onto the SAME idempotent
+// conflict signal — otherwise the app-registration adopt branch is
+// unreachable and the retry budget burns on an impossible create.
+// ---------------------------------------------------------------------------
+
+describe('ProvisioningHttp non-409 conflict rules (#916)', () => {
+  const CONFLICT_RULES = [
+    { status: 400, codes: ['ObjectConflict'] },
+    { status: 400, messageIncludes: ['same value for property uniquename'] },
+  ] as const;
+
+  const withRules: ProvisioningRequest = {
+    ...CREATE_APP,
+    conflictOn: CONFLICT_RULES,
+  };
+
+  const badRequest = (message: string, code = 'Request_BadRequest'): ResponseSpec => ({
+    status: 400,
+    body: { error: { code, message } },
+  });
+
+  it('matches on the Graph error code', async () => {
+    const { http } = harness([
+      route('/applications', badRequest('anything', 'ObjectConflict')),
+    ]);
+    const response = await http.request(withRules);
+    assert.equal(response.kind, 'conflict');
+    assert.equal(response.status, 400);
+  });
+
+  it('matches on the error message, whatever the code', async () => {
+    const { http } = harness([
+      route(
+        '/applications',
+        badRequest(
+          'Another object with the same value for property uniqueName already exists.',
+        ),
+      ),
+    ]);
+    const response = await http.request(withRules);
+    assert.equal(response.kind, 'conflict');
+    assert.deepEqual(
+      (response.json as { error: { code: string } }).error.code,
+      'Request_BadRequest',
+      'the parsed body travels with the conflict signal',
+    );
+  });
+
+  it('leaves an unrelated 400 on the error path', async () => {
+    const { http } = harness([
+      route('/applications', badRequest('Property displayName is invalid.')),
+    ]);
+    const err = await rejection(http.request(withRules));
+    assert.match((err as Error).message, /applications\.create 400/);
+  });
+
+  it('never fires for a status no rule declares', async () => {
+    const { http } = harness([
+      route('/applications', { status: 500, body: { error: { code: 'ObjectConflict' } } }),
+    ]);
+    const err = await rejection(http.request(withRules));
+    assert.match((err as Error).message, /applications\.create 500/);
+  });
+
+  it('a request without rules keeps the plain 409-only mapping', async () => {
+    const { http } = harness([
+      route('/applications', badRequest('anything', 'ObjectConflict')),
+    ]);
+    const err = await rejection(http.request(CREATE_APP));
+    assert.match((err as Error).message, /applications\.create 400/);
+  });
+});

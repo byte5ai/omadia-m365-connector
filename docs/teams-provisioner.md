@@ -119,12 +119,77 @@ backoff → `ProvisioningThrottledError`.
 > connector `< 0.4.0` must keep its not-supported branch
 > (`typeof provisioner.uninstallFromTeam === 'function'`) instead of crashing.
 
-### Idempotency — 409 is not an error
+### Idempotency — "already exists" is not an error
 
 Steps that can hit "already exists" on re-runs (catalog upload via
 `externalId` lookup, team install, app registration via `uniqueName`) return
 `Idempotent<T> = { outcome: 'created' | 'already-existed', value }`. Callers
 branch on `outcome`; nobody string-matches Graph error bodies.
+
+The signal is usually a 409 — but not always. Entra reports a taken
+`uniqueName` on `POST /applications` as **400 `Request_BadRequest`**
+("Another object with the same value for property uniqueName already
+exists."). A request may therefore declare `conflictOn` rules, and the choke
+point maps a matching status/code/message onto the same
+`{ kind: 'conflict' }` result. See `UNIQUE_NAME_CONFLICT_RULES` in
+`src/teamsProvisioner/directory.ts`.
+
+### Entra replication and the recycle bin (byte5ai/omadia#916)
+
+Two Entra behaviours the app-registration step has to survive, both found on
+the first real run against a customer tenant:
+
+**Eventual consistency.** `POST /applications` answers 201 and the immediate
+`POST /applications/{id}/addPassword` can answer 404
+`Request_ResourceNotFound` for a few seconds — the object exists, it is not
+replicated to the node serving the follow-up write. The step polls the new
+object until it is readable and retries `addPassword` through the same window
+(8 probes, ~40 s total, all seams injectable). An exhausted budget raises
+`DirectoryReplicationError`, which is **transient**: the app exists and is
+adoptable.
+
+**The recycle bin.** A deleted application is only SOFT-deleted, and its
+`uniqueName` stays reserved for 30 days while the object is invisible in
+`GET /applications`. On a conflict the step therefore looks in
+`directory/deletedItems/microsoft.graph.application` and **restores** the
+holder when it is one of ours (exact `uniqueName` match) — a restore returns
+the original object, which is exactly what re-provisioning the same agent slug
+should yield. If the recycle bin cannot be read (it needs
+`Application.ReadWrite.All`, which this connector deliberately does not ask
+for) or the restore fails, the step raises `UniqueNameReservedError`, whose
+message says *why* the name is unavailable and for how long instead of a bare
+"already exists" about an object the operator cannot find.
+
+### Rollback is narrow, on purpose
+
+The failure that motivated all of the above: a transient 404 was treated as a
+step failure, the partially-created app was rolled back, the delete
+soft-deleted it, its `uniqueName` became unavailable for 30 days, and all
+four remaining retries collided with an object nobody could see. One
+transient error burned a provisioning slug for a month.
+
+So `createAppRegistration` now:
+
+1. hands the caller the `appId` via `onRegistrationCreated` the moment the
+   registration exists — **before** the secret and the service principal — so
+   an interruption leaves a resumable row instead of an orphan;
+2. rolls back **nothing** when the failure is transient
+   (`isTransientProvisioningFailure`: throttling, pending replication, 5xx,
+   408/425/429, transport errors);
+3. never deletes a registration that carries a `uniqueName`, even on a
+   non-transient failure — it is addressable by its natural key, so the next
+   run adopts it. Deleting costs the name; keeping it costs one adoptable app.
+   A registration with no `uniqueName` is an orphan nothing could find again
+   and is still deleted.
+
+`deleteAppRegistration` stays the explicit, idempotent delete for
+deprovisioning.
+
+Adoption always mints a **fresh** client secret (the original was returned
+once and never persisted). Because that would otherwise accumulate a
+credential per re-run against Entra's cap, the step removes its own superseded
+credentials — matched by the deterministic secret label — and leaves every
+other credential on the app untouched.
 
 ### Graceful degradation — registration-only mode
 
