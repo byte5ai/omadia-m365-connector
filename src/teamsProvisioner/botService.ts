@@ -40,6 +40,7 @@
  */
 
 import { ARM_MANAGEMENT_HOST, type ArmConfigResult } from './config.js';
+import { BotHandleUnavailableError, ProvisioningRequestError } from './errors.js';
 import type { ProvisioningHttp, ProvisioningOkResponse } from './http.js';
 import type {
   AzureBot,
@@ -58,6 +59,16 @@ export const BOT_KIND_REGISTRATION = 'registration';
 export const BOT_SKU_F0 = 'F0';
 /** Pinned ARM body literal: the SingleTenant invariant, ARM-side. */
 export const BOT_MSA_APP_TYPE_SINGLE_TENANT = 'SingleTenant';
+/**
+ * Bot Framework handle bounds (byte5ai/omadia#921). Stricter than the ARM
+ * resource-name rule the same string also has to satisfy: 4-42 chars,
+ * alphanumerics and hyphens only, no leading/trailing hyphen.
+ */
+export const BOT_HANDLE_MIN_LENGTH = 4;
+export const BOT_HANDLE_MAX_LENGTH = 42;
+/** The handle grammar both ARM and Bot Framework accept. */
+export const BOT_HANDLE_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{2,40})[A-Za-z0-9]$/;
+
 /** ARM channel sub-resource name for the Teams enablement PUT. */
 export const MS_TEAMS_CHANNEL_NAME = 'MsTeamsChannel';
 
@@ -170,34 +181,44 @@ export class BotServiceClient {
     requireNonEmpty(input.msaAppTenantId, 'msaAppTenantId');
     requireNonEmpty(input.messagingEndpoint, 'messagingEndpoint');
 
-    const response = await this.http.request({
-      resource: 'arm',
-      method: 'PUT',
-      url: this.botUrl(botName),
-      step: 'botServices.put',
-      jsonBody: {
-        location: this.armConfig.region,
-        kind: BOT_KIND_REGISTRATION,
-        sku: { name: BOT_SKU_F0 },
-        properties: {
-          displayName: input.displayName,
-          endpoint: input.messagingEndpoint,
-          msaAppId: input.msaAppId,
-          // The SingleTenant invariant, ARM-side — always with the app tenant.
-          msaAppType: BOT_MSA_APP_TYPE_SINGLE_TENANT,
-          msaAppTenantId: input.msaAppTenantId,
+    let response;
+    try {
+      response = await this.http.request({
+        resource: 'arm',
+        method: 'PUT',
+        url: this.botUrl(botName),
+        step: 'botServices.put',
+        jsonBody: {
+          location: this.armConfig.region,
+          kind: BOT_KIND_REGISTRATION,
+          sku: { name: BOT_SKU_F0 },
+          properties: {
+            displayName: input.displayName,
+            endpoint: input.messagingEndpoint,
+            msaAppId: input.msaAppId,
+            // The SingleTenant invariant, ARM-side — always with the app tenant.
+            msaAppType: BOT_MSA_APP_TYPE_SINGLE_TENANT,
+            msaAppTenantId: input.msaAppTenantId,
+          },
         },
-      },
-      missingScopesOn403: [BOT_SERVICES_WRITE_ACTION],
-      pollLongRunning: true,
-    });
+        missingScopesOn403: [BOT_SERVICES_WRITE_ACTION],
+        pollLongRunning: true,
+      });
+    } catch (err) {
+      // ARM reports a taken GLOBAL handle as a 400 `InvalidBotData`, not a
+      // 409 — an untyped client error that reads like a payload bug and gets
+      // retried as one (byte5ai/omadia#921). Promote it to the typed verdict
+      // so the caller fails fast with an explanation.
+      if (isBotNameTakenError(err)) {
+        throw new BotHandleUnavailableError(botName, err.status, err);
+      }
+      throw err;
+    }
     if (response.kind === 'conflict') {
       // NOT the idempotent signal: our own re-run upserts with 200. A 409
-      // means the globally-unique handle belongs to a foreign resource.
-      throw new Error(
-        `arm botServices.put 409: bot handle '${botName}' conflicts with an ` +
-          'existing foreign resource — bot handles are globally unique',
-      );
+      // means the globally-unique handle belongs to a foreign resource —
+      // same verdict as the 400 above, so it carries the same typed error.
+      throw new BotHandleUnavailableError(botName, 409);
     }
     const outcome: IdempotentOutcome =
       response.status === 200 ? 'already-existed' : 'created';
@@ -362,6 +383,24 @@ export class BotServiceClient {
   }
 }
 
+/**
+ * Does this failure mean the global bot handle is taken?
+ *
+ * ARM answers `400` with `{"error":{"code":"InvalidBotData","message":"Bot is
+ * not valid. Errors: The bot name is already registered to another bot
+ * application."}}`. The status alone cannot carry the meaning — a 400 is also
+ * how ARM reports a genuinely malformed body — so the error code plus the
+ * registered-to-another phrase are both required before promoting.
+ */
+function isBotNameTakenError(err: unknown): err is ProvisioningRequestError {
+  if (!(err instanceof ProvisioningRequestError)) return false;
+  if (err.status !== 400) return false;
+  const body = err.message.toLowerCase();
+  return (
+    body.includes('invalidbotdata') && body.includes('already registered to another')
+  );
+}
+
 function requireNonEmpty(value: string, field: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) {
     throw new Error(`invalid_argument: '${field}' must be a non-empty string`);
@@ -370,16 +409,29 @@ function requireNonEmpty(value: string, field: string): string {
 }
 
 /**
- * Bot handles are 2-64 chars of letters, digits, `.`, `_`, `-` (ARM resource
- * name AND globally-unique Bot Framework handle) — reject anything that could
- * break the ARM URL instead of encoding surprises into the resource id.
+ * One string has to satisfy TWO different rule sets, and the stricter one
+ * wins (byte5ai/omadia#921).
+ *
+ * The ARM resource name for `Microsoft.BotService/botServices` tolerates 2-64
+ * chars of `[A-Za-z0-9._-]`. The Bot Framework HANDLE the same string becomes
+ * is narrower: {@link BOT_HANDLE_MIN_LENGTH}-{@link BOT_HANDLE_MAX_LENGTH}
+ * chars, alphanumerics and hyphens only. Validating against the ARM rule (as
+ * this did until #921) lets a `.`/`_` handle — or a 60-char one — through the
+ * client and into a 400 from the service, which is precisely the class of
+ * late, opaque failure this module exists to prevent.
+ *
+ * Callers compose the handle; this is the boundary that proves the
+ * composition is expressible. See `buildBotHandle` in the middleware job
+ * runner for the naming convention itself.
  */
 function requireBotName(botName: string): string {
   requireNonEmpty(botName, 'botName');
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$/.test(botName)) {
+  if (!BOT_HANDLE_RE.test(botName)) {
     throw new Error(
-      "invalid_argument: 'botName' must be 2-64 chars of [A-Za-z0-9._-] " +
-        'starting with a letter or digit',
+      `invalid_argument: 'botName' must be ${String(BOT_HANDLE_MIN_LENGTH)}-` +
+        `${String(BOT_HANDLE_MAX_LENGTH)} chars of [A-Za-z0-9-] starting and ` +
+        'ending with a letter or digit — Azure bot handles are stricter than ' +
+        'ARM resource names (no dots, no underscores)',
     );
   }
   return botName;

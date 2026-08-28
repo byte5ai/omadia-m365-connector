@@ -332,6 +332,7 @@ export {
   DirectoryReplicationError,
   ProvisioningRequestError,
   UniqueNameReservedError,
+  BotHandleUnavailableError,
   DELETED_ITEM_RETENTION_DAYS,
   isTransientProvisioningFailure,
 } from './errors.js';

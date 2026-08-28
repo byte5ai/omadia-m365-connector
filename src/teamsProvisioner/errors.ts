@@ -233,6 +233,50 @@ export class UniqueNameReservedError extends TeamsProvisionerError {
 }
 
 /**
+ * The Azure bot handle is not available: it is registered to a bot
+ * application that is not ours (byte5ai/omadia#921).
+ *
+ * Bot Service handles live in a SINGLE GLOBAL namespace shared by every Azure
+ * customer — they behave like DNS labels, not like tenant- or
+ * subscription-scoped resource names. ARM reports the collision in two
+ * different shapes depending on how far the request got:
+ *
+ *   - `400 InvalidBotData` — "The bot name is already registered to another
+ *     bot application" (the common case; the name is taken globally),
+ *   - `409 Conflict` — the ARM resource name itself belongs to a foreign
+ *     resource.
+ *
+ * Both are DETERMINISTIC: the identical request will fail identically
+ * forever, so this error is deliberately excluded from
+ * {@link isTransientProvisioningFailure}. The job runner
+ * (byte5ai/omadia#864) branches on it to fail fast instead of burning a
+ * retry budget on a verdict that cannot change.
+ */
+export class BotHandleUnavailableError extends TeamsProvisionerError {
+  /** The handle ARM refused. */
+  public readonly botName: string;
+  /** How ARM reported the collision. */
+  public readonly status: number;
+
+  constructor(botName: string, status: number, cause?: unknown) {
+    super(
+      `bot_handle_unavailable: Azure bot handle '${botName}' is already ` +
+        'registered to another bot application. Bot handles share ONE global ' +
+        'namespace across all Azure customers (like a DNS label) — they are ' +
+        'not scoped to your tenant, subscription or resource group. omadia ' +
+        'qualifies the handle automatically from the agent slug plus the ' +
+        "app registration's id, so a collision here means that qualified " +
+        'name is taken too — rename the agent (bot slug) and re-run ' +
+        'provisioning',
+      cause,
+    );
+    this.name = 'BotHandleUnavailableError';
+    this.botName = botName;
+    this.status = status;
+  }
+}
+
+/**
  * HTTP statuses that mean "the same call can succeed later": throttling,
  * request timeouts and the 5xx family. Deliberately NOT 404 — a bare
  * not-found is a legitimate terminal answer for most steps; the ONE 404 that
@@ -259,6 +303,8 @@ const TRANSIENT_TRANSPORT_PATTERN =
 export function isTransientProvisioningFailure(err: unknown): boolean {
   if (err instanceof ProvisioningThrottledError) return true;
   if (err instanceof DirectoryReplicationError) return true;
+  // A taken global bot handle is a verdict, not a hiccup — never retry it.
+  if (err instanceof BotHandleUnavailableError) return false;
   if (err instanceof ProvisioningRequestError) {
     return TRANSIENT_HTTP_STATUSES.has(err.status);
   }
