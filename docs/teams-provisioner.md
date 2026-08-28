@@ -157,8 +157,11 @@ the original object, which is exactly what re-provisioning the same agent slug
 should yield. If the recycle bin cannot be read (it needs
 `Application.ReadWrite.All`, which this connector deliberately does not ask
 for) or the restore fails, the step raises `UniqueNameReservedError`, whose
-message says *why* the name is unavailable and for how long instead of a bare
-"already exists" about an object the operator cannot find.
+message says *why* the name is unavailable, for how long, and which object to
+act on — instead of a bare "already exists" about an object the operator
+cannot find. Permanently deleting that recycle-bin entry frees the name
+immediately (verified against a live tenant), but it destroys the app and its
+`appId` with it, so it is the operator's escape hatch, not the provisioner's.
 
 ### Rollback is narrow, on purpose
 

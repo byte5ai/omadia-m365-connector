@@ -466,8 +466,9 @@ export class AppRegistrationClient {
           `A deleted Entra app keeps its uniqueName reserved for ${String(DELETED_ITEM_RETENTION_DAYS)} days ` +
           `while sitting in the recycle bin, and the recycle bin could not be read ` +
           `(it needs Application.ReadWrite.All, not just ${APP_REGISTRATION_SCOPE}). ` +
-          `Check 'directory/deletedItems/microsoft.graph.application' in the tenant, ` +
-          `then restore that object or provision under a different name.`,
+          `Check 'directory/deletedItems/microsoft.graph.application' in the tenant, then ` +
+          `restore that object, or permanently delete it to free the name immediately, ` +
+          `or provision under a different name.`,
       });
     }
 
@@ -491,8 +492,9 @@ export class AppRegistrationClient {
             `'${uniqueName}' is reserved by soft-deleted application '${deleted.objectId}'` +
             `${deleted.deletedDateTime !== undefined ? ` (deleted ${deleted.deletedDateTime})` : ''}. ` +
             `Entra holds the name for ${String(DELETED_ITEM_RETENTION_DAYS)} days after a delete and restoring ` +
-            `it failed (${String(err)}). Restore or purge it manually — note a purge does NOT ` +
-            `release the name — or provision under a different name.`,
+            `it failed (${String(err)}). Restore it manually, or permanently delete it ` +
+            `(DELETE /directory/deletedItems/${deleted.objectId}) which frees the name ` +
+            `immediately, or provision under a different name.`,
         },
         err,
       );
