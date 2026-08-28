@@ -15,8 +15,10 @@ import {
 import type { ArmConfigResult } from '../src/teamsProvisioner/config.js';
 import { ProvisioningHttp } from '../src/teamsProvisioner/http.js';
 import {
+  BotHandleUnavailableError,
   ConsentMissingError,
   ProvisioningThrottledError,
+  isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
 import type { CreateBotInput, RegistrationOnlyOutcome } from '../src/teamsProvisioner/types.js';
 
@@ -344,7 +346,131 @@ describe('BotServiceClient.createBot', () => {
       route('/botServices/omadia-agent-hr', { status: 409, body: {} }),
     ]);
     const err = await rejection(client.createBot(CREATE_INPUT));
-    assert.match(String(err), /globally unique/);
+    assert.ok(err instanceof BotHandleUnavailableError);
+    assert.equal(err.status, 409);
+    assert.equal(err.botName, BOT_NAME);
+  });
+
+  // ---------------------------------------------------------------------
+  // byte5ai/omadia#921 — the handle namespace is GLOBAL
+  // ---------------------------------------------------------------------
+
+  it('promotes a 400 InvalidBotData to the typed BotHandleUnavailableError', async () => {
+    const { client } = harness([
+      route('/botServices/omadia-agent-hr', {
+        status: 400,
+        body: {
+          error: {
+            code: 'InvalidBotData',
+            message:
+              'Bot is not valid. Errors: The bot name is already registered to another bot application.',
+          },
+        },
+      }),
+    ]);
+    const err = await rejection(client.createBot(CREATE_INPUT));
+    assert.ok(err instanceof BotHandleUnavailableError);
+    assert.equal(err.name, 'BotHandleUnavailableError');
+    assert.equal(err.status, 400);
+    assert.equal(err.botName, BOT_NAME);
+  });
+
+  it('explains the global namespace and the automatic qualification', async () => {
+    const { client } = harness([
+      route('/botServices/omadia-agent-hr', {
+        status: 400,
+        body: {
+          error: {
+            code: 'InvalidBotData',
+            message:
+              'Bot is not valid. Errors: The bot name is already registered to another bot application.',
+          },
+        },
+      }),
+    ]);
+    const err = await rejection(client.createBot(CREATE_INPUT));
+    const message = String((err as Error).message);
+    assert.match(message, /^bot_handle_unavailable: /);
+    assert.match(message, /global namespace across all Azure customers/);
+    assert.match(message, /not scoped to your tenant, subscription or resource group/);
+    assert.match(message, /qualifies the handle automatically/);
+  });
+
+  it('never classifies a taken handle as transient — no retry storm', async () => {
+    const { client } = harness([
+      route('/botServices/omadia-agent-hr', {
+        status: 400,
+        body: {
+          error: {
+            code: 'InvalidBotData',
+            message:
+              'Bot is not valid. Errors: The bot name is already registered to another bot application.',
+          },
+        },
+      }),
+    ]);
+    const err = await rejection(client.createBot(CREATE_INPUT));
+    assert.equal(isTransientProvisioningFailure(err), false);
+  });
+
+  it('issues exactly ONE bot PUT for a taken handle and never rolls back', async () => {
+    const { client, calls, sleeps } = harness([
+      route('/botServices/omadia-agent-hr', {
+        status: 400,
+        body: {
+          error: {
+            code: 'InvalidBotData',
+            message:
+              'Bot is not valid. Errors: The bot name is already registered to another bot application.',
+          },
+        },
+      }),
+    ]);
+    await rejection(client.createBot(CREATE_INPUT));
+    const arm = armCalls(calls);
+    assert.equal(arm.filter((c) => methodOf(c) === 'PUT').length, 1);
+    // Nothing was created, so nothing may be deleted.
+    assert.equal(arm.filter((c) => methodOf(c) === 'DELETE').length, 0);
+    assert.deepEqual(sleeps, []);
+  });
+
+  it('leaves an ordinary 400 as the untyped request error', async () => {
+    const { client } = harness([
+      route('/botServices/omadia-agent-hr', {
+        status: 400,
+        body: { error: { code: 'InvalidRequest', message: 'malformed body' } },
+      }),
+    ]);
+    const err = await rejection(client.createBot(CREATE_INPUT));
+    assert.equal(err instanceof BotHandleUnavailableError, false);
+    assert.match(String(err), /botServices\.put 400/);
+  });
+
+  it('rejects handles that ARM would accept but Bot Framework would not', async () => {
+    // The ARM resource-name rule allows dots, underscores and 64 chars; the
+    // Bot Framework handle rule does not. The stricter rule wins (#921).
+    const tooLong = `omadia-${'a'.repeat(40)}`;
+    for (const bad of ['abc', tooLong, 'omadia_hr_bot', 'omadia.hr.bot', '-omadia-hr', 'omadia-hr-']) {
+      const { client, calls } = harness([]);
+      const err = await rejection(client.createBot({ ...CREATE_INPUT, botName: bad }));
+      assert.match(String(err), /invalid_argument: 'botName'/, `expected ${bad} to be rejected`);
+      assert.equal(calls.length, 0, `expected no network call for ${bad}`);
+    }
+  });
+
+  it('accepts a qualified handle at exactly the 42-char boundary', async () => {
+    const boundary = `omadia-${'a'.repeat(26)}-7034c271`;
+    assert.equal(boundary.length, 42);
+    const resourceId = `/subscriptions/sub-1/resourceGroups/rg-1/providers/Microsoft.BotService/botServices/${boundary}`;
+    const { client } = harness([
+      route('/channels/MsTeamsChannel', CHANNEL_OK),
+      route(`/botServices/${boundary}`, {
+        status: 201,
+        body: { ...BOT_BODY, id: resourceId, name: boundary },
+      }),
+    ]);
+    const outcome = await client.createBot({ ...CREATE_INPUT, botName: boundary });
+    assert.equal(outcome.kind, 'provisioned');
   });
 
   it('rejects an ARM-URL-breaking botName before any network call', async () => {
