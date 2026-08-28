@@ -58,6 +58,11 @@ import {
   type GetCatalogAppResult,
 } from './catalog.js';
 import { isArmConfigured, type ArmConfigResult } from './config.js';
+import {
+  TeamLookupClient,
+  type GetTeamInput,
+  type GetTeamResult,
+} from './teamLookup.js';
 import { ProvisioningHttp } from './http.js';
 import {
   TeamInstallClient,
@@ -174,6 +179,25 @@ export interface TeamsProvisionerAccessor {
   uninstallFromTeam(
     input: UninstallFromTeamInput,
   ): Promise<UninstallFromTeamResult>;
+
+  /**
+   * Resolve one team id to its display name (since 0.5.0).
+   *
+   * Every other method here addresses a team by GUID, which is also all the
+   * consumer can show an operator. This is the step that turns
+   * `19:…@thread.tacv2` into "Marketing". Read-only, and NOT an enumeration:
+   * it answers for an id the caller already holds.
+   *
+   * A team that is gone or not visible answers `{ found: false }` — an
+   * ordinary outcome, not a throw, because a consumer's fallback is simply to
+   * keep showing the id.
+   *
+   * FEATURE-DETECT it, for the same reason as {@link uninstallFromTeam}: the
+   * middleware mirrors this contract structurally rather than importing it,
+   * so a middleware running against a connector < 0.5.0 must keep its
+   * id-only branch.
+   */
+  getTeam(input: GetTeamInput): Promise<GetTeamResult>;
 }
 
 /** Everything {@link createTeamsProvisioner} needs — assembled by `activate()`. */
@@ -247,6 +271,7 @@ export function createTeamsProvisioner(
   const bots = new BotServiceClient({ http, armConfig, log: options.log });
   const catalog = new CatalogUploadClient({ http, log: options.log });
   const installs = new TeamInstallClient({ http, log: options.log });
+  const teamLookup = new TeamLookupClient({ http, log: options.log });
 
   return {
     tenantMode,
@@ -263,6 +288,7 @@ export function createTeamsProvisioner(
     getCatalogApp: (input) => catalog.getCatalogApp(input),
     installToTeam: (input) => installs.installToTeam(input),
     uninstallFromTeam: (input) => installs.uninstallFromTeam(input),
+    getTeam: (input) => teamLookup.getTeam(input),
   };
 }
 
@@ -363,6 +389,14 @@ export type {
   GetCatalogAppInput,
   GetCatalogAppResult,
 } from './catalog.js';
+
+export { TEAM_READ_SCOPE } from './teamLookup.js';
+export type {
+  GetTeamInput,
+  GetTeamResult,
+  TeamFound,
+  TeamNotFound,
+} from './teamLookup.js';
 
 export type {
   BotDeletedResult,

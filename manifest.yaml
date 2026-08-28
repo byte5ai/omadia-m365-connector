@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.5.3"
+  version: "0.5.4"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -75,7 +75,7 @@ setup:
 
       For the Teams provisioning capability (`teamsProvisioner@1`) additionally
       add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-      `TeamsAppInstallation.ReadWriteForTeam.All`.
+      `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
 
       Extending an existing app registration requires **renewed admin consent**:
       click **Grant admin consent for <Tenant>** again. If Graph still
@@ -112,7 +112,7 @@ setup:
 
       Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
       `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-      `TeamsAppInstallation.ReadWriteForTeam.All`.
+      `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
 
       Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
       **erneuten Admin-Consent**: **Grant admin consent for <Tenant>**

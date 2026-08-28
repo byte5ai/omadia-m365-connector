@@ -313,7 +313,9 @@ describe('manifest.yaml / package.json hub edits', () => {
   ) as { version: string };
 
   it('bumps the version in BOTH files without drift', () => {
-    assert.equal(pkg.version, '0.5.3');
+    // 0.5.3 — `teamsProvisioner@1.getTeam`, the team-name lookup.
+    // 0.5.4 — the global bot-handle verdict + the stricter handle grammar (#921).
+    assert.equal(pkg.version, '0.5.4');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
