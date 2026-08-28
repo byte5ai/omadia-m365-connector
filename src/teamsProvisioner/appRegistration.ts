@@ -9,11 +9,23 @@
  *   2. `POST /applications/{id}/addPassword`   — the bot client secret
  *   3. `POST /servicePrincipals`               — the tenant service principal
  *
- * A partial failure rolls back what this call created (best-effort, logged,
- * original error rethrown); `deleteAppRegistration` is the rollback half and
- * is idempotent — an already-deleted app answers with the idempotent
- * `'already-deleted'` signal (mirroring `Idempotent<T>` in `types.ts` for the
- * delete direction), never an error.
+ * Entra is EVENTUALLY CONSISTENT between (1) and (2): the create answers 201
+ * and `addPassword` on that brand-new object can still answer 404
+ * `Request_ResourceNotFound` for a few seconds. That is a replication window,
+ * not a failure — the step polls through it (`directory.ts`) instead of
+ * giving up (byte5ai/omadia#916).
+ *
+ * ROLLBACK IS NARROW, on purpose. A partial failure used to delete the app it
+ * had just created; because a deleted Entra app is only SOFT-deleted, that
+ * reserved its `uniqueName` for 30 days and every retry then collided with an
+ * object nobody could see — one transient 404 burned a provisioning slug for a
+ * month. Now: a transient failure rolls back NOTHING (the registration is the
+ * durable, adoptable artifact), and a registration carrying a `uniqueName` is
+ * never deleted by the rollback path at all — it is addressable by its natural
+ * key, so the next run adopts it. `deleteAppRegistration` remains the explicit,
+ * idempotent delete for deprovisioning — an already-deleted app answers with
+ * the `'already-deleted'` signal (mirroring `Idempotent<T>` in `types.ts` for
+ * the delete direction), never an error.
  *
  * ARCHITECTURE INVARIANT — SingleTenant only. Every registration is created
  * with `signInAudience: 'AzureADMyOrg'` in the CUSTOMER tenant; MultiTenant is
@@ -30,7 +42,10 @@
  * All HTTP goes through the shared {@link ProvisioningHttp} choke point (one
  * token cache, Retry-After-honouring 429 backoff, 403 → `ConsentMissingError`
  * with {@link APP_REGISTRATION_SCOPE}, 409 → conflict signal). This module
- * opens no second token cache and does no fetch of its own.
+ * opens no second token cache and does no fetch of its own. Note that the
+ * `uniqueName` duplicate does NOT arrive as a 409: Entra reports it as a 400
+ * `Request_BadRequest`, mapped onto the conflict signal by
+ * `UNIQUE_NAME_CONFLICT_RULES` in `directory.ts`.
  *
  * Style precedent: `graphClient.ts` — options-bag constructor, hand-rolled
  * REST against `https://graph.microsoft.com/v1.0`, non-2xx → typed/plain
@@ -39,6 +54,31 @@
 
 import type { SecretsAccessor } from '@omadia/plugin-api';
 
+import {
+  asRecord,
+  escapeODataQuotes,
+  requireAppId,
+  requireNonEmpty,
+  requireStringField,
+  requireUniqueName,
+  secretLabel,
+  staleCredentialKeyIds,
+} from './appRegistrationSupport.js';
+
+import {
+  GRAPH_BASE,
+  UNIQUE_NAME_CONFLICT_RULES,
+  findDeletedApplicationByUniqueName,
+  restoreDeletedApplication,
+  retryWhileReplicating,
+  waitForApplicationAddressable,
+  type ReplicationOptions,
+} from './directory.js';
+import {
+  DELETED_ITEM_RETENTION_DAYS,
+  UniqueNameReservedError,
+  isTransientProvisioningFailure,
+} from './errors.js';
 import type { ProvisioningHttp, ProvisioningOkResponse } from './http.js';
 import {
   storeAppPassword,
@@ -61,8 +101,6 @@ import {
  */
 export const APP_REGISTRATION_SCOPE = 'Application.ReadWrite.OwnedBy';
 
-const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
-
 export interface AppRegistrationClientOptions {
   /**
    * The SHARED token/429 choke point of the http unit. Pass the one
@@ -75,6 +113,13 @@ export interface AppRegistrationClientOptions {
   /** Tenant the registrations are created in (stamped into results). */
   readonly tenantId: string;
   readonly log?: (msg: string) => void;
+  /**
+   * Budget for the Entra replication windows (probe count, base interval)
+   * and the test seam for the waits. Defaults cover roughly 40 s across 8
+   * probes — long enough for the observed windows, far short of the job
+   * runner's own retry cadence.
+   */
+  readonly replication?: ReplicationOptions;
 }
 
 export interface CreateAppRegistrationInput {
@@ -92,6 +137,22 @@ export interface CreateAppRegistrationInput {
   readonly uniqueName?: string;
   /** Portal label for the generated secret. Default: `<displayName> bot password`. */
   readonly secretDisplayName?: string;
+  /**
+   * Called the MOMENT the registration exists — after create/adopt, BEFORE
+   * the secret and the service principal. The caller persists `appId` here,
+   * so an interruption anywhere in the rest of the chain leaves a RESUMABLE
+   * row instead of an orphaned app nobody knows about (byte5ai/omadia#916).
+   *
+   * Best effort by design: a throwing callback is logged and the step
+   * continues. The registration carries a `uniqueName`, so it stays
+   * adoptable even when the persistence attempt failed — turning a store
+   * hiccup into a Graph-side abort would trade a small problem for a bigger
+   * one.
+   */
+  readonly onRegistrationCreated?: (
+    registration: AppRegistration,
+    outcome: IdempotentOutcome,
+  ) => void | Promise<void>;
 }
 
 /** What `createAppRegistration` hands back — note: NO secret value, only the ref. */
@@ -140,6 +201,7 @@ export class AppRegistrationClient {
   private readonly secrets: SecretsAccessor;
   private readonly tenantId: string;
   private readonly log: (msg: string) => void;
+  private readonly replication: ReplicationOptions;
 
   constructor(opts: AppRegistrationClientOptions) {
     this.http = opts.http;
@@ -150,6 +212,7 @@ export class AppRegistrationClient {
       ((msg: string): void => {
         console.error(msg);
       });
+    this.replication = { ...opts.replication, log: (msg) => { this.log(msg); } };
   }
 
   /**
@@ -175,6 +238,22 @@ export class AppRegistrationClient {
     }
     const { registration, outcome } = await this.registerApplication(input);
 
+    // The app_id is now the one durable fact of this step — hand it to the
+    // caller BEFORE anything else can fail, so an interruption leaves a
+    // resumable row rather than an orphan (byte5ai/omadia#916).
+    await this.notifyRegistrationCreated(input, registration, outcome);
+
+    if (outcome === 'created') {
+      // Eventual consistency: the object exists but may not be addressable
+      // for the follow-up writes yet. Poll, do not fail.
+      await waitForApplicationAddressable(
+        this.http,
+        registration.objectId,
+        [APP_REGISTRATION_SCOPE],
+        this.replication,
+      );
+    }
+
     // Captured BEFORE the vault write: on the uniqueName-reuse path
     // storeAppPassword OVERWRITES a prior run's entry, and a rollback must
     // restore that entry instead of destroying a credential this call did
@@ -196,6 +275,9 @@ export class AppRegistrationClient {
       const servicePrincipalOutcome = await this.ensureServicePrincipal(
         registration.appId,
       );
+      if (outcome === 'already-existed') {
+        await this.pruneStaleBotPasswords(registration, input, password.keyId);
+      }
       return {
         outcome,
         value: {
@@ -208,6 +290,16 @@ export class AppRegistrationClient {
         },
       };
     } catch (err) {
+      if (isTransientProvisioningFailure(err)) {
+        // NOT a reason to undo anything. The registration is real and
+        // adoptable by its uniqueName; deleting it here is precisely what
+        // reserved a slug for 30 days in byte5ai/omadia#916.
+        this.log(
+          `provisioner app-registration: transient failure after ${outcome === 'created' ? 'creating' : 'adopting'} ` +
+            `'${registration.appId}' — leaving it in place for an idempotent re-run (${String(err)})`,
+        );
+        throw err;
+      }
       await this.rollbackPartialCreate(
         registration,
         outcome,
@@ -216,6 +308,23 @@ export class AppRegistrationClient {
         priorSecretValue,
       );
       throw err;
+    }
+  }
+
+  /** Best-effort early persistence hook — see `onRegistrationCreated`. */
+  private async notifyRegistrationCreated(
+    input: CreateAppRegistrationInput,
+    registration: AppRegistration,
+    outcome: IdempotentOutcome,
+  ): Promise<void> {
+    if (input.onRegistrationCreated === undefined) return;
+    try {
+      await input.onRegistrationCreated(registration, outcome);
+    } catch (err) {
+      this.log(
+        `provisioner app-registration: onRegistrationCreated for '${registration.appId}' ` +
+          `failed: ${String(err)}`,
+      );
     }
   }
 
@@ -273,7 +382,7 @@ export class AppRegistrationClient {
     return this.parseApplication(response, 'applications.get', tenantMode);
   }
 
-  /** `POST /applications`; 409 (uniqueName taken) → find + reuse the existing app. */
+  /** `POST /applications`; a taken `uniqueName` → find + adopt the existing app. */
   private async registerApplication(
     input: CreateAppRegistrationInput,
   ): Promise<{ registration: AppRegistration; outcome: IdempotentOutcome }> {
@@ -291,6 +400,9 @@ export class AppRegistrationClient {
           : {}),
       },
       missingScopesOn403: [APP_REGISTRATION_SCOPE],
+      // Entra reports a taken uniqueName as 400, not 409 — without these
+      // rules the adopt branch below can never be reached.
+      conflictOn: UNIQUE_NAME_CONFLICT_RULES,
     });
 
     if (response.kind === 'ok') {
@@ -304,38 +416,149 @@ export class AppRegistrationClient {
       };
     }
 
-    // 409: the uniqueName idempotency key is already taken — find and reuse.
+    // The uniqueName idempotency key is already taken — find and adopt.
     if (input.uniqueName === undefined) {
       throw new Error(
-        'graph applications.create 409 without a uniqueName — cannot resolve ' +
+        'graph applications.create conflict without a uniqueName — cannot resolve ' +
           'the conflicting registration; pass a stable uniqueName for idempotent re-runs',
       );
     }
-    const existing = await this.http.request({
-      resource: 'graph',
-      method: 'GET',
-      url: `${GRAPH_BASE}/applications(uniqueName='${encodeURIComponent(escapeODataQuotes(input.uniqueName))}')`,
-      step: 'applications.findByUniqueName',
-      missingScopesOn403: [APP_REGISTRATION_SCOPE],
-    });
-    if (existing.kind !== 'ok') {
-      throw new Error('graph applications.findByUniqueName unexpected 409');
-    }
     return {
-      registration: this.parseApplication(
-        existing,
-        'applications.findByUniqueName',
-        input.tenantMode,
-      ),
+      registration: await this.adoptByUniqueName(input, input.uniqueName),
       outcome: 'already-existed',
     };
   }
 
-  /** `POST /applications/{id}/addPassword` — the secret value stays local to the caller. */
-  private async addPassword(
+  /**
+   * Resolve the registration behind a taken `uniqueName`.
+   *
+   * Two possible owners of the name:
+   *
+   * - a LIVE application — the normal idempotent re-run: look it up by the
+   *   alternate key and adopt it (fresh secret, service principal ensured).
+   * - a SOFT-DELETED application — invisible in `GET /applications` yet still
+   *   holding the name for {@link DELETED_ITEM_RETENTION_DAYS} days. Restoring
+   *   it is the only way to free the name early, and it returns the SAME
+   *   object (same appId, same uniqueName) — exactly what re-provisioning the
+   *   agent slug is supposed to yield. Restricted to an object whose
+   *   `uniqueName` matches ours exactly, i.e. one this provisioner owns.
+   *
+   * If neither resolves, the operator finally learns WHY the name is taken
+   * instead of reading "already exists" about an object they cannot see.
+   */
+  private async adoptByUniqueName(
+    input: CreateAppRegistrationInput,
+    uniqueName: string,
+  ): Promise<AppRegistration> {
+    const live = await this.findByUniqueName(uniqueName, input.tenantMode);
+    if (live !== undefined) return live;
+
+    const deleted = await findDeletedApplicationByUniqueName(
+      this.http,
+      uniqueName,
+      [APP_REGISTRATION_SCOPE],
+      this.log,
+    );
+    if (deleted === undefined) {
+      throw new UniqueNameReservedError(uniqueName, {
+        hint:
+          `'${uniqueName}' is already taken but no matching application is visible. ` +
+          `A deleted Entra app keeps its uniqueName reserved for ${String(DELETED_ITEM_RETENTION_DAYS)} days ` +
+          `while sitting in the recycle bin, and the recycle bin could not be read ` +
+          `(it needs Application.ReadWrite.All, not just ${APP_REGISTRATION_SCOPE}). ` +
+          `Check 'directory/deletedItems/microsoft.graph.application' in the tenant, ` +
+          `then restore that object or provision under a different name.`,
+      });
+    }
+
+    this.log(
+      `provisioner applications.create: '${uniqueName}' is held by soft-deleted app ` +
+        `'${deleted.objectId}'${deleted.deletedDateTime !== undefined ? ` (deleted ${deleted.deletedDateTime})` : ''} — restoring it`,
+    );
+    try {
+      await restoreDeletedApplication(this.http, deleted.objectId, [
+        APP_REGISTRATION_SCOPE,
+      ]);
+    } catch (err) {
+      throw new UniqueNameReservedError(
+        uniqueName,
+        {
+          deletedObjectId: deleted.objectId,
+          ...(deleted.deletedDateTime !== undefined
+            ? { deletedDateTime: deleted.deletedDateTime }
+            : {}),
+          hint:
+            `'${uniqueName}' is reserved by soft-deleted application '${deleted.objectId}'` +
+            `${deleted.deletedDateTime !== undefined ? ` (deleted ${deleted.deletedDateTime})` : ''}. ` +
+            `Entra holds the name for ${String(DELETED_ITEM_RETENTION_DAYS)} days after a delete and restoring ` +
+            `it failed (${String(err)}). Restore or purge it manually — note a purge does NOT ` +
+            `release the name — or provision under a different name.`,
+        },
+        err,
+      );
+    }
+
+    // The restore is itself replicated — the app is not readable instantly.
+    const restored = await retryWhileReplicating(
+      'applications.findByUniqueName',
+      deleted.objectId,
+      () => this.findByUniqueName(uniqueName, input.tenantMode),
+      this.replication,
+    );
+    return restored;
+  }
+
+  /** `GET /applications(uniqueName='…')` — `undefined` when no live app holds it. */
+  private async findByUniqueName(
+    uniqueName: string,
+    tenantMode: TenantMode,
+  ): Promise<AppRegistration | undefined> {
+    const existing = await this.http.request({
+      resource: 'graph',
+      method: 'GET',
+      url: `${GRAPH_BASE}/applications(uniqueName='${encodeURIComponent(escapeODataQuotes(uniqueName))}')`,
+      step: 'applications.findByUniqueName',
+      missingScopesOn403: [APP_REGISTRATION_SCOPE],
+      extraOkStatuses: [404],
+    });
+    if (existing.kind !== 'ok') {
+      throw new Error('graph applications.findByUniqueName unexpected conflict');
+    }
+    if (existing.status === 404) return undefined;
+    return this.parseApplication(
+      existing,
+      'applications.findByUniqueName',
+      tenantMode,
+    );
+  }
+
+  /**
+   * `POST /applications/{id}/addPassword` — the secret value stays local to
+   * the caller.
+   *
+   * A 404 here does NOT mean the app is gone: Graph replicates read and write
+   * paths independently, so a brand-new registration can still answer
+   * `Request_ResourceNotFound` on this write after it already reads back
+   * fine. Retried through that window; an exhausted budget raises the
+   * transient `DirectoryReplicationError` (byte5ai/omadia#916).
+   */
+  private addPassword(
     registration: AppRegistration,
     input: CreateAppRegistrationInput,
   ): Promise<{ secretText: string; keyId: string; endDateTime: string }> {
+    return retryWhileReplicating(
+      'applications.addPassword',
+      registration.objectId,
+      () => this.tryAddPassword(registration, input),
+      this.replication,
+    );
+  }
+
+  /** One `addPassword` attempt; `undefined` = "not replicated yet, retry". */
+  private async tryAddPassword(
+    registration: AppRegistration,
+    input: CreateAppRegistrationInput,
+  ): Promise<{ secretText: string; keyId: string; endDateTime: string } | undefined> {
     const response = await this.http.request({
       resource: 'graph',
       method: 'POST',
@@ -343,15 +566,16 @@ export class AppRegistrationClient {
       step: 'applications.addPassword',
       jsonBody: {
         passwordCredential: {
-          displayName:
-            input.secretDisplayName ?? `${input.displayName} bot password`,
+          displayName: secretLabel(input),
         },
       },
       missingScopesOn403: [APP_REGISTRATION_SCOPE],
+      extraOkStatuses: [404],
     });
     if (response.kind === 'conflict') {
       throw new Error('graph applications.addPassword unexpected 409');
     }
+    if (response.status === 404) return undefined;
     const body = asRecord(response.json, 'applications.addPassword');
     return {
       secretText: requireStringField(body, 'secretText', 'applications.addPassword'),
@@ -376,12 +600,22 @@ export class AppRegistrationClient {
   }
 
   /**
-   * Best-effort rollback after a partial create. Only artifacts of THIS call
-   * are touched: a registration found via `uniqueName` (`'already-existed'`)
-   * is never deleted — its freshly added password credential is removed
-   * instead, and a vault entry the call OVERWROTE (rather than created) is
-   * restored to its previous value instead of deleted. Rollback failures are
-   * logged (never a secret value), the caller rethrows the original error.
+   * Best-effort rollback after a NON-transient partial create (transient
+   * failures never get here — see `createAppRegistration`).
+   *
+   * Only artifacts of THIS call are touched, and the registration itself is
+   * deleted in exactly one case: it was created here AND carries no
+   * `uniqueName`, i.e. nothing could ever find it again. A registration WITH
+   * a uniqueName is kept: deleting it soft-deletes the object and reserves
+   * that name for ${DELETED_ITEM_RETENTION_DAYS} days, which is how a single
+   * failed run used to make a slug unusable for a month (byte5ai/omadia#916).
+   * Keeping it costs one adoptable app; deleting it costs the name.
+   *
+   * A registration found via `uniqueName` (`'already-existed'`) additionally
+   * gets its freshly added password credential removed, and a vault entry the
+   * call OVERWROTE (rather than created) is restored to its previous value
+   * instead of deleted. Rollback failures are logged (never a secret value),
+   * the caller rethrows the original error.
    */
   private async rollbackPartialCreate(
     registration: AppRegistration,
@@ -411,6 +645,14 @@ export class AppRegistrationClient {
       }
     }
     if (outcome === 'created') {
+      if (registration.uniqueName !== undefined) {
+        this.log(
+          `provisioner rollback: keeping registration '${registration.appId}' ` +
+            `(uniqueName='${registration.uniqueName}') — deleting it would reserve that name for ` +
+            `${String(DELETED_ITEM_RETENTION_DAYS)} days; the next run adopts it instead`,
+        );
+        return;
+      }
       try {
         await this.deleteAppRegistration({ appId: registration.appId });
       } catch (err) {
@@ -437,6 +679,59 @@ export class AppRegistrationClient {
           `provisioner rollback: applications.removePassword on '${registration.appId}' failed: ${String(err)}`,
         );
       }
+    }
+  }
+
+  /**
+   * Adopting an existing registration always mints a FRESH secret — the
+   * original was returned exactly once and never persisted, so it cannot be
+   * recovered. That makes the credentials this provisioner created pile up on
+   * every re-run, and Entra caps how many an app may hold.
+   *
+   * So: remove the provisioner's OWN older credentials (matched by the
+   * deterministic secret label, minus the one just added) and leave everything
+   * else alone — a credential an operator added by hand is not ours to revoke.
+   * Best effort: the registration is already usable, a failed cleanup must not
+   * fail the step.
+   */
+  private async pruneStaleBotPasswords(
+    registration: AppRegistration,
+    input: CreateAppRegistrationInput,
+    keepKeyId: string,
+  ): Promise<void> {
+    const label = secretLabel(input);
+    try {
+      const response = await this.http.request({
+        resource: 'graph',
+        method: 'GET',
+        url: `${GRAPH_BASE}/applications/${encodeURIComponent(registration.objectId)}?$select=passwordCredentials`,
+        step: 'applications.readCredentials',
+        missingScopesOn403: [APP_REGISTRATION_SCOPE],
+      });
+      if (response.kind !== 'ok') return;
+      const stale = staleCredentialKeyIds(response.json, label, keepKeyId);
+      for (const keyId of stale) {
+        await this.http.request({
+          resource: 'graph',
+          method: 'POST',
+          url: `${GRAPH_BASE}/applications/${encodeURIComponent(registration.objectId)}/removePassword`,
+          step: 'applications.removePassword',
+          jsonBody: { keyId },
+          missingScopesOn403: [APP_REGISTRATION_SCOPE],
+          extraOkStatuses: [404],
+        });
+      }
+      if (stale.length > 0) {
+        this.log(
+          `provisioner app-registration: removed ${String(stale.length)} superseded ` +
+            `'${label}' credential(s) from '${registration.appId}'`,
+        );
+      }
+    } catch (err) {
+      this.log(
+        `provisioner app-registration: pruning superseded credentials on ` +
+          `'${registration.appId}' failed: ${String(err)}`,
+      );
     }
   }
 
@@ -469,62 +764,4 @@ export class AppRegistrationClient {
   }
 }
 
-function requireNonEmpty(value: string, field: string): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new Error(`invalid_argument: '${field}' must be a non-empty string`);
-  }
-  return value;
-}
-
-/** Entra client ids are GUID-shaped — reject anything that could break the OData URL. */
-function requireAppId(appId: string): string {
-  requireNonEmpty(appId, 'appId');
-  if (/[\s'()/]/.test(appId)) {
-    throw new Error(
-      "invalid_argument: 'appId' must be a plain Entra application (client) id",
-    );
-  }
-  return appId;
-}
-
-/**
- * `uniqueName` is an idempotency key that ends up in an OData alternate-key
- * URL path. Mirroring {@link requireAppId}, anything that could break the
- * URL or the OData literal — whitespace, quotes, parens, path separators,
- * `#`/`?`/`%`/`&`/`+` — is rejected up front (belt) even though the lookup
- * additionally percent-encodes the value (braces).
- */
-function requireUniqueName(uniqueName: string): string {
-  requireNonEmpty(uniqueName, 'uniqueName');
-  if (/[\s'"()/\\#?%&+]/.test(uniqueName)) {
-    throw new Error(
-      "invalid_argument: 'uniqueName' must not contain whitespace, quotes, " +
-        'parentheses, slashes or URL metacharacters (#, ?, %, &, +)',
-    );
-  }
-  return uniqueName;
-}
-
-/** OData string-literal escaping for alternate-key lookups (`'` → `''`). */
-function escapeODataQuotes(value: string): string {
-  return value.replace(/'/g, "''");
-}
-
-function asRecord(json: unknown, step: string): Record<string, unknown> {
-  if (json === null || typeof json !== 'object') {
-    throw new Error(`graph ${step}: unexpected empty/non-object response body`);
-  }
-  return json as Record<string, unknown>;
-}
-
-function requireStringField(
-  body: Record<string, unknown>,
-  field: string,
-  step: string,
-): string {
-  const value = body[field];
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`graph ${step}: response body missing '${field}'`);
-  }
-  return value;
-}
+// Pure value helpers live in `appRegistrationSupport.ts` — see its module doc.

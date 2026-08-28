@@ -11,7 +11,9 @@ import {
 import { ProvisioningHttp } from '../src/teamsProvisioner/http.js';
 import {
   ConsentMissingError,
+  DirectoryReplicationError,
   ProvisioningThrottledError,
+  UniqueNameReservedError,
 } from '../src/teamsProvisioner/errors.js';
 
 // createAppRegistration: three chained Graph writes (POST /applications →
@@ -128,12 +130,19 @@ const CREATE_INPUT: CreateAppRegistrationInput = {
   uniqueName: 'omadia-agent-hr',
 };
 
-function harness(routes: Route[]): {
+function harness(
+  routes: Route[],
+  replicationOverrides: { maxAttempts?: number } = {},
+): {
   client: AppRegistrationClient;
   calls: FetchCall[];
   vault: Map<string, string>;
+  waits: number[];
+  logs: string[];
 } {
   const calls: FetchCall[] = [];
+  const waits: number[] = [];
+  const logs: string[] = [];
   const { accessor, vault } = fakeSecrets();
   const http = new ProvisioningHttp({
     graphCredential: {
@@ -150,9 +159,18 @@ function harness(routes: Route[]): {
     http,
     secrets: accessor,
     tenantId: TENANT_ID,
-    log: () => {},
+    log: (msg) => {
+      logs.push(msg);
+    },
+    replication: {
+      // Replication waits are recorded, never really slept.
+      sleep: async (ms) => {
+        waits.push(ms);
+      },
+      ...replicationOverrides,
+    },
   });
-  return { client, calls, vault };
+  return { client, calls, vault, waits, logs };
 }
 
 const graphCalls = (calls: FetchCall[]): FetchCall[] =>
@@ -190,12 +208,15 @@ describe('createAppRegistration — happy path', () => {
     assert.equal(result.value.servicePrincipalOutcome, 'created');
 
     const graph = graphCalls(calls);
-    assert.equal(graph.length, 3);
+    assert.equal(graph.length, 4);
     assert.ok(graph[0]?.url.endsWith('/v1.0/applications'));
     assert.equal(graph[0]?.init?.method, 'POST');
-    assert.ok(graph[1]?.url.endsWith(`/applications/${OBJECT_ID}/addPassword`));
-    assert.ok(graph[2]?.url.endsWith('/servicePrincipals'));
-    assert.deepEqual(bodyOf(graph[2]!), { appId: APP_ID });
+    // Between create and the first follow-up WRITE: the replication probe.
+    assert.ok(graph[1]?.url.endsWith(`/applications/${OBJECT_ID}`));
+    assert.equal(graph[1]?.init?.method, 'GET');
+    assert.ok(graph[2]?.url.endsWith(`/applications/${OBJECT_ID}/addPassword`));
+    assert.ok(graph[3]?.url.endsWith('/servicePrincipals'));
+    assert.deepEqual(bodyOf(graph[3]!), { appId: APP_ID });
   });
 
   it('persists the secret in the vault and never returns it in cleartext', async () => {
@@ -278,7 +299,7 @@ describe('createAppRegistration — 409 idempotency', () => {
     const err = await rejection(
       client.createAppRegistration({ displayName: 'HR Agent', tenantMode: 'customer' }),
     );
-    assert.match((err as Error).message, /409 without a uniqueName/);
+    assert.match((err as Error).message, /conflict without a uniqueName/);
   });
 
   it('refuses to adopt a found registration that is not SingleTenant', async () => {
@@ -327,35 +348,98 @@ describe('createAppRegistration — 403/429 typed errors', () => {
 });
 
 describe('createAppRegistration — rollback of partial failures', () => {
-  it('addPassword fails → deletes the just-created app, vault untouched', async () => {
+  // byte5ai/omadia#916: a 5xx is TRANSIENT. Deleting the app over one
+  // soft-deletes it and reserves its uniqueName for 30 days, so the retry
+  // collides with an object nobody can see. Nothing may be undone here.
+  it('transient failure after create → NOTHING is rolled back', async () => {
     const routes: Route[] = [
-      route('/addPassword', { status: 500, body: { error: 'boom' } }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 503, body: { error: 'boom' } }),
       route("/applications(appId='", { status: 204 }),
       route('/applications', { status: 201, body: APP_BODY }),
     ];
-    const { client, calls, vault } = harness(routes);
+    const { client, calls, vault, logs } = harness(routes);
     const err = await rejection(client.createAppRegistration(CREATE_INPUT));
 
-    assert.match((err as Error).message, /applications\.addPassword 500/);
+    assert.match((err as Error).message, /servicePrincipals\.create 503/);
+    assert.ok(
+      !graphCalls(calls).some((c) => c.init?.method === 'DELETE'),
+      'a transient failure must never delete the registration',
+    );
+    assert.ok(
+      !graphCalls(calls).some((c) => c.url.includes('/removePassword')),
+      'a transient failure must not revoke the credential either',
+    );
+    assert.equal(
+      vault.get(SECRET_REF),
+      SECRET_TEXT,
+      'the stored secret matches a live credential — keep it for the re-run',
+    );
+    assert.ok(logs.some((l) => l.includes('leaving it in place')));
+  });
+
+  it('replication budget exhausted → transient, still no rollback', async () => {
+    const routes: Route[] = [
+      route('/addPassword', {
+        status: 404,
+        body: { error: { code: 'Request_ResourceNotFound' } },
+      }),
+      route("/applications(appId='", { status: 204 }),
+      route('/applications', { status: 201, body: APP_BODY }),
+    ];
+    const { client, calls } = harness(routes, { maxAttempts: 3 });
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof DirectoryReplicationError);
+    assert.equal(err.step, 'applications.addPassword');
+    assert.equal(err.objectId, OBJECT_ID);
+    assert.ok(
+      !graphCalls(calls).some((c) => c.init?.method === 'DELETE'),
+      'the app exists and is adoptable — deleting it burns the uniqueName',
+    );
+  });
+
+  it('non-transient failure keeps a registration that carries a uniqueName', async () => {
+    const routes: Route[] = [
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 400, body: { error: 'nope' } }),
+      route("/applications(appId='", { status: 204 }),
+      route('/applications', { status: 201, body: APP_BODY }),
+    ];
+    const { client, calls, vault, logs } = harness(routes);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.match((err as Error).message, /servicePrincipals\.create 400/);
+    assert.equal(vault.size, 0, 'the vault entry this call wrote is rolled back');
+    assert.ok(
+      !graphCalls(calls).some((c) => c.init?.method === 'DELETE'),
+      'deleting would reserve the uniqueName for 30 days',
+    );
+    assert.ok(logs.some((l) => l.includes('would reserve that name')));
+  });
+
+  it('non-transient failure DOES delete an app that carries no uniqueName', async () => {
+    // Nothing could ever find this object again — an orphan, not an
+    // adoptable identity. That is the one case rollback still deletes.
+    const anonymous = { ...APP_BODY, uniqueName: undefined };
+    const routes: Route[] = [
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 400, body: { error: 'nope' } }),
+      route("/applications(appId='", { status: 204 }),
+      route('/applications', { status: 201, body: anonymous }),
+    ];
+    const { client, calls, vault } = harness(routes);
+    await rejection(
+      client.createAppRegistration({
+        displayName: 'HR Agent',
+        tenantMode: 'customer',
+      }),
+    );
+
     assert.equal(vault.size, 0);
     const del = graphCalls(calls).find((c) => c.init?.method === 'DELETE');
     assert.ok(del, 'expected the rollback DELETE');
     assert.ok(del!.url.includes(`applications(appId='${APP_ID}')`));
-  });
-
-  it('service-principal failure → deletes app AND vault entry, rethrows original', async () => {
-    const routes: Route[] = [
-      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
-      route('/servicePrincipals', { status: 500, body: { error: 'boom' } }),
-      route("/applications(appId='", { status: 204 }),
-      route('/applications', { status: 201, body: APP_BODY }),
-    ];
-    const { client, calls, vault } = harness(routes);
-    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
-
-    assert.match((err as Error).message, /servicePrincipals\.create 500/);
-    assert.equal(vault.size, 0, 'rollback must remove the stored secret');
-    assert.ok(graphCalls(calls).some((c) => c.init?.method === 'DELETE'));
   });
 
   it('restores an OVERWRITTEN vault entry on rollback instead of deleting it', async () => {
@@ -367,7 +451,7 @@ describe('createAppRegistration — rollback of partial failures', () => {
     const routes: Route[] = [
       route('/addPassword', { status: 200, body: PASSWORD_BODY }),
       route('/removePassword', { status: 204 }),
-      route('/servicePrincipals', { status: 500, body: { error: 'boom' } }),
+      route('/servicePrincipals', { status: 400, body: { error: 'boom' } }),
       route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
       route('/applications', { status: 409, body: {} }),
     ];
@@ -388,7 +472,7 @@ describe('createAppRegistration — rollback of partial failures', () => {
     const routes: Route[] = [
       route('/addPassword', { status: 200, body: PASSWORD_BODY }),
       route('/removePassword', { status: 204 }),
-      route('/servicePrincipals', { status: 500, body: { error: 'boom' } }),
+      route('/servicePrincipals', { status: 400, body: { error: 'boom' } }),
       route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
       route('/applications', { status: 409, body: {} }),
     ];
@@ -475,5 +559,365 @@ describe('getAppRegistration — status probe', () => {
     ];
     const { client } = harness(routes);
     assert.equal(await client.getAppRegistration(APP_ID, 'customer'), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// byte5ai/omadia#916 — the first real provisioning run against the byte5
+// tenant. Every case below reproduces one link of the chain that burned a
+// slug for 30 days: create 201 → addPassword 404 (replication) → rollback →
+// soft-delete → uniqueName reserved → every retry collides.
+// ---------------------------------------------------------------------------
+
+/** Entra's answer to a taken uniqueName: 400, NOT 409. */
+const UNIQUE_NAME_TAKEN = {
+  status: 400,
+  body: {
+    error: {
+      code: 'Request_BadRequest',
+      message:
+        'Another object with the same value for property uniqueName already exists.',
+    },
+  },
+};
+
+/** The same collision as Graph sometimes codes it. */
+const OBJECT_CONFLICT = {
+  status: 400,
+  body: {
+    error: { code: 'ObjectConflict', message: 'conflicting object exists' },
+  },
+};
+
+const NOT_REPLICATED_YET = {
+  status: 404,
+  body: {
+    error: {
+      code: 'Request_ResourceNotFound',
+      message: `Resource '${OBJECT_ID}' does not exist or one of its queried reference-property objects are not present.`,
+    },
+  },
+};
+
+describe('createAppRegistration — Entra replication window (#916)', () => {
+  it('create 201 → addPassword 404 → polls → 200, no rollback', async () => {
+    const routes: Route[] = [
+      route('/addPassword', NOT_REPLICATED_YET, { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 201, body: { id: 'sp-1' } }),
+      route("/applications(appId='", { status: 204 }),
+      route('/applications', { status: 201, body: APP_BODY }),
+    ];
+    const { client, calls, vault, waits } = harness(routes);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'created');
+    assert.equal(result.value.appId, APP_ID);
+    assert.equal(vault.get(SECRET_REF), SECRET_TEXT);
+    assert.equal(
+      graphCalls(calls).filter((c) => c.url.includes('/addPassword')).length,
+      2,
+      'the 404 is retried in place, not reported as a step failure',
+    );
+    assert.deepEqual(waits, [1000], 'one replication wait before the retry');
+    assert.ok(!graphCalls(calls).some((c) => c.init?.method === 'DELETE'));
+  });
+
+  it('waits for the created app to become addressable before writing to it', async () => {
+    const routes: Route[] = [
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 201, body: { id: 'sp-1' } }),
+      route(
+        `/applications/${OBJECT_ID}`,
+        { status: 404, body: {} },
+        { status: 200, body: APP_BODY },
+      ),
+      route('/applications', { status: 201, body: APP_BODY }),
+    ];
+    const { client, calls, waits } = harness(routes);
+    await client.createAppRegistration(CREATE_INPUT);
+
+    const probes = graphCalls(calls).filter(
+      (c) => c.init?.method === 'GET' && c.url.endsWith(`/applications/${OBJECT_ID}`),
+    );
+    assert.equal(probes.length, 2, 'polled until the object was readable');
+    assert.deepEqual(waits, [1000]);
+  });
+
+  it('adopting an existing app skips the replication probe', async () => {
+    const routes: Route[] = [
+      route('passwordCredentials', { status: 200, body: { passwordCredentials: [] } }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 409, body: {} }),
+      route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client, calls, waits } = harness(routes);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'already-existed');
+    assert.deepEqual(waits, [], 'a found app is addressable by definition');
+  });
+});
+
+describe('createAppRegistration — uniqueName conflict is a 400 (#916)', () => {
+  for (const [label, spec] of [
+    ['Request_BadRequest + uniqueName message', UNIQUE_NAME_TAKEN],
+    ['ObjectConflict code', OBJECT_CONFLICT],
+  ] as const) {
+    it(`400 ${label} → adopts the live registration`, async () => {
+      const routes: Route[] = [
+        route('passwordCredentials', {
+          status: 200,
+          body: { passwordCredentials: [] },
+        }),
+        route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+        route('/servicePrincipals', { status: 409, body: {} }),
+        route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+        route('/applications', spec),
+      ];
+      const { client, calls, vault } = harness(routes);
+      const result = await client.createAppRegistration(CREATE_INPUT);
+
+      assert.equal(result.outcome, 'already-existed');
+      assert.equal(result.value.appId, APP_ID);
+      // A fresh secret is minted — the original was never persisted.
+      assert.equal(vault.get(SECRET_REF), SECRET_TEXT);
+      assert.ok(
+        graphCalls(calls).some((c) =>
+          c.url.includes("applications(uniqueName='omadia-agent-hr')"),
+        ),
+        'expected the alternate-key lookup',
+      );
+    });
+  }
+
+  it('an unrelated 400 stays an error — the rules are not a catch-all', async () => {
+    const routes: Route[] = [
+      route('/applications', {
+        status: 400,
+        body: {
+          error: {
+            code: 'Request_BadRequest',
+            message: 'Property displayName is invalid.',
+          },
+        },
+      }),
+    ];
+    const { client, calls } = harness(routes);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.match((err as Error).message, /applications\.create 400/);
+    assert.ok(
+      !graphCalls(calls).some((c) => c.url.includes("(uniqueName='")),
+      'no adoption attempt for a genuine bad request',
+    );
+  });
+});
+
+describe('createAppRegistration — the recycle bin (#916)', () => {
+  const DELETED_ITEM = {
+    id: 'del-0001',
+    appId: APP_ID,
+    displayName: 'HR Agent',
+    uniqueName: 'omadia-agent-hr',
+    deletedDateTime: '2026-08-28T10:19:32Z',
+  };
+
+  it('soft-deleted holder → restores it and adopts the registration', async () => {
+    const routes: Route[] = [
+      route('passwordCredentials', { status: 200, body: { passwordCredentials: [] } }),
+      route('/restore', { status: 200, body: APP_BODY }),
+      route('/deletedItems/microsoft.graph.application', {
+        status: 200,
+        body: { value: [DELETED_ITEM] },
+      }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 409, body: {} }),
+      route(
+        "/applications(uniqueName='",
+        { status: 404, body: {} },
+        { status: 200, body: APP_BODY },
+      ),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client, calls } = harness(routes);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'already-existed');
+    assert.equal(result.value.appId, APP_ID);
+    const restore = graphCalls(calls).find((c) => c.url.includes('/restore'));
+    assert.ok(restore, 'expected the recycle-bin restore');
+    assert.equal(restore!.init?.method, 'POST');
+    assert.ok(restore!.url.includes('deletedItems/del-0001/restore'));
+  });
+
+  it('restore fails → an error that names the object and the 30-day window', async () => {
+    const routes: Route[] = [
+      route('/restore', { status: 400, body: { error: 'nope' } }),
+      route('/deletedItems/microsoft.graph.application', {
+        status: 200,
+        body: { value: [DELETED_ITEM] },
+      }),
+      route("/applications(uniqueName='", { status: 404, body: {} }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client } = harness(routes);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof UniqueNameReservedError);
+    assert.equal(err.uniqueName, 'omadia-agent-hr');
+    assert.equal(err.deletedObjectId, 'del-0001');
+    assert.equal(err.deletedDateTime, '2026-08-28T10:19:32Z');
+    assert.equal(err.retentionDays, 30);
+    assert.match(err.message, /30 days/);
+    assert.match(err.message, /soft-deleted application 'del-0001'/);
+  });
+
+  it('recycle bin unreadable → still explains WHY the name is taken', async () => {
+    // Application.ReadWrite.OwnedBy does not cover directory/deletedItems.
+    // The probe degrades to a diagnostic; it must never escalate into a
+    // consent error for the whole step.
+    const routes: Route[] = [
+      route('/deletedItems/microsoft.graph.application', {
+        status: 403,
+        body: { error: 'forbidden' },
+      }),
+      route("/applications(uniqueName='", { status: 404, body: {} }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client } = harness(routes);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof UniqueNameReservedError);
+    assert.ok(!(err instanceof ConsentMissingError));
+    assert.match(err.message, /30 days/);
+    assert.match(err.message, /recycle bin/);
+    assert.match(err.message, /Application\.ReadWrite\.All/);
+  });
+});
+
+describe('createAppRegistration — app_id is persistable before anything else (#916)', () => {
+  it('onRegistrationCreated fires after create and BEFORE addPassword', async () => {
+    const routes: Route[] = [
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 201, body: { id: 'sp-1' } }),
+      route('/applications', { status: 201, body: APP_BODY }),
+    ];
+    const { client, calls } = harness(routes);
+    let seenWhenNotified: string[] = [];
+    const result = await client.createAppRegistration({
+      ...CREATE_INPUT,
+      onRegistrationCreated: (registration, outcome) => {
+        assert.equal(registration.appId, APP_ID);
+        assert.equal(outcome, 'created');
+        seenWhenNotified = graphCalls(calls).map((c) => c.url);
+      },
+    });
+
+    assert.equal(result.value.appId, APP_ID);
+    assert.equal(seenWhenNotified.length, 1, 'notified right after the create');
+    assert.ok(!seenWhenNotified.some((u) => u.includes('/addPassword')));
+  });
+
+  it('an interrupted run leaves a resumable app_id, and the re-run adopts it', async () => {
+    // Run 1: the app is created, then the chain dies in the replication
+    // window. The caller has already persisted app_id.
+    let persistedAppId: string | undefined;
+    const onRegistrationCreated = (registration: { appId: string }): void => {
+      persistedAppId = registration.appId;
+    };
+
+    const run1 = harness(
+      [
+        route('/addPassword', NOT_REPLICATED_YET),
+        route("/applications(appId='", { status: 204 }),
+        route('/applications', { status: 201, body: APP_BODY }),
+      ],
+      { maxAttempts: 2 },
+    );
+    await rejection(
+      run1.client.createAppRegistration({ ...CREATE_INPUT, onRegistrationCreated }),
+    );
+    assert.equal(persistedAppId, APP_ID, 'app_id survives the interruption');
+    assert.ok(
+      !graphCalls(run1.calls).some((c) => c.init?.method === 'DELETE'),
+      'the app stays in the tenant — that is what makes the re-run possible',
+    );
+
+    // Run 2: create collides with the LIVE app from run 1 and adopts it.
+    const run2 = harness([
+      route('passwordCredentials', { status: 200, body: { passwordCredentials: [] } }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 409, body: {} }),
+      route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ]);
+    const result = await run2.client.createAppRegistration({
+      ...CREATE_INPUT,
+      onRegistrationCreated,
+    });
+
+    assert.equal(result.outcome, 'already-existed');
+    assert.equal(result.value.appId, persistedAppId);
+    assert.equal(run2.vault.get(SECRET_REF), SECRET_TEXT);
+  });
+
+  it('a throwing persistence hook is logged, not fatal', async () => {
+    const { client, logs } = harness(HAPPY_ROUTES());
+    const result = await client.createAppRegistration({
+      ...CREATE_INPUT,
+      onRegistrationCreated: () => {
+        throw new Error('store unavailable');
+      },
+    });
+
+    assert.equal(result.value.appId, APP_ID);
+    assert.ok(logs.some((l) => l.includes('onRegistrationCreated')));
+  });
+});
+
+describe('createAppRegistration — superseded credentials on adoption (#916)', () => {
+  it('removes only the provisioner-labelled predecessors', async () => {
+    const routes: Route[] = [
+      route('passwordCredentials', {
+        status: 200,
+        body: {
+          passwordCredentials: [
+            { keyId: 'key-1', displayName: 'HR Agent bot password' },
+            { keyId: 'key-0', displayName: 'HR Agent bot password' },
+            { keyId: 'key-operator', displayName: 'ops laptop' },
+          ],
+        },
+      }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/removePassword', { status: 204 }),
+      route('/servicePrincipals', { status: 409, body: {} }),
+      route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client, calls } = harness(routes);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'already-existed');
+    const removed = graphCalls(calls).filter((c) =>
+      c.url.includes('/removePassword'),
+    );
+    assert.equal(removed.length, 1, 'exactly the one superseded credential');
+    assert.deepEqual(bodyOf(removed[0]!), { keyId: 'key-0' });
+  });
+
+  it('a failing cleanup never fails the step', async () => {
+    const routes: Route[] = [
+      route('passwordCredentials', { status: 500, body: { error: 'boom' } }),
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 409, body: {} }),
+      route("/applications(uniqueName='", { status: 200, body: APP_BODY }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client, vault } = harness(routes);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'already-existed');
+    assert.equal(vault.get(SECRET_REF), SECRET_TEXT);
   });
 });

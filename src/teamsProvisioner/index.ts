@@ -19,6 +19,14 @@
  * `docs/teams-provisioner.md` — see the secret-store unit's rationale in
  * `secretStore.ts`.
  *
+ * IDEMPOTENCY — `createAppRegistration` is safe to re-run: a taken
+ * `uniqueName` adopts the existing registration (including one restored from
+ * the recycle bin), Entra's replication windows are polled through rather
+ * than reported as failures, and a transient failure never rolls the
+ * registration back (byte5ai/omadia#916). Callers that persist the app id
+ * should pass `onRegistrationCreated` so an interrupted chain leaves a
+ * resumable row.
+ *
  * GRACEFUL DEGRADATION — registration-only mode is observable on the
  * published capability: `canCreateBots` is `false` and `createBot` answers
  * the typed `RegistrationOnlyOutcome` without touching the network.
@@ -225,6 +233,11 @@ export function createTeamsProvisioner(
     secrets: options.secrets,
     tenantId: options.graphCredential.tenantId,
     log: options.log,
+    // Same wait seam the http unit uses — the app-registration step sleeps
+    // through Entra's replication windows and tests must not really wait.
+    ...(options.sleep !== undefined
+      ? { replication: { sleep: options.sleep } }
+      : {}),
   });
   const bots = new BotServiceClient({ http, armConfig, log: options.log });
   const catalog = new CatalogUploadClient({ http, log: options.log });
@@ -285,6 +298,11 @@ export {
   ProvisioningThrottledError,
   ArmNotConfiguredError,
   CapabilityUnavailableError,
+  DirectoryReplicationError,
+  ProvisioningRequestError,
+  UniqueNameReservedError,
+  DELETED_ITEM_RETENTION_DAYS,
+  isTransientProvisioningFailure,
 } from './errors.js';
 
 export {

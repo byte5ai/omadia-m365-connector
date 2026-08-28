@@ -13,7 +13,11 @@
  * - 403 → typed {@link ConsentMissingError} carrying the missing scope set
  *   and which API rejected, so the agent factory can fall back.
  * - 409 → NOT an error: the `{ kind: 'conflict' }` result is the idempotent
- *   signal the step units map to `Idempotent<T>` `'already-existed'`.
+ *   signal the step units map to `Idempotent<T>` `'already-existed'`. Some
+ *   APIs report a duplicate WITHOUT a 409 — Entra answers a taken
+ *   `uniqueName` on `POST /applications` with **400 Request_BadRequest**
+ *   (byte5ai/omadia#916) — so a request may declare extra
+ *   {@link ProvisioningConflictRule}s that map onto the same signal.
  * - 429 → backoff honouring the `Retry-After` header (never a fixed sleep);
  *   exhausted budget → {@link ProvisioningThrottledError}.
  *
@@ -35,7 +39,11 @@ import {
   truncate,
   type AadClientCredential,
 } from '../graphClient.js';
-import { ConsentMissingError, ProvisioningThrottledError } from './errors.js';
+import {
+  ConsentMissingError,
+  ProvisioningRequestError,
+  ProvisioningThrottledError,
+} from './errors.js';
 
 /** Which API a request targets — also the audience key for token + errors. */
 export type ProvisioningResource = 'graph' | 'arm';
@@ -117,6 +125,28 @@ export interface ProvisioningRequest {
    * (already gone = rolled back). Keeps callers from string-matching errors.
    */
   readonly extraOkStatuses?: readonly number[];
+  /**
+   * Non-409 answers that STILL mean "the object already exists" and must
+   * surface as {@link ProvisioningConflictResponse} rather than an error.
+   * The matching stays HERE — the one place that owns the status matrix —
+   * so step units keep branching on `kind === 'conflict'` only.
+   */
+  readonly conflictOn?: readonly ProvisioningConflictRule[];
+}
+
+/**
+ * One "this is really a duplicate" signature: a status plus optional Graph
+ * `error.code` values and/or `error.message` substrings (matched
+ * case-insensitively). A rule fires when the status matches AND every
+ * constraint it declares matches — a rule with no constraint fires on the
+ * status alone, so keep those narrow.
+ */
+export interface ProvisioningConflictRule {
+  readonly status: number;
+  /** Qualifying `error.code` values, e.g. `['ObjectConflict']`. */
+  readonly codes?: readonly string[];
+  /** Qualifying `error.message` substrings (lower-cased comparison). */
+  readonly messageIncludes?: readonly string[];
 }
 
 /** 2xx (or extraOkStatuses) outcome. `json` is undefined for empty bodies. */
@@ -127,16 +157,31 @@ export interface ProvisioningOkResponse {
   readonly header: (name: string) => string | null;
 }
 
-/** 409 outcome — the idempotent "already exists" signal, NOT an error. */
+/**
+ * Duplicate outcome — the idempotent "already exists" signal, NOT an error.
+ * Usually a 409; `status` is the raw status because a {@link
+ * ProvisioningConflictRule} can promote another one (Entra's 400 on a taken
+ * `uniqueName`) onto this same branch.
+ */
 export interface ProvisioningConflictResponse {
   readonly kind: 'conflict';
-  readonly status: 409;
+  readonly status: number;
   readonly json: unknown;
 }
 
 export type ProvisioningResponse =
   | ProvisioningOkResponse
   | ProvisioningConflictResponse;
+
+/**
+ * What one HTTP exchange settled on: the raw `Response` for every status the
+ * caller treats as non-error, or an already-parsed conflict for a status a
+ * {@link ProvisioningConflictRule} promoted (its body had to be read to
+ * inspect the error code, and a body can only be read once).
+ */
+type FetchOutcome =
+  | { readonly kind: 'response'; readonly response: Response }
+  | { readonly kind: 'conflict'; readonly conflict: ProvisioningConflictResponse };
 
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
@@ -175,7 +220,13 @@ export class ProvisioningHttp {
 
   /** The single choke point — every Graph/ARM provisioning verb goes here. */
   async request(req: ProvisioningRequest): Promise<ProvisioningResponse> {
-    const response = await this.fetchWithRetry(req);
+    const outcome = await this.fetchWithRetry(req);
+
+    // A rule-matched conflict already consumed the body (it had to, to read
+    // the error code) — hand the parsed payload straight through.
+    if (outcome.kind === 'conflict') return outcome.conflict;
+
+    const { response } = outcome;
 
     if (response.status === 409) {
       return {
@@ -217,7 +268,7 @@ export class ProvisioningHttp {
    * response for every status the caller treats as non-error (2xx,
    * extraOkStatuses, 409); throws typed/generic errors for the rest.
    */
-  private async fetchWithRetry(req: ProvisioningRequest): Promise<Response> {
+  private async fetchWithRetry(req: ProvisioningRequest): Promise<FetchOutcome> {
     let lastRetryAfterSeconds: number | undefined;
 
     for (let attempt = 0; ; attempt += 1) {
@@ -247,11 +298,22 @@ export class ProvisioningHttp {
         response.status === 409 ||
         (req.extraOkStatuses?.includes(response.status) ?? false)
       ) {
-        return response;
+        return { kind: 'response', response };
+      }
+
+      // The body can be read exactly ONCE, and three branches below need it —
+      // so read it here, on the error path only, and pass the text along.
+      const bodyText = await safeBody(response);
+
+      const conflict = matchConflictRule(req, response.status, bodyText);
+      if (conflict !== undefined) {
+        this.log(
+          `provisioner ${req.step}: ${String(response.status)} reads as an already-exists conflict — continuing on the idempotent path`,
+        );
+        return { kind: 'conflict', conflict };
       }
 
       if (response.status === 403) {
-        const bodyText = await safeBody(response);
         throw new ConsentMissingError(
           req.missingScopesOn403,
           req.resource,
@@ -264,7 +326,6 @@ export class ProvisioningHttp {
       if (response.status === 429) {
         lastRetryAfterSeconds = retryAfterSeconds(response) ?? lastRetryAfterSeconds;
         if (attempt >= this.max429Retries) {
-          const bodyText = await safeBody(response);
           throw new ProvisioningThrottledError(
             req.resource,
             lastRetryAfterSeconds,
@@ -278,7 +339,6 @@ export class ProvisioningHttp {
           // A wait beyond the cap is a "come back much later" signal, not a
           // backoff — surface it typed so the job runner can reschedule
           // instead of holding an awaited sleep for hours.
-          const bodyText = await safeBody(response);
           throw new ProvisioningThrottledError(
             req.resource,
             lastRetryAfterSeconds,
@@ -294,8 +354,10 @@ export class ProvisioningHttp {
         continue;
       }
 
-      const bodyText = await safeBody(response);
-      throw new Error(
+      throw new ProvisioningRequestError(
+        req.resource,
+        req.step,
+        response.status,
         `${req.resource} ${req.step} ${String(response.status)} ${req.method} ${truncate(req.url, 120)} body=${truncate(bodyText, 200)}`,
       );
     }
@@ -376,7 +438,10 @@ export class ProvisioningHttp {
       }
       if (!poll.ok) {
         const bodyText = await safeBody(poll);
-        throw new Error(
+        throw new ProvisioningRequestError(
+          req.resource,
+          `${req.step} poll`,
+          poll.status,
           `${req.resource} ${req.step} poll ${String(poll.status)} body=${truncate(bodyText, 200)}`,
         );
       }
@@ -426,7 +491,10 @@ export class ProvisioningHttp {
     });
     if (!response.ok) {
       const bodyText = await safeBody(response);
-      throw new Error(
+      throw new ProvisioningRequestError(
+        req.resource,
+        `${req.step} final read`,
+        response.status,
         `${req.resource} ${req.step} final read ${String(response.status)} body=${truncate(bodyText, 200)}`,
       );
     }
@@ -447,6 +515,60 @@ function retryAfterSeconds(response: Response): number | undefined {
     return Math.max(0, Math.ceil((asDate - Date.now()) / 1000));
   }
   return undefined;
+}
+
+/**
+ * Does this error body match one of the request's extra conflict rules?
+ * Returns the ready conflict response, or `undefined` to keep the normal
+ * error path.
+ */
+function matchConflictRule(
+  req: ProvisioningRequest,
+  status: number,
+  bodyText: string,
+): ProvisioningConflictResponse | undefined {
+  const rules = req.conflictOn;
+  if (rules === undefined || rules.length === 0) return undefined;
+  const candidates = rules.filter((rule) => rule.status === status);
+  if (candidates.length === 0) return undefined;
+
+  const json = parseJson(bodyText);
+  const code = graphErrorField(json, 'code')?.toLowerCase();
+  const message = graphErrorField(json, 'message')?.toLowerCase();
+
+  for (const rule of candidates) {
+    if (
+      rule.codes !== undefined &&
+      !rule.codes.some((c) => c.toLowerCase() === code)
+    ) {
+      continue;
+    }
+    if (
+      rule.messageIncludes !== undefined &&
+      !rule.messageIncludes.some((m) => message?.includes(m.toLowerCase()) === true)
+    ) {
+      continue;
+    }
+    return { kind: 'conflict', status, json };
+  }
+  return undefined;
+}
+
+/** `error.code` / `error.message` of a Graph/ARM error envelope, if present. */
+function graphErrorField(json: unknown, field: 'code' | 'message'): string | undefined {
+  if (!json || typeof json !== 'object') return undefined;
+  const error = (json as Record<string, unknown>)['error'];
+  if (!error || typeof error !== 'object') return undefined;
+  const value = (error as Record<string, unknown>)[field];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
 
 async function safeJson(response: Response): Promise<unknown> {

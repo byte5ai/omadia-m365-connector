@@ -15,8 +15,13 @@ import {
 import {
   ArmNotConfiguredError,
   ConsentMissingError,
+  DELETED_ITEM_RETENTION_DAYS,
+  DirectoryReplicationError,
+  ProvisioningRequestError,
   ProvisioningThrottledError,
   TeamsProvisionerError,
+  UniqueNameReservedError,
+  isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
 import { ConsentRequiredError } from '../src/graphObo.js';
 
@@ -166,5 +171,63 @@ describe('error taxonomy', () => {
     assert.equal(err.name, 'ArmNotConfiguredError');
     assert.equal(err.message, 'arm_not_configured');
     assert.deepEqual(err.missingSetupFields, ['azure_subscription_id']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// byte5ai/omadia#916 — classification decides whether a partial provisioning
+// failure may be rolled back. Rolling back a transient one soft-deletes a
+// perfectly good app and reserves its uniqueName for 30 days.
+// ---------------------------------------------------------------------------
+
+describe('transient-failure classification (#916)', () => {
+  it('throttling and pending replication are transient', () => {
+    assert.equal(
+      isTransientProvisioningFailure(new ProvisioningThrottledError('graph', 3)),
+      true,
+    );
+    assert.equal(
+      isTransientProvisioningFailure(
+        new DirectoryReplicationError('applications.addPassword', 'obj-1', 8, 39_000),
+      ),
+      true,
+    );
+  });
+
+  it('5xx / 429 / timeouts are transient, 4xx answers are not', () => {
+    const at = (status: number): ProvisioningRequestError =>
+      new ProvisioningRequestError('graph', 'applications.create', status, 'boom');
+
+    for (const status of [408, 425, 429, 500, 502, 503, 504]) {
+      assert.equal(isTransientProvisioningFailure(at(status)), true, String(status));
+    }
+    for (const status of [400, 401, 403, 404, 405]) {
+      assert.equal(isTransientProvisioningFailure(at(status)), false, String(status));
+    }
+  });
+
+  it('transport failures are transient, plain errors are not', () => {
+    const aborted = new Error('The operation was aborted');
+    aborted.name = 'AbortError';
+    assert.equal(isTransientProvisioningFailure(aborted), true);
+    assert.equal(isTransientProvisioningFailure(new Error('fetch failed')), true);
+    assert.equal(isTransientProvisioningFailure(new Error('ECONNRESET')), true);
+    assert.equal(isTransientProvisioningFailure(new Error('nope')), false);
+    assert.equal(isTransientProvisioningFailure('nope'), false);
+  });
+
+  it('UniqueNameReservedError explains the reservation and stays terminal', () => {
+    const err = new UniqueNameReservedError('omadia-teams-bot-hr', {
+      deletedObjectId: 'del-1',
+      deletedDateTime: '2026-08-28T10:19:32Z',
+      hint: 'name held by a soft-deleted app',
+    });
+    assert.ok(err instanceof TeamsProvisionerError);
+    assert.equal(err.name, 'UniqueNameReservedError');
+    assert.equal(err.uniqueName, 'omadia-teams-bot-hr');
+    assert.equal(err.deletedObjectId, 'del-1');
+    assert.equal(err.retentionDays, DELETED_ITEM_RETENTION_DAYS);
+    assert.match(err.message, /unique_name_reserved/);
+    assert.equal(isTransientProvisioningFailure(err), false);
   });
 });
