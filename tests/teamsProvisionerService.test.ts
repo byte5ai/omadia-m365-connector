@@ -289,9 +289,53 @@ describe('createTeamsProvisioner — capability assembly', () => {
       'getDelegatedSignInStatus',
       'refreshDelegatedToken',
       'revokeDelegatedSignIn',
+      // Install-target ENUMERATION (0.8.0) — the lists a picker offers so an
+      // operator never types a team or chat id by hand.
+      'listTeams',
+      'listChats',
+      // Reset primitives (0.8.0). deleteAppRegistration and deleteBot above
+      // already were the rollback halves and are reused unchanged; these two
+      // are what a delete alone cannot do — free the reserved uniqueName, and
+      // take the app back out of the tenant catalog.
+      'purgeDeletedAppRegistration',
+      'removeFromCatalog',
     ] as const) {
       assert.equal(typeof provisioner[step], 'function', `missing step ${step}`);
     }
+  });
+
+  it('answers listChats with a typed sign-in verdict, not a network call', async () => {
+    // The whole delegated story in one assertion: chat listing cannot run on
+    // the connector's application credentials, because Graph offers no
+    // tenant-wide app-only route for chats at all. A consumer must learn that
+    // from a typed error, not from a 403 it has to interpret — and learning it
+    // must not cost a Graph round trip, hence the trap fetch.
+    const { ctx } = fakeContext();
+    const armConfig = await readArmConfig(ctx, {
+      clientId: APP_ID,
+      clientSecret: APP_SECRET,
+    });
+    const provisioner = createTeamsProvisioner({
+      graphCredential: {
+        tenantId: TENANT,
+        clientId: APP_ID,
+        clientSecret: APP_SECRET,
+      },
+      armConfig,
+      secrets: ctx.secrets,
+      fetchImpl: trapFetch,
+      log: () => {},
+    });
+
+    await assert.rejects(
+      () => provisioner.listChats(),
+      (err: unknown) => {
+        assert.ok(err instanceof barrel.DelegatedScopeRequiredError);
+        assert.equal(err.reason, 'no-token');
+        assert.deepEqual(err.requiredScopes, [barrel.CHAT_READ_DELEGATED_SCOPE]);
+        return true;
+      },
+    );
   });
 
   it('stays side-effect free: no Graph call until a step runs', async () => {
@@ -358,7 +402,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     // 0.5.4 — the global bot-handle verdict + the stricter handle grammar (#921).
     // 0.6.0 — delegated catalog publishing via device code (#924).
     // 0.7.0 — chat install/uninstall + install-target classification.
-    assert.equal(pkg.version, '0.7.0');
+    // 0.8.0 — install-target ENUMERATION (listTeams/listChats) + the reset
+    //         primitives (purge, catalog removal).
+    assert.equal(pkg.version, '0.8.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

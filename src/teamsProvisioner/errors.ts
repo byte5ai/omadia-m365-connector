@@ -513,6 +513,95 @@ export class DeviceCodeFlowError extends TeamsProvisionerError {
 }
 
 /**
+ * A delegated read was asked for with a credential that cannot perform it —
+ * either none was passed, or the stored one carries the wrong scopes.
+ *
+ * DISTINCT FROM {@link DelegatedSignInRequiredError} on purpose. That one
+ * explains the catalog-publish situation ("Graph supports no application
+ * permission for this verb"), which is a different fact about a different
+ * endpoint; reusing it for a chat listing would hand the operator a sentence
+ * about the app catalog while they are looking at a target picker.
+ *
+ * DISTINCT FROM {@link DelegatedConsentRequiredError} too: nothing has been
+ * REJECTED here. This is a pre-flight verdict about the credential in hand,
+ * raised before a Graph call is spent producing a misleading answer.
+ *
+ * Both reasons share one remedy — run the device-code sign-in again — but
+ * they read very differently to an operator, so {@link reason} carries which
+ * one it is instead of forcing a caller to parse the message.
+ */
+export class DelegatedScopeRequiredError extends TeamsProvisionerError {
+  /** Which step needs the user token, e.g. `chats.list`. */
+  public readonly step: string;
+  /** Delegated scopes the sign-in has to acquire. */
+  public readonly requiredScopes: readonly string[];
+  /** `'no-token'`: nobody signed in. `'scope-missing'`: signed in, too narrow. */
+  public readonly reason: 'no-token' | 'scope-missing';
+  /** Scopes the stored credential DOES carry (empty for `'no-token'`). */
+  public readonly grantedScopes: readonly string[];
+
+  constructor(
+    step: string,
+    requiredScopes: readonly string[],
+    reason: 'no-token' | 'scope-missing',
+    grantedScopes: readonly string[] = [],
+  ) {
+    super(
+      reason === 'no-token'
+        ? `delegated_scope_required: '${step}' reads on behalf of the signed-in ` +
+            'administrator and no delegated credential was passed. Microsoft ' +
+            'Graph offers no tenant-wide application-permission route for this ' +
+            'data, so an admin has to complete the device-code sign-in once. ' +
+            `Required delegated scope(s): ${requiredScopes.join(', ')}`
+        : `delegated_scope_required: '${step}' needs the delegated scope(s) ` +
+            `${requiredScopes.join(', ')}, which the stored credential does not ` +
+            `carry (it has: ${grantedScopes.length > 0 ? grantedScopes.join(', ') : 'none'}). ` +
+            'A credential minted before this scope was requested cannot grow ' +
+            'one by refreshing — the administrator has to sign in again',
+    );
+    this.name = 'DelegatedScopeRequiredError';
+    this.step = step;
+    this.requiredScopes = requiredScopes;
+    this.reason = reason;
+    this.grantedScopes = grantedScopes;
+  }
+}
+
+/**
+ * A purge was addressed with an APPLICATION (client) id instead of the
+ * directory OBJECT id, and the recycle bin proved it.
+ *
+ * WHY THIS DESERVES ITS OWN CLASS. `DELETE /directory/deletedItems/{id}` takes
+ * the object id; both ids are GUIDs, so the wrong one does not fail loudly —
+ * Graph answers a perfectly ordinary 404, indistinguishable from "already
+ * purged". Reporting that as `'already-absent'` would tell an operator the
+ * `uniqueName` is free while the entry, and its 30-day reservation, is still
+ * sitting in the bin — the exact shape of the confusion that cost a slug a
+ * month in byte5ai/omadia#916. The error carries the id that WOULD have
+ * worked, so the fix is a retry with a value the caller already has.
+ */
+export class DeletedObjectIdMismatchError extends TeamsProvisionerError {
+  /** What the caller passed — an `appId`, as it turns out. */
+  public readonly passedId: string;
+  /** The directory object id the recycle bin actually holds it under. */
+  public readonly objectId: string;
+
+  constructor(passedId: string, objectId: string) {
+    super(
+      `deleted_object_id_mismatch: '${passedId}' is the application (client) ` +
+        'id, but DELETE /directory/deletedItems addresses the DIRECTORY OBJECT ' +
+        `id. The recycle bin holds this app under objectId '${objectId}' — ` +
+        'retry the purge with that. Reporting the 404 as "already absent" ' +
+        'would have claimed the uniqueName was freed while the reservation ' +
+        `still stands for up to ${String(DELETED_ITEM_RETENTION_DAYS)} days`,
+    );
+    this.name = 'DeletedObjectIdMismatchError';
+    this.passedId = passedId;
+    this.objectId = objectId;
+  }
+}
+
+/**
  * HTTP statuses that mean "the same call can succeed later": throttling,
  * request timeouts and the 5xx family. Deliberately NOT 404 — a bare
  * not-found is a legitimate terminal answer for most steps; the ONE 404 that
@@ -551,9 +640,12 @@ export function isTransientProvisioningFailure(err: unknown): boolean {
   // are listed explicitly rather than left to the message-pattern fallback
   // below, which could match one of their explanatory sentences by accident.
   if (err instanceof DelegatedSignInRequiredError) return false;
+  if (err instanceof DelegatedScopeRequiredError) return false;
   if (err instanceof DelegatedConsentRequiredError) return false;
   if (err instanceof DelegatedTokenExpiredError) return false;
   if (err instanceof DeviceCodeFlowError) return false;
+  // Retrying a purge with the same wrong id produces the same wrong answer.
+  if (err instanceof DeletedObjectIdMismatchError) return false;
   if (err instanceof ProvisioningRequestError) {
     return TRANSIENT_HTTP_STATUSES.has(err.status);
   }

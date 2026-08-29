@@ -44,6 +44,7 @@ import {
 } from './appRegistrationSupport.js';
 import {
   APP_CATALOG_DELEGATED_PERMISSION_ID,
+  CHAT_READ_DELEGATED_PERMISSION_ID,
   GRAPH_RESOURCE_APP_ID,
 } from './delegatedAuth.js';
 import {
@@ -110,6 +111,16 @@ export interface PublisherApp {
    * at sign-in (or through the admin-consent URL).
    */
   readonly declaresCatalogScope: boolean;
+  /**
+   * `true` once the delegated `Chat.ReadBasic` scope is declared too (0.8.0).
+   *
+   * Additive rather than a rename of {@link declaresCatalogScope}: that field
+   * is on the shipped surface and still means exactly what it says. An adopted
+   * app from an older install has this `false` until `ensurePublisherApp`
+   * repairs it — which it does on the next sign-in, by merging the scope in
+   * rather than overwriting the collection.
+   */
+  readonly declaresChatScope: boolean;
 }
 
 export interface PublisherAppClientOptions {
@@ -144,15 +155,28 @@ function publisherAppBody(displayName: string, uniqueName: string): Record<strin
   };
 }
 
-/** The single delegated permission the publisher app declares. */
+/**
+ * The delegated permissions the publisher app declares.
+ *
+ * Two since 0.8.0: publishing to the catalog, and reading the signing-in
+ * administrator's chats so a target picker can offer them. Both are delegated
+ * (`type: 'Scope'`) — `'Role'` would be an application permission, which is
+ * precisely what Graph refuses for the catalog upload and does not offer
+ * tenant-wide for chats at all.
+ */
+export const PUBLISHER_APP_DELEGATED_PERMISSION_IDS: readonly string[] = [
+  APP_CATALOG_DELEGATED_PERMISSION_ID,
+  CHAT_READ_DELEGATED_PERMISSION_ID,
+];
+
+/** The delegated permissions the publisher app declares, as Graph wants them. */
 function catalogResourceAccess(): Record<string, unknown> {
   return {
     resourceAppId: GRAPH_RESOURCE_APP_ID,
-    resourceAccess: [
-      // `type: 'Scope'` = DELEGATED. `'Role'` would be an app permission,
-      // which is precisely what Graph refuses for the catalog upload.
-      { id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' },
-    ],
+    resourceAccess: PUBLISHER_APP_DELEGATED_PERMISSION_IDS.map((id) => ({
+      id,
+      type: 'Scope',
+    })),
   };
 }
 
@@ -310,11 +334,14 @@ export class PublisherAppClient {
    * the Graph entry is touched, and within it only our scope is added.
    */
   private async reconcile(app: PublisherApp): Promise<PublisherApp> {
-    if (app.isPublicClient && app.declaresCatalogScope) return app;
+    if (app.isPublicClient && app.declaresCatalogScope && app.declaresChatScope) {
+      return app;
+    }
 
     const missing: string[] = [];
     if (!app.isPublicClient) missing.push('isFallbackPublicClient');
     if (!app.declaresCatalogScope) missing.push('AppCatalog.ReadWrite.All (delegated)');
+    if (!app.declaresChatScope) missing.push('Chat.ReadBasic (delegated)');
     this.log(
       `provisioner publisherApp: repairing adopted app '${app.appId}' — ` +
         `missing ${missing.join(', ')}`,
@@ -323,7 +350,7 @@ export class PublisherAppClient {
     const existing = await this.readResourceAccess(app.objectId);
     const patch: Record<string, unknown> = {
       isFallbackPublicClient: true,
-      requiredResourceAccess: mergeCatalogScope(existing),
+      requiredResourceAccess: mergePublisherScopes(existing),
     };
 
     const response = await this.http.request({
@@ -338,7 +365,12 @@ export class PublisherAppClient {
       throw new Error('graph publisherApp.patch unexpected conflict');
     }
 
-    return { ...app, isPublicClient: true, declaresCatalogScope: true };
+    return {
+      ...app,
+      isPublicClient: true,
+      declaresCatalogScope: true,
+      declaresChatScope: true,
+    };
   }
 
   /** Current `requiredResourceAccess` of the app, for the merge above. */
@@ -412,12 +444,39 @@ export class PublisherAppClient {
           : publisherAppUniqueName(this.tenantId),
       isPublicClient: body['isFallbackPublicClient'] === true,
       declaresCatalogScope: declaresCatalogScope(body['requiredResourceAccess']),
+      declaresChatScope: declaresChatScope(body['requiredResourceAccess']),
     };
   }
 }
 
 /** Does this `requiredResourceAccess` collection already declare our scope? */
 export function declaresCatalogScope(requiredResourceAccess: unknown): boolean {
+  return declaresDelegatedScope(
+    requiredResourceAccess,
+    APP_CATALOG_DELEGATED_PERMISSION_ID,
+  );
+}
+
+/**
+ * Does it declare the delegated `Chat.ReadBasic` behind the target picker
+ * (0.8.0)?
+ *
+ * Declaring is not consenting — but it IS what makes consenting possible for a
+ * tenant that has turned user consent off: the admin-consent URL grants the
+ * permissions the APP DECLARES, so an undeclared scope can never be granted
+ * that way no matter how often the administrator signs in.
+ */
+export function declaresChatScope(requiredResourceAccess: unknown): boolean {
+  return declaresDelegatedScope(
+    requiredResourceAccess,
+    CHAT_READ_DELEGATED_PERMISSION_ID,
+  );
+}
+
+function declaresDelegatedScope(
+  requiredResourceAccess: unknown,
+  permissionId: string,
+): boolean {
   if (!Array.isArray(requiredResourceAccess)) return false;
   for (const entry of requiredResourceAccess) {
     if (entry === null || typeof entry !== 'object') continue;
@@ -428,10 +487,7 @@ export function declaresCatalogScope(requiredResourceAccess: unknown): boolean {
     for (const item of access) {
       if (item === null || typeof item !== 'object') continue;
       const grant = item as Record<string, unknown>;
-      if (
-        grant['id'] === APP_CATALOG_DELEGATED_PERMISSION_ID &&
-        grant['type'] === 'Scope'
-      ) {
+      if (grant['id'] === permissionId && grant['type'] === 'Scope') {
         return true;
       }
     }
@@ -444,7 +500,39 @@ export function declaresCatalogScope(requiredResourceAccess: unknown): boolean {
  * collection without disturbing anything else in it.
  */
 export function mergeCatalogScope(existing: readonly unknown[]): unknown[] {
-  if (declaresCatalogScope(existing)) return [...existing];
+  return mergeDelegatedScope(existing, APP_CATALOG_DELEGATED_PERMISSION_ID);
+}
+
+/**
+ * Ensure EVERY delegated scope the publisher app needs (0.8.0) — catalog
+ * publish plus the chat read behind the target picker.
+ *
+ * This is what {@link PublisherAppClient} reconciles against. `mergeCatalogScope`
+ * stays as it was, doing exactly what its name says, so a caller that only
+ * cares about publishing keeps its old behaviour.
+ */
+export function mergePublisherScopes(existing: readonly unknown[]): unknown[] {
+  let merged: unknown[] = [...existing];
+  for (const id of PUBLISHER_APP_DELEGATED_PERMISSION_IDS) {
+    merged = mergeDelegatedScope(merged, id);
+  }
+  return merged;
+}
+
+/**
+ * Add one delegated `resourceAccess` id to the Graph entry of a
+ * `requiredResourceAccess` collection, leaving everything else untouched.
+ *
+ * The merge matters more than it looks: PATCHing `requiredResourceAccess` is a
+ * full overwrite, so building the new collection from scratch would silently
+ * drop a permission somebody added on purpose — a worse failure than the one
+ * being repaired.
+ */
+function mergeDelegatedScope(
+  existing: readonly unknown[],
+  permissionId: string,
+): unknown[] {
+  if (declaresDelegatedScope(existing, permissionId)) return [...existing];
 
   const merged: unknown[] = [];
   let addedToGraphEntry = false;
@@ -458,13 +546,18 @@ export function mergeCatalogScope(existing: readonly unknown[]): unknown[] {
       const access = Array.isArray(record['resourceAccess'])
         ? [...(record['resourceAccess'] as unknown[])]
         : [];
-      access.push({ id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' });
+      access.push({ id: permissionId, type: 'Scope' });
       merged.push({ ...record, resourceAccess: access });
       addedToGraphEntry = true;
       continue;
     }
     merged.push(entry);
   }
-  if (!addedToGraphEntry) merged.push(catalogResourceAccess());
+  if (!addedToGraphEntry) {
+    merged.push({
+      resourceAppId: GRAPH_RESOURCE_APP_ID,
+      resourceAccess: [{ id: permissionId, type: 'Scope' }],
+    });
+  }
   return merged;
 }
