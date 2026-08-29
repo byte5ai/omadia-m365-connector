@@ -80,8 +80,11 @@ import {
 } from './teamLookup.js';
 import { ProvisioningHttp } from './http.js';
 import {
+  ChatInstallClient,
   TeamInstallClient,
   type InstallToTeamRequest,
+  type UninstallFromChatInput,
+  type UninstallFromChatResult,
   type UninstallFromTeamInput,
   type UninstallFromTeamResult,
 } from './install.js';
@@ -89,8 +92,10 @@ import type {
   AppRegistration,
   BotProvisioningOutcome,
   CatalogTeamsApp,
+  ChatAppInstallation,
   CreateBotInput,
   Idempotent,
+  InstallToChatInput,
   TeamAppInstallation,
   TenantMode,
   UploadToCatalogInput,
@@ -288,6 +293,55 @@ export interface TeamsProvisionerAccessor {
   ): Promise<UninstallFromTeamResult>;
 
   /**
+   * Chain step 5, chat flavour — install the catalog app into one CHAT
+   * (since 0.7.0): a group chat (`19:…@thread.v2`) or a 1:1 chat
+   * (`19:…@unq.gbl.spaces`).
+   *
+   * Not a variant of {@link installToTeam} but its peer: an agent belongs
+   * wherever the conversation is, and for most installs that is a group chat,
+   * which had no path here before. Runs on APPLICATION permissions
+   * (`TeamsAppInstallation.ReadWriteForChat.All`) — no delegated sign-in, no
+   * protected-API request form.
+   *
+   * Idempotent the same way: an app already installed in the chat answers
+   * `{ outcome: 'already-existed' }` rather than throwing.
+   *
+   * A chat id that is not a chat id fails FAST and specifically: a channel id
+   * (`19:…@thread.tacv2`) or a team GUID throws `InstallTargetMismatchError`
+   * before any network call, carrying the remedy; a well-formed chat Graph
+   * cannot resolve throws `ChatNotFoundError`, which is deliberately a
+   * different type from the team direction's not-found. Use
+   * {@link classifyInstallTarget} to route an operator-supplied id to the
+   * right method in the first place.
+   *
+   * FEATURE-DETECT it (`typeof provisioner.installToChat === 'function'`) —
+   * same reason as {@link uninstallFromTeam}: the middleware mirrors this
+   * contract structurally rather than importing it, so a middleware running
+   * against a connector < 0.7.0 must keep its team-only branch.
+   */
+  installToChat(
+    input: InstallToChatInput,
+  ): Promise<Idempotent<ChatAppInstallation>>;
+
+  /**
+   * Reverse of {@link installToChat} (since 0.7.0), keyed by the same
+   * (chatId, teamsAppId) pair — the chat-scope mirror of
+   * {@link uninstallFromTeam}, with the same `'uninstalled' |
+   * 'already-absent'` vocabulary.
+   *
+   * Idempotent in both halves: an app that is not installed, and a chat that
+   * no longer exists, both answer `'already-absent'`. Unlike the install
+   * direction this does NOT throw `ChatNotFoundError` — being asked to make
+   * sure an app is absent from a chat that is gone is a request already
+   * satisfied.
+   *
+   * FEATURE-DETECT it, as above.
+   */
+  uninstallFromChat(
+    input: UninstallFromChatInput,
+  ): Promise<UninstallFromChatResult>;
+
+  /**
    * Resolve one team id to its display name (since 0.5.0).
    *
    * Every other method here addresses a team by GUID, which is also all the
@@ -416,6 +470,7 @@ export function createTeamsProvisioner(
     },
   });
   const installs = new TeamInstallClient({ http, log: options.log });
+  const chatInstalls = new ChatInstallClient({ http, log: options.log });
   const teamLookup = new TeamLookupClient({ http, log: options.log });
 
   return {
@@ -457,6 +512,8 @@ export function createTeamsProvisioner(
     revokeDelegatedSignIn: (input) => revokeInstructions(input.tokens),
     installToTeam: (input) => installs.installToTeam(input),
     uninstallFromTeam: (input) => installs.uninstallFromTeam(input),
+    installToChat: (input) => chatInstalls.installToChat(input),
+    uninstallFromChat: (input) => chatInstalls.uninstallFromChat(input),
     getTeam: (input) => teamLookup.getTeam(input),
   };
 }
@@ -479,9 +536,11 @@ export type {
   BotProvisionedOutcome,
   BotProvisioningOutcome,
   CatalogTeamsApp,
+  ChatAppInstallation,
   CreateBotInput,
   Idempotent,
   IdempotentOutcome,
+  InstallToChatInput,
   InstallToTeamInput,
   RegisterApplicationInput,
   RegistrationOnlyOutcome,
@@ -502,6 +561,10 @@ export {
   ProvisioningRequestError,
   UniqueNameReservedError,
   BotHandleUnavailableError,
+  // Chat-install taxonomy (0.7.0) — a chat 404 and a wrong-kind target id
+  // each carry their own operator remedy.
+  ChatNotFoundError,
+  InstallTargetMismatchError,
   // Delegated catalog-publish taxonomy (byte5ai/omadia#924).
   DelegatedSignInRequiredError,
   DelegatedConsentRequiredError,
@@ -622,12 +685,31 @@ export type {
   GetBotResult,
 } from './botService.js';
 
+// Note: CHAT_INSTALL_SCOPE / TEAM_INSTALL_SCOPE stay internal to install.ts —
+// no consumer needs the app-role literal, and the 403 path already hands it
+// over on `ConsentMissingError.missingScopes`.
 export type {
   ConsentedPermissionSet,
   InstallToTeamRequest,
   ResourceSpecificPermission,
   ResourceSpecificPermissionType,
+  UninstallFromChatInput,
+  UninstallFromChatOutcome,
+  UninstallFromChatResult,
   UninstallFromTeamInput,
   UninstallFromTeamOutcome,
   UninstallFromTeamResult,
 } from './install.js';
+
+// Install-target classification (0.7.0) — pure, network-free, and the way a
+// consumer routes an operator-supplied id to installToTeam vs installToChat.
+export { classifyInstallTarget, isChatTarget } from './installTarget.js';
+export type {
+  AmbiguousTarget,
+  ChannelTarget,
+  ChatTarget,
+  InstallTarget,
+  InstallTargetKind,
+  TeamTarget,
+  UnknownTarget,
+} from './installTarget.js';

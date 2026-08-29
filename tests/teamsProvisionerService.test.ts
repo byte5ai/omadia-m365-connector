@@ -278,6 +278,10 @@ describe('createTeamsProvisioner — capability assembly', () => {
       'getCatalogApp',
       'installToTeam',
       'uninstallFromTeam',
+      // Chat install (0.7.0) — the group-chat target the team-only surface
+      // could not express. Consumers feature-detect these two.
+      'installToChat',
+      'uninstallFromChat',
       // Delegated catalog publishing (0.6.0, byte5ai/omadia#924).
       'uploadToCatalogDelegated',
       'startDelegatedSignIn',
@@ -353,7 +357,8 @@ describe('manifest.yaml / package.json hub edits', () => {
     // 0.5.3 — `teamsProvisioner@1.getTeam`, the team-name lookup.
     // 0.5.4 — the global bot-handle verdict + the stricter handle grammar (#921).
     // 0.6.0 — delegated catalog publishing via device code (#924).
-    assert.equal(pkg.version, '0.6.0');
+    // 0.7.0 — chat install/uninstall + install-target classification.
+    assert.equal(pkg.version, '0.7.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
@@ -395,11 +400,13 @@ describe('manifest.yaml / package.json hub edits', () => {
     assert.match(manifest, /secrets:\s*\n\s*runtime_write: true/);
   });
 
-  it('documents the three provisioning scopes in the bilingual setup.guide', () => {
+  it('documents the provisioning scopes in the bilingual setup.guide', () => {
     for (const scope of [
       'Application.ReadWrite.OwnedBy',
       'AppCatalog.ReadWrite.All',
       'TeamsAppInstallation.ReadWriteForTeam.All',
+      // 0.7.0 — the chat install target.
+      'TeamsAppInstallation.ReadWriteForChat.All',
     ]) {
       const first = manifest.indexOf(`\`${scope}\``);
       const last = manifest.lastIndexOf(`\`${scope}\``);

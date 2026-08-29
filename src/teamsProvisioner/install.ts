@@ -1,9 +1,23 @@
 /**
- * Team-install step of `teamsProvisioner@1` (epic byte5ai/omadia#860,
- * capability issue byte5ai/omadia-m365-connector#3): install a catalog Teams
- * app into ONE team — the last link of the "1 agent = 1 Entra app + 1 Azure
- * bot + 1 Teams app package" chain — and, since 0.4.0, take it back out
- * again ({@link TeamInstallClient.uninstallFromTeam}, byte5ai/omadia#900).
+ * Install step of `teamsProvisioner@1` (epic byte5ai/omadia#860, capability
+ * issue byte5ai/omadia-m365-connector#3): install a catalog Teams app into ONE
+ * team — the last link of the "1 agent = 1 Entra app + 1 Azure bot + 1 Teams
+ * app package" chain — and, since 0.4.0, take it back out again
+ * ({@link TeamInstallClient.uninstallFromTeam}, byte5ai/omadia#900).
+ *
+ * SINCE 0.7.0, ALSO INTO A CHAT ({@link ChatInstallClient}). A team was never
+ * the only place an agent belongs: the common case is a group chat, which had
+ * no path here at all. `POST /chats/{id}/installedApps` is the chat-scope
+ * counterpart and — unlike the catalog upload — it DOES support application
+ * permissions, so the chat direction needs no delegated sign-in; it needs the
+ * `TeamsAppInstallation.ReadWriteForChat.All` app role
+ * ({@link CHAT_INSTALL_SCOPE}) and nothing else.
+ *
+ * The two directions are near-twins and deliberately do not share a class:
+ * see {@link ChatInstallClient} for what actually differs (app role,
+ * not-found meaning, the pre-flight target check). What they DO share — the
+ * installation lookup, OData escaping, result assembly — lives in the
+ * module-private helpers at the bottom.
  *
  * One Graph write: `POST /teams/{teamId}/installedApps` with the
  * `teamsApp@odata.bind` reference to the catalog app. When the caller passes
@@ -35,9 +49,20 @@
  * fetch of its own.
  */
 
-import type { ProvisioningHttp } from './http.js';
+import { ChatNotFoundError, InstallTargetMismatchError } from './errors.js';
+import type { ProvisioningConflictRule, ProvisioningHttp } from './http.js';
+import {
+  classifyInstallTarget,
+  isChatTarget,
+  type AmbiguousTarget,
+  type ChannelTarget,
+  type TeamTarget,
+  type UnknownTarget,
+} from './installTarget.js';
 import type {
+  ChatAppInstallation,
   Idempotent,
+  InstallToChatInput,
   InstallToTeamInput,
   TeamAppInstallation,
 } from './types.js';
@@ -258,46 +283,361 @@ export class TeamInstallClient {
     };
   }
 
-  /**
-   * `GET /teams/{teamId}/installedApps?$expand=teamsApp&$filter=teamsApp/id eq '…'`
-   * — the installation id for a catalog app, or `undefined` when the app is
-   * not installed in the team.
-   *
-   * OData string-literal escaping (quote doubling) + `encodeURIComponent`
-   * keep the `$filter` injection-safe for arbitrary ids, exactly as the
-   * catalog `externalId` lookup does. The returned entries are re-checked
-   * against `teamsApp.id` client-side, so a tenant that ignores the
-   * `$filter` cannot make us delete the wrong installation.
-   */
-  private async findInstallationId(
+  /** See {@link findInstallationId} — the team-scoped installation lookup. */
+  private findInstallationId(
     teamId: string,
     teamsAppId: string,
   ): Promise<string | undefined> {
-    const filter = `teamsApp/id eq '${escapeODataString(teamsAppId)}'`;
+    return findInstallationId(this.http, {
+      collectionUrl: `${GRAPH_BASE}/teams/${encodeURIComponent(teamId)}/installedApps`,
+      teamsAppId,
+      step: 'teams.installedApps.lookup',
+      scope: TEAM_INSTALL_SCOPE,
+      subject: `team=${teamId}`,
+    });
+  }
+}
+
+/**
+ * Graph APPLICATION permission the chat direction needs (since 0.7.0).
+ *
+ * NOT the `…SelfForChat.All` variant, which only lets an app install ITSELF —
+ * the provisioner installs the per-agent app it generated, a different app
+ * from the connector's own identity, so "self" never applies.
+ *
+ * Surfaced on 403 via `ConsentMissingError.missingScopes`.
+ */
+export const CHAT_INSTALL_SCOPE = 'TeamsAppInstallation.ReadWriteForChat.All';
+
+/**
+ * How the chat endpoint reports "this app is already installed here" — and
+ * what is actually KNOWN about that, which is less than one would like.
+ *
+ * WHAT IS ESTABLISHED. `409` with `error.code` **`Conflict`** is the duplicate
+ * signal for the sibling scopes, and the http layer already treats 409 as its
+ * NATIVE conflict — no rule needed for it. The message body reads
+ * `AppEntitlement id: '<app>' already exists in <scope>`, and the SCOPE TAIL
+ * VARIES: `… already exists in TeamId: '19:…'` for the team endpoint,
+ * `… already exists in thread` for the per-user endpoint.
+ *
+ * WHAT IS NOT. Graph's reference for this verb documents no failure response
+ * at all — only `201 Created` — and a search across Microsoft Q&A, Stack
+ * Overflow and GitHub turns up no report of the CHAT variant's duplicate
+ * answer specifically. So the 409 is an inference from two neighbouring
+ * scopes, not an observed fact about this one.
+ *
+ * WHY A 400 RULE ANYWAY. `teams`, `chats` and `users/…/teamwork` are separate
+ * endpoints that have already been shown to word the same condition
+ * differently, and Entra set the precedent that a duplicate can arrive
+ * Bad-Request-shaped: a taken `uniqueName` on `POST /applications` answers
+ * **400** rather than 409 (byte5ai/omadia#916). A re-run of a provisioning
+ * chain hard-failing on an app that is simply already there is the expensive
+ * mistake here, so the 400 shapes fold onto the same idempotent path.
+ *
+ * THE SUBSTRINGS ARE THE OBSERVED ONES. `'already exists'` is the wording both
+ * documented scopes use; `'already installed'` is a cheap second guess. What
+ * is deliberately NOT here: `NameAlreadyExists` and `AppAlreadyInstalled` —
+ * neither error code exists anywhere in this API surface, so matching them
+ * would be decoration. Nor `AddAppBotToChatRosterFailed`, which is an HTTP 500
+ * from the Teams web client's own internal API, never a Graph answer.
+ */
+const CHAT_ALREADY_INSTALLED_RULES: readonly ProvisioningConflictRule[] = [
+  { status: 400, codes: ['Conflict'] },
+  { status: 400, messageIncludes: ['already exists', 'already installed'] },
+];
+
+/** Input for {@link ChatInstallClient.uninstallFromChat}. */
+export interface UninstallFromChatInput {
+  readonly chatId: string;
+  /** Catalog id (`CatalogTeamsApp.teamsAppId`) — NOT the installation id. */
+  readonly teamsAppId: string;
+}
+
+/**
+ * Idempotency signal of the chat uninstall — the same vocabulary as
+ * {@link UninstallFromTeamOutcome}, deliberately: a consumer that already
+ * branches on `'uninstalled' | 'already-absent'` for teams needs no second
+ * shape for chats.
+ */
+export type UninstallFromChatOutcome = 'uninstalled' | 'already-absent';
+
+/** Result of {@link ChatInstallClient.uninstallFromChat}. */
+export interface UninstallFromChatResult {
+  readonly outcome: UninstallFromChatOutcome;
+  readonly value: ChatAppInstallation;
+}
+
+export interface ChatInstallClientOptions {
+  /**
+   * The SHARED token/429 choke point of the http unit. Pass the one
+   * `ProvisioningHttp` instance of the provisioner — this module must never
+   * open a second token cache.
+   */
+  readonly http: Pick<ProvisioningHttp, 'request'>;
+  readonly log?: (msg: string) => void;
+}
+
+/**
+ * Install catalog Teams apps into CHATS — group chats and 1:1 chats (since
+ * 0.7.0). The chat-scope twin of {@link TeamInstallClient}; one step client
+ * per provisioner, ordering stays middleware-side.
+ *
+ * WHY A SECOND CLIENT AND NOT A FLAG. The two directions share their body
+ * shape and their idempotency story but nothing else that matters: a different
+ * Graph collection, a different app role, a different not-found meaning, and a
+ * pre-flight target check that only the chat side needs. A `scope: 'team' |
+ * 'chat'` parameter would have to branch on all four inside every method.
+ * The genuinely shared parts — the installation lookup, the OData escaping,
+ * the result assembly — are module-private functions both clients call.
+ *
+ * NO `consentedPermissionSet` HERE, unlike {@link installToTeam}. Graph
+ * documents that `TeamsAppInstallation.ReadWriteForChat.All` "cannot be used
+ * to install apps that require consent to resource-specific permissions" —
+ * consenting RSC on a chat install needs `…ReadWriteAndConsentForChat.All`
+ * instead, and the refusal is real: this endpoint answers **400
+ * `ResourceSpecificPermissionsMismatch`** when the app's manifest declares RSC
+ * the caller's role cannot consent to. Offering the field on this scope would
+ * let a caller build a request that is refused by construction, so it is left
+ * out until a consumer actually needs RSC in chats (and with it, the wider app
+ * role). That 400 is deliberately NOT folded into the idempotent path.
+ */
+export class ChatInstallClient {
+  private readonly http: Pick<ProvisioningHttp, 'request'>;
+  private readonly log: (msg: string) => void;
+
+  constructor(opts: ChatInstallClientOptions) {
+    this.http = opts.http;
+    this.log =
+      opts.log ??
+      ((msg: string): void => {
+        console.error(msg);
+      });
+  }
+
+  /**
+   * `POST /chats/{chatId}/installedApps` — install the catalog app
+   * (`teamsAppId` = `CatalogTeamsApp.teamsAppId`) into the chat.
+   *
+   * APPLICATION PERMISSIONS WORK HERE. Unlike the catalog upload
+   * (`POST /appCatalogs/teamsApps`, delegated-only since byte5ai/omadia#924),
+   * this verb supports app-only tokens — {@link CHAT_INSTALL_SCOPE} is an
+   * application app role. No device-code sign-in, no protected-API request
+   * form to Microsoft.
+   *
+   * - PRE-FLIGHT → the `chatId` is classified by shape first
+   *   ({@link classifyInstallTarget}). A channel id, a team GUID or an
+   *   unrecognised string throws `InstallTargetMismatchError` BEFORE any
+   *   network call, carrying the remedy — a Graph 404 would name none of it.
+   * - 2xx → `'created'`, with the Graph installation id when the response
+   *   body carried one.
+   * - 409 (and a Bad-Request-shaped duplicate, see
+   *   {@link CHAT_ALREADY_INSTALLED_RULES}) → `'already-existed'` — success,
+   *   never an exception.
+   * - 404 → `ChatNotFoundError`, DISTINCT from the team direction's 404: the
+   *   operator's remedy differs (see the error's doc). Graph does not
+   *   separate "no such chat" from "no such catalog app" on this verb, but
+   *   the app id comes from our own upload step, so the chat is the honest
+   *   thing to name.
+   * - 403 → `ConsentMissingError([CHAT_INSTALL_SCOPE], 'graph')` from the
+   *   http layer — the same typed family as every other step, so callers keep
+   *   ONE fallback branch.
+   * - 429 → retried by the http layer honouring `Retry-After`; exhausted
+   *   budget → `ProvisioningThrottledError`.
+   */
+  async installToChat(
+    input: InstallToChatInput,
+  ): Promise<Idempotent<ChatAppInstallation>> {
+    const chatId = this.requireChatId(input.chatId, 'chats.installedApps.add');
+    const teamsAppId = requireNonEmpty(input.teamsAppId, 'teamsAppId');
+
     const response = await this.http.request({
       resource: 'graph',
-      method: 'GET',
-      url: `${GRAPH_BASE}/teams/${encodeURIComponent(teamId)}/installedApps?$expand=teamsApp&$filter=${encodeURIComponent(filter)}`,
-      step: 'teams.installedApps.lookup',
-      missingScopesOn403: [TEAM_INSTALL_SCOPE],
-      // A team that no longer exists has no installation either — the same
-      // "nothing to remove" outcome, not an error.
+      method: 'POST',
+      url: `${GRAPH_BASE}/chats/${encodeURIComponent(chatId)}/installedApps`,
+      step: 'chats.installedApps.add',
+      jsonBody: {
+        'teamsApp@odata.bind': `${GRAPH_BASE}/appCatalogs/teamsApps/${encodeURIComponent(teamsAppId)}`,
+      },
+      missingScopesOn403: [CHAT_INSTALL_SCOPE],
+      conflictOn: CHAT_ALREADY_INSTALLED_RULES,
+      // Taken off the generic error path so it can be re-thrown as the typed,
+      // chat-specific not-found below.
       extraOkStatuses: [404],
     });
 
-    if (response.kind !== 'ok') {
-      throw new Error(
-        `graph teams.installedApps.lookup unexpectedly answered ${String(response.status)} for team=${teamId}`,
+    if (response.kind === 'conflict') {
+      this.log(
+        `provisioner chats.installedApps.add: app ${teamsAppId} already installed in chat ${chatId} (${String(response.status)} → already-existed)`,
+      );
+      return {
+        outcome: 'already-existed',
+        value: chatInstallation(chatId, teamsAppId, response.json),
+      };
+    }
+
+    if (response.status === 404) {
+      throw new ChatNotFoundError(chatId, 'chats.installedApps.add');
+    }
+
+    return {
+      outcome: 'created',
+      value: chatInstallation(chatId, teamsAppId, response.json),
+    };
+  }
+
+  /**
+   * Remove a catalog app from ONE chat — the reverse of
+   * {@link installToChat}, and the chat-scope mirror of
+   * {@link TeamInstallClient.uninstallFromTeam}.
+   *
+   * Same two-step for the same reason: Graph deletes an installation by its
+   * INSTALLATION id, which the caller generally does not hold.
+   *
+   *   1. `GET /chats/{chatId}/installedApps?$expand=teamsApp&$filter=teamsApp/id eq '…'`
+   *      — no hit → `'already-absent'`, and NO delete is attempted.
+   *   2. `DELETE /chats/{chatId}/installedApps/{installationId}` — 2xx →
+   *      `'uninstalled'`; 404 → `'already-absent'`, so a removal race never
+   *      turns into an exception.
+   *
+   * A CHAT THAT IS GONE IS `'already-absent'` HERE, not `ChatNotFoundError`.
+   * The install direction has to be loud about a bad chat id because it failed
+   * to do what was asked; the uninstall direction was asked to make sure an
+   * app is not in a chat, and a chat that does not exist satisfies that. Same
+   * reasoning the team direction already applies to its 404 lookup.
+   */
+  async uninstallFromChat(
+    input: UninstallFromChatInput,
+  ): Promise<UninstallFromChatResult> {
+    const chatId = this.requireChatId(
+      input.chatId,
+      'chats.installedApps.remove',
+    );
+    const teamsAppId = requireNonEmpty(input.teamsAppId, 'teamsAppId');
+
+    const installationId = await findInstallationId(this.http, {
+      collectionUrl: `${GRAPH_BASE}/chats/${encodeURIComponent(chatId)}/installedApps`,
+      teamsAppId,
+      step: 'chats.installedApps.lookup',
+      scope: CHAT_INSTALL_SCOPE,
+      subject: `chat=${chatId}`,
+    });
+
+    if (installationId === undefined) {
+      this.log(
+        `provisioner chats.installedApps.remove: app ${teamsAppId} not installed in chat ${chatId} (lookup miss → already-absent)`,
+      );
+      return { outcome: 'already-absent', value: { chatId, teamsAppId } };
+    }
+
+    const response = await this.http.request({
+      resource: 'graph',
+      method: 'DELETE',
+      url: `${GRAPH_BASE}/chats/${encodeURIComponent(chatId)}/installedApps/${encodeURIComponent(installationId)}`,
+      step: 'chats.installedApps.remove',
+      missingScopesOn403: [CHAT_INSTALL_SCOPE],
+      // Already gone = already removed.
+      extraOkStatuses: [404],
+    });
+
+    const gone = response.kind === 'ok' && response.status === 404;
+    if (gone) {
+      this.log(
+        `provisioner chats.installedApps.remove: installation ${installationId} in chat ${chatId} already gone (404 → already-absent)`,
       );
     }
-    if (response.status === 404) return undefined;
 
-    for (const entry of listEntries(response.json)) {
-      const id = matchingInstallationId(entry, teamsAppId);
-      if (id !== undefined) return id;
-    }
-    return undefined;
+    return {
+      outcome: gone ? 'already-absent' : 'uninstalled',
+      value: { chatId, teamsAppId, installationId },
+    };
   }
+
+  /**
+   * Non-empty AND shaped like a chat. Everything the classifier does not call
+   * a chat is refused here, with the classification's own remedy text: a
+   * channel id points at the team, a bare 32-hex says which full form to
+   * re-enter, a team GUID says which method to call instead.
+   */
+  private requireChatId(value: string, step: string): string {
+    const chatId = requireNonEmpty(value, 'chatId');
+    const target = classifyInstallTarget(chatId);
+    if (isChatTarget(target)) return target.chatId;
+    throw new InstallTargetMismatchError(
+      step,
+      chatId,
+      target.kind,
+      targetHint(target),
+    );
+  }
+}
+
+/**
+ * `GET {collection}?$expand=teamsApp&$filter=teamsApp/id eq '…'` — the
+ * installation id for a catalog app in one team or chat, or `undefined` when
+ * the app is not installed there.
+ *
+ * OData string-literal escaping (quote doubling) + `encodeURIComponent` keep
+ * the `$filter` injection-safe for arbitrary ids, exactly as the catalog
+ * `externalId` lookup does. The returned entries are re-checked against
+ * `teamsApp.id` client-side, so a tenant that ignores the `$filter` cannot
+ * make us delete the wrong installation.
+ *
+ * A 404 on the collection (the team/chat is gone) answers `undefined` — the
+ * same "nothing to remove" outcome, not an error.
+ */
+async function findInstallationId(
+  http: Pick<ProvisioningHttp, 'request'>,
+  opts: {
+    /** Absolute `…/installedApps` URL of the team or chat. */
+    readonly collectionUrl: string;
+    readonly teamsAppId: string;
+    readonly step: string;
+    /** App role reported on 403. */
+    readonly scope: string;
+    /** Label for the unexpected-status message, e.g. `chat=19:…`. */
+    readonly subject: string;
+  },
+): Promise<string | undefined> {
+  const filter = `teamsApp/id eq '${escapeODataString(opts.teamsAppId)}'`;
+  const response = await http.request({
+    resource: 'graph',
+    method: 'GET',
+    url: `${opts.collectionUrl}?$expand=teamsApp&$filter=${encodeURIComponent(filter)}`,
+    step: opts.step,
+    missingScopesOn403: [opts.scope],
+    extraOkStatuses: [404],
+  });
+
+  if (response.kind !== 'ok') {
+    throw new Error(
+      `graph ${opts.step} unexpectedly answered ${String(response.status)} for ${opts.subject}`,
+    );
+  }
+  if (response.status === 404) return undefined;
+
+  for (const entry of listEntries(response.json)) {
+    const id = matchingInstallationId(entry, opts.teamsAppId);
+    if (id !== undefined) return id;
+  }
+  return undefined;
+}
+
+/**
+ * Operator-facing remedy for a target that is not a chat. Most kinds carry
+ * their own `hint`; a team GUID is well-formed and correct — just for the
+ * other method — so it gets the one sentence the classifier has no business
+ * knowing (it does not know which step asked).
+ */
+function targetHint(
+  target: TeamTarget | ChannelTarget | AmbiguousTarget | UnknownTarget,
+): string {
+  if (target.kind === 'team') {
+    return (
+      'this is a TEAM id (dashed GUID / group id), not a chat thread id. ' +
+      'Install it with installToTeam instead.'
+    );
+  }
+  return target.hint;
 }
 
 /** OData string literal escaping: single quotes double up. */
@@ -340,6 +680,20 @@ function installation(
   const id = installationId(json);
   return {
     teamId,
+    teamsAppId,
+    ...(id !== undefined ? { installationId: id } : {}),
+  };
+}
+
+/** Chat twin of {@link installation}. */
+function chatInstallation(
+  chatId: string,
+  teamsAppId: string,
+  json: unknown,
+): ChatAppInstallation {
+  const id = installationId(json);
+  return {
+    chatId,
     teamsAppId,
     ...(id !== undefined ? { installationId: id } : {}),
   };

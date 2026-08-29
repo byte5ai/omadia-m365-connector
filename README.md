@@ -62,6 +62,13 @@ Graph client via the service registry.
      into the target team (`POST /teams/{id}/installedApps`) and, since
      0.4.0, remove it again (`GET /teams/{id}/installedApps` +
      `DELETE /teams/{id}/installedApps/{installationId}`)
+   - `TeamsAppInstallation.ReadWriteForChat.All` — since 0.7.0, install the
+     catalog app into a group or 1:1 **chat**
+     (`POST /chats/{id}/installedApps`) and remove it again. Unlike the
+     catalog upload this verb DOES support application permissions — no
+     device-code sign-in, and it is not a Teams protected API. Not the
+     `…SelfForChat.All` variant, which only lets an app install *itself*.
+     Needed only for chat installs; team-only deployments can skip it.
    - `Team.ReadBasic.All` — since 0.5.0, resolve a team id to its display name
      (`GET /teams/{id}?$select=id,displayName`) so consumers can show operators
      a team NAME instead of a GUID. Read-only, and the narrowest scope that

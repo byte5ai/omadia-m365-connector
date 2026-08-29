@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.6.0"
+  version: "0.7.0"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -77,6 +77,11 @@ setup:
       add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
       `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
 
+      To install an agent into a **group chat** (since 0.7.0) also add
+      `TeamsAppInstallation.ReadWriteForChat.All`. Not the `…SelfForChat.All`
+      variant — that one only lets an app install *itself*, while the
+      provisioner installs the per-agent app it generated.
+
       ### 4. One-time admin sign-in for catalog publishing
 
       Publishing a Teams app package (`POST /appCatalogs/teamsApps`) is the one
@@ -133,6 +138,11 @@ setup:
       Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
       `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
       `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
+
+      Für die Installation eines Agenten in einen **Gruppenchat** (ab 0.7.0)
+      zusätzlich `TeamsAppInstallation.ReadWriteForChat.All`. Nicht die
+      `…SelfForChat.All`-Variante — die erlaubt einer App nur, *sich selbst* zu
+      installieren; der Provisioner installiert die generierte Agent-App.
 
       ### 4. Einmalige Admin-Anmeldung für den Katalog-Upload
 
