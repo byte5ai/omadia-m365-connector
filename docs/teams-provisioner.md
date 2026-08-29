@@ -119,6 +119,93 @@ backoff → `ProvisioningThrottledError`.
 > connector `< 0.4.0` must keep its not-supported branch
 > (`typeof provisioner.uninstallFromTeam === 'function'`) instead of crashing.
 
+### Chat install — `installToChat` / `uninstallFromChat` (since 0.7.0)
+
+A team was never the only place an agent belongs. The common case is a **group
+chat**, which had no path through this capability at all.
+
+```ts
+installToChat(input: { chatId: string; teamsAppId: string })
+  → Idempotent<ChatAppInstallation>
+uninstallFromChat(input: { chatId: string; teamsAppId: string })
+  → { outcome: 'uninstalled' | 'already-absent', value: ChatAppInstallation }
+```
+
+`POST /chats/{chatId}/installedApps` with the same `teamsApp@odata.bind` body
+as the team direction, plus the lookup-then-DELETE pair on
+`/chats/{chatId}/installedApps` for the reverse. Both run on **application**
+permissions — `TeamsAppInstallation.ReadWriteForChat.All`
+(`9e19bae1-2623-4c4f-ab6e-2664615ff9a0`). No delegated sign-in, and this is not
+one of the [Teams protected APIs](https://learn.microsoft.com/en-us/graph/teams-protected-apis)
+(those cover message *reading*), so no request form to Microsoft. Deliberately
+**not** the `…SelfForChat.All` variant: that only lets an app install *itself*,
+and the provisioner installs the per-agent app it generated.
+
+No `consentedPermissionSet` parameter here, unlike `installToTeam`: Graph
+documents that this app role "cannot be used to install apps that require
+consent to resource-specific permissions", and the endpoint enforces it with
+**400 `ResourceSpecificPermissionsMismatch`**. RSC in chats would need
+`…ReadWriteAndConsentForChat.All`.
+
+**How "already installed" arrives — and what is actually known.** Graph's
+reference documents *no* failure response for this verb, only `201 Created`.
+The duplicate signal of the sibling scopes is **409 `Conflict`** with the body
+`AppEntitlement id: '<app>' already exists in <scope>`, where the scope tail
+varies per endpoint (`TeamId: '19:…'` for teams, `thread` for the per-user
+endpoint). No published report covers the CHAT variant specifically, so 409 is
+an inference from neighbours rather than an observed fact. The step therefore
+treats **both** 409 and a Bad-Request-shaped duplicate (400 carrying the
+`Conflict` code, or an `already exists` / `already installed` message) as
+`'already-existed'` — Entra set the 400-shaped-duplicate precedent on
+`POST /applications` (byte5ai/omadia#916). An ordinary 400 still fails.
+
+**Two things behave differently from the team direction, on purpose:**
+
+- **A missing chat is its own error.** A 404 on the install throws
+  `ChatNotFoundError` (carrying `chatId` and `step`), not a generic
+  `ProvisioningRequestError`. A team 404 means a wrong group id; a chat 404
+  overwhelmingly means an id copied from the wrong place. Both are terminal —
+  `isTransientProvisioningFailure` returns `false`.
+- **A wrong-KIND id fails before the network.** `installToChat` classifies the
+  id by shape first and throws `InstallTargetMismatchError` — carrying a `hint`
+  in operator language — for a channel id, a team GUID, or an unrecognised
+  string. The uninstall direction is gentler about a chat that is *gone*
+  (`'already-absent'`, since "make sure it is not installed" is already
+  satisfied) but applies the same shape check.
+
+#### Routing an operator-supplied id — `classifyInstallTarget`
+
+Pure, network-free, exported. It says what an id *looks like*, never whether it
+exists:
+
+| Input | `kind` |
+|---|---|
+| dashed GUID (8-4-4-4-12) | `team` |
+| `19:…@thread.v2` | `group-chat` |
+| `19:…@unq.gbl.spaces` | `one-on-one-chat` |
+| `19:…@thread.tacv2` | `channel` — **not** an install target |
+| bare 32 hex, no dashes/prefix/suffix | `ambiguous` |
+| anything else | `unknown` |
+
+Two entries earn their place. A **channel** id is well-formed and still wrong:
+an app is installed into the channel's TEAM, so the result carries a `hint`
+saying exactly that instead of letting Graph answer a bare 404. And a bare
+32-hex string such as `abc8af8ec7fc471785d3b83c4d84b667` (a real field-test
+paste) is a dash-stripped team GUID **and** the body of a
+`19:<32 hex>@thread.v2` chat id — nothing in the string separates them, so it
+gets its own `ambiguous` outcome carrying both `candidates` rather than a
+coin-flip. The caller decides with context the string does not have.
+
+`19:…@thread.skype` classifies as `unknown`; its hint names the legacy
+Skype-interop thread explicitly, because the `/chats` resource answers 400 for
+those rather than resolving them.
+
+> **Consumers must feature-detect** `installToChat` / `uninstallFromChat`
+> (`typeof provisioner.installToChat === 'function'`) — same reason as
+> `uninstallFromTeam`: the middleware mirrors this contract structurally
+> rather than importing it, so a middleware talking to a connector `< 0.7.0`
+> must keep its team-only branch.
+
 ### Idempotency — "already exists" is not an error
 
 Steps that can hit "already exists" on re-runs (catalog upload via

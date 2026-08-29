@@ -76,6 +76,12 @@ export {
   ArmNotConfiguredError,
   CapabilityUnavailableError,
   AppPackageError,
+  // Chat install (0.7.0) — an agent belongs in a group chat as often as in a
+  // team. Application-permission only, no delegated sign-in needed.
+  ChatNotFoundError,
+  InstallTargetMismatchError,
+  classifyInstallTarget,
+  isChatTarget,
   // Delegated catalog publishing (byte5ai/omadia#924) — POST
   // /appCatalogs/teamsApps is delegated-only, so exactly one chain step runs
   // on a user token acquired once per tenant via the device-code flow.
@@ -124,9 +130,11 @@ export type {
   BotProvisionedOutcome,
   BotProvisioningOutcome,
   CatalogTeamsApp,
+  ChatAppInstallation,
   CreateBotInput,
   Idempotent,
   IdempotentOutcome,
+  InstallToChatInput,
   InstallToTeamInput,
   RegisterApplicationInput,
   RegistrationOnlyOutcome,
@@ -169,6 +177,17 @@ export type {
   UninstallFromTeamInput,
   UninstallFromTeamOutcome,
   UninstallFromTeamResult,
+  UninstallFromChatInput,
+  UninstallFromChatOutcome,
+  UninstallFromChatResult,
+  // Install-target classification (0.7.0).
+  AmbiguousTarget,
+  ChannelTarget,
+  ChatTarget,
+  InstallTarget,
+  InstallTargetKind,
+  TeamTarget,
+  UnknownTarget,
   TeamsBotPasswordSecretRef,
   // Delegated catalog publishing.
   DelegatedAccount,

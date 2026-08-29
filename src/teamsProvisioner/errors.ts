@@ -276,6 +276,89 @@ export class BotHandleUnavailableError extends TeamsProvisionerError {
   }
 }
 
+/**
+ * A chat install/uninstall named a chat Graph will not resolve: it does not
+ * exist, or it is invisible to this tenant app.
+ *
+ * A SEPARATE CLASS FROM THE TEAM DIRECTION ON PURPOSE. Both are "404 on the
+ * install target", and that is where the similarity ends — the operator's next
+ * move is different enough that collapsing them costs a support round trip:
+ *
+ * - a team 404 means a group id that is wrong or a team that was deleted;
+ * - a chat 404 means a thread id that was copied from the wrong place —
+ *   overwhelmingly a CHANNEL id (`@thread.tacv2`), which is a well-formed
+ *   Teams id for something an app is never installed into (see
+ *   {@link InstallTargetMismatchError}, which catches that shape before the
+ *   network) — or a chat the app-only identity genuinely cannot see.
+ *
+ * Deterministic, never transient: the identical call answers identically until
+ * somebody changes the id or the chat. It is therefore excluded from
+ * {@link isTransientProvisioningFailure} explicitly rather than by falling
+ * through to the message-pattern default.
+ */
+export class ChatNotFoundError extends TeamsProvisionerError {
+  /** The chat thread id Graph did not resolve. */
+  public readonly chatId: string;
+  /** Which step asked, e.g. `chats.installedApps.add`. */
+  public readonly step: string;
+
+  constructor(chatId: string, step: string, cause?: unknown) {
+    super(
+      `chat_not_found: '${step}' found no chat '${chatId}' — it does not ` +
+        'exist, or it is not visible to this tenant app. Check that the id is ' +
+        'a CHAT thread id (`19:…@thread.v2` for a group chat, ' +
+        '`19:…@unq.gbl.spaces` for a 1:1 chat) and not a channel id ' +
+        '(`19:…@thread.tacv2`), and that the app role ' +
+        'TeamsAppInstallation.ReadWriteForChat.All is consented for the tenant',
+      cause,
+    );
+    this.name = 'ChatNotFoundError';
+    this.chatId = chatId;
+    this.step = step;
+  }
+}
+
+/**
+ * The identifier handed to an install step names a Teams scope the step cannot
+ * act on — a channel id passed to the chat install, a team GUID passed to the
+ * chat install, or a shape that is no Teams identifier at all.
+ *
+ * PRE-FLIGHT, BY DESIGN. This is thrown from the SHAPE of the id
+ * (`classifyInstallTarget`), before a token is fetched or a request is sent,
+ * because the alternative is a Graph 404 whose message names none of the
+ * actual problem. {@link hint} carries the remedy in operator language — for
+ * the channel case, that an app is installed into the channel's TEAM.
+ *
+ * Deterministic: retrying the identical id cannot help, so it is excluded from
+ * {@link isTransientProvisioningFailure}.
+ */
+export class InstallTargetMismatchError extends TeamsProvisionerError {
+  /** The identifier as classified (trimmed). */
+  public readonly value: string;
+  /** What the identifier turned out to be — `InstallTargetKind`. */
+  public readonly targetKind: string;
+  /** Which step refused it, e.g. `chats.installedApps.add`. */
+  public readonly step: string;
+  /** Operator-facing remedy, from the classification. */
+  public readonly hint: string;
+
+  constructor(
+    step: string,
+    value: string,
+    targetKind: string,
+    hint: string,
+  ) {
+    super(
+      `install_target_mismatch: '${step}' cannot use '${value}' — ${hint}`,
+    );
+    this.name = 'InstallTargetMismatchError';
+    this.step = step;
+    this.value = value;
+    this.targetKind = targetKind;
+    this.hint = hint;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Delegated catalog-publish taxonomy (byte5ai/omadia#924).
 //
@@ -458,6 +541,11 @@ export function isTransientProvisioningFailure(err: unknown): boolean {
   if (err instanceof DirectoryReplicationError) return true;
   // A taken global bot handle is a verdict, not a hiccup — never retry it.
   if (err instanceof BotHandleUnavailableError) return false;
+  // Same shape of verdict for the chat direction: a missing/invisible chat and
+  // a wrong-kind target id both answer identically until a human changes the
+  // id. Listed explicitly so neither leans on the message-pattern fallback.
+  if (err instanceof ChatNotFoundError) return false;
+  if (err instanceof InstallTargetMismatchError) return false;
   // Every delegated-auth failure needs a DIFFERENT action (sign in, consent,
   // refresh) — none of them is fixed by replaying the identical call, so they
   // are listed explicitly rather than left to the message-pattern fallback

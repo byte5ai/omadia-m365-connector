@@ -175,6 +175,30 @@ extends it by exactly three scopes:
 | `AppCatalog.ReadWrite.All` | `getCatalogApp` and the idempotent 409 re-resolution — `GET /appCatalogs/teamsApps`. Since 0.6.0 it does **not** cover `uploadToCatalog`: Graph lists application permissions for `POST /appCatalogs/teamsApps` as "Not supported.", so that one step needs a DELEGATED token (below) |
 | `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps`; since 0.4.0 also `uninstallFromTeam` — `GET /teams/{id}/installedApps` + `DELETE /teams/{id}/installedApps/{installationId}` |
 | `Team.ReadBasic.All` | `getTeam` (since 0.5.0) — `GET /teams/{id}?$select=id,displayName`; resolves a team id to a NAME so consumers can label a team instead of printing its GUID. Optional in practice: without consent the lookup 403s and the consumer keeps showing the id |
+| `TeamsAppInstallation.ReadWriteForChat.All` | `installToChat` (since 0.7.0) — `POST /chats/{id}/installedApps`, plus `uninstallFromChat` — `GET /chats/{id}/installedApps` + `DELETE /chats/{id}/installedApps/{installationId}`. Needed only to install an agent into a group or 1:1 CHAT; team-only deployments can leave it out |
+
+### Chats work on APPLICATION permissions (since 0.7.0)
+
+Worth stating plainly, because the catalog-upload experience below suggests
+otherwise: `POST /chats/{id}/installedApps` **does** support app-only tokens.
+`TeamsAppInstallation.ReadWriteForChat.All`
+(`9e19bae1-2623-4c4f-ab6e-2664615ff9a0`) is an application app role, it is not
+one of the [Teams protected APIs](https://learn.microsoft.com/en-us/graph/teams-protected-apis)
+(those cover message *reading* — `/teams/{id}/channels/{id}/messages`,
+`/chats/{id}/messages` and the change-notification subscriptions on them), and
+no request form has to be submitted to Microsoft. The chat direction therefore
+needs no device-code sign-in; only the catalog upload does.
+
+Use `…ReadWriteForChat.All`, **not** `…ReadWriteSelfForChat.All`. The "Self"
+variants only let an app install *itself* into a chat; the provisioner installs
+the per-agent app it generated, which is a different app from the connector's
+own identity.
+
+One limit that comes with this role: Graph documents that it "cannot be used to
+install apps that require consent to resource-specific permissions", and the
+endpoint enforces it with **400 `ResourceSpecificPermissionsMismatch`**.
+`installToChat` therefore takes no `consentedPermissionSet` (unlike
+`installToTeam`) — RSC in chats would need `…ReadWriteAndConsentForChat.All`.
 
 ### The one delegated step: catalog upload (since 0.6.0)
 
@@ -243,7 +267,8 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 
 > For the Teams provisioning capability (`teamsProvisioner@1`) additionally
 > add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-> `TeamsAppInstallation.ReadWriteForTeam.All`.
+> `TeamsAppInstallation.ReadWriteForTeam.All`, and — for chat installs, since
+> 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All`.
 >
 > Extending an existing app registration requires **renewed admin consent**:
 > click **Grant admin consent for &lt;Tenant&gt;** again. If Graph still
@@ -255,7 +280,8 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 
 > Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
 > `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-> `TeamsAppInstallation.ReadWriteForTeam.All`.
+> `TeamsAppInstallation.ReadWriteForTeam.All` und — für Chat-Installationen,
+> ab 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All`.
 >
 > Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
 > **erneuten Admin-Consent**: **Grant admin consent for &lt;Tenant&gt;**

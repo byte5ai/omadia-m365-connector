@@ -147,6 +147,22 @@ export interface TeamAppInstallation {
 }
 
 /**
+ * An app installation into one CHAT (`POST /chats/{id}/installedApps`) —
+ * the chat-scope twin of {@link TeamAppInstallation}, since 0.7.0.
+ *
+ * Kept as its OWN type rather than widening `TeamAppInstallation` with an
+ * optional `chatId`: a target is a team or a chat, never both, and a shape
+ * where either id may be missing pushes that check into every consumer.
+ */
+export interface ChatAppInstallation {
+  /** Chat thread id (`19:…@thread.v2` group, `19:…@unq.gbl.spaces` 1:1). */
+  readonly chatId: string;
+  readonly teamsAppId: string;
+  /** Graph installation id when the API returned/located one. */
+  readonly installationId?: string;
+}
+
+/**
  * Input for the Entra app-registration step.
  *
  * @deprecated Part of the pre-implementation {@link TeamsProvisioner} sketch.
@@ -215,6 +231,14 @@ export interface UploadToCatalogInput {
 /** Input for the team-install step. */
 export interface InstallToTeamInput {
   readonly teamId: string;
+  /** Catalog id (`CatalogTeamsApp.teamsAppId`). */
+  readonly teamsAppId: string;
+}
+
+/** Input for the chat-install step (since 0.7.0). */
+export interface InstallToChatInput {
+  /** Chat thread id (`19:…@thread.v2` group, `19:…@unq.gbl.spaces` 1:1). */
+  readonly chatId: string;
   /** Catalog id (`CatalogTeamsApp.teamsAppId`). */
   readonly teamsAppId: string;
 }
