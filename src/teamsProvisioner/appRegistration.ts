@@ -68,7 +68,9 @@ import {
 import {
   GRAPH_BASE,
   UNIQUE_NAME_CONFLICT_RULES,
+  findDeletedApplicationByAppId,
   findDeletedApplicationByUniqueName,
+  purgeDeletedApplication,
   restoreDeletedApplication,
   retryWhileReplicating,
   waitForApplicationAddressable,
@@ -76,6 +78,7 @@ import {
 } from './directory.js';
 import {
   DELETED_ITEM_RETENTION_DAYS,
+  DeletedObjectIdMismatchError,
   UniqueNameReservedError,
   isTransientProvisioningFailure,
 } from './errors.js';
@@ -189,6 +192,27 @@ export interface DeleteAppRegistrationInput {
 
 export interface DeleteAppRegistrationResult {
   readonly outcome: DeleteAppRegistrationOutcome;
+}
+
+/** Idempotent purge signal — an entry already gone is a purge already done. */
+export type PurgeDeletedAppRegistrationOutcome = 'purged' | 'already-absent';
+
+export interface PurgeDeletedAppRegistrationInput {
+  /**
+   * DIRECTORY OBJECT id of the soft-deleted application — `application.id`,
+   * NOT the `appId` that {@link DeleteAppRegistrationInput} takes.
+   *
+   * The two are both GUIDs and cannot be told apart by shape, which is why
+   * this field is named for the one that works and why the implementation
+   * re-probes the recycle bin before it reports `'already-absent'`.
+   * `ProvisionedAppRegistration.registration.objectId` is where a caller
+   * normally has it from.
+   */
+  readonly objectId: string;
+}
+
+export interface PurgeDeletedAppRegistrationResult {
+  readonly outcome: PurgeDeletedAppRegistrationOutcome;
 }
 
 /**
@@ -361,6 +385,52 @@ export class AppRegistrationClient {
     return {
       outcome: response.status === 404 ? 'already-deleted' : 'deleted',
     };
+  }
+
+  /**
+   * The other half of a real reset: PERMANENTLY delete the soft-deleted app
+   * so its `uniqueName` stops being reserved.
+   *
+   * {@link deleteAppRegistration} only soft-deletes — Entra parks the object
+   * in the recycle bin and holds its name for
+   * {@link DELETED_ITEM_RETENTION_DAYS} days. That is why a "clean up and
+   * retry" that stops at the delete makes the next attempt WORSE: it collides
+   * with an object nobody can see (byte5ai/omadia#916). Call this when the
+   * intent is to free the slug, not to keep the app recoverable — a purge is
+   * irreversible, and the appId dies with the object.
+   *
+   * Idempotent: an entry that is not in the bin answers `'already-absent'`.
+   *
+   * WITH ONE GUARD. Passing an `appId` here would 404 exactly like an entry
+   * that was genuinely purged, so a bare 404 is not evidence of anything. This
+   * re-scans the bin for that id and throws {@link DeletedObjectIdMismatchError}
+   * — carrying the object id that WOULD have worked — rather than reporting a
+   * freed name that is still reserved. The extra Graph call is spent only on
+   * the 404 path, and only to avoid lying.
+   */
+  async purgeDeletedAppRegistration(
+    input: PurgeDeletedAppRegistrationInput,
+  ): Promise<PurgeDeletedAppRegistrationResult> {
+    const objectId = requireNonEmpty(input.objectId, 'objectId');
+    const outcome = await purgeDeletedApplication(this.http, objectId, [
+      APP_REGISTRATION_SCOPE,
+    ]);
+    if (outcome === 'purged') return { outcome };
+
+    // 404. Either it was already purged, or we were handed the wrong GUID.
+    const misaddressed = await findDeletedApplicationByAppId(
+      this.http,
+      objectId,
+      [APP_REGISTRATION_SCOPE],
+      this.log,
+    );
+    if (misaddressed !== undefined) {
+      throw new DeletedObjectIdMismatchError(objectId, misaddressed.objectId);
+    }
+    // The probe is best-effort (it needs a scope the provisioner may not
+    // have); a miss means we have no evidence AGAINST 'already-absent', which
+    // is the honest answer for an idempotent delete.
+    return { outcome: 'already-absent' };
   }
 
   /**

@@ -185,12 +185,12 @@ export interface DeletedApplication {
 const MAX_DELETED_ITEM_PAGES = 5;
 
 /**
- * Find a soft-deleted application by its `uniqueName`.
+ * Scan the application recycle bin for the first entry matching `predicate`.
  *
  * Deliberately a client-side scan of `GET
  * /directory/deletedItems/microsoft.graph.application` rather than an
- * `$filter`: `uniqueName` is not reliably filterable there, and a rejected
- * filter would turn a diagnostic into a second failure.
+ * `$filter`: neither `uniqueName` nor `appId` is reliably filterable there,
+ * and a rejected filter would turn a diagnostic into a second failure.
  *
  * BEST EFFORT — this endpoint is not covered by
  * `Application.ReadWrite.OwnedBy`, so a tenant that granted only the
@@ -198,9 +198,10 @@ const MAX_DELETED_ITEM_PAGES = 5;
  * failure answers `undefined`, and the caller degrades to an explanatory
  * error instead of a consent error.
  */
-export async function findDeletedApplicationByUniqueName(
+async function scanDeletedApplications(
   http: Pick<ProvisioningHttp, 'request'>,
-  uniqueName: string,
+  predicate: (candidate: DeletedApplication) => boolean,
+  label: string,
   scopes: readonly string[],
   log: (msg: string) => void,
 ): Promise<DeletedApplication | undefined> {
@@ -225,7 +226,7 @@ export async function findDeletedApplicationByUniqueName(
       const items = Array.isArray(record['value']) ? record['value'] : [];
       for (const item of items) {
         const parsed = parseDeletedApplication(item);
-        if (parsed?.uniqueName === uniqueName) return parsed;
+        if (parsed !== undefined && predicate(parsed)) return parsed;
       }
 
       const nextLink = record['@odata.nextLink'];
@@ -237,10 +238,103 @@ export async function findDeletedApplicationByUniqueName(
     // A probe is a diagnostic, never a failure mode of its own.
     log(
       `provisioner directory.deletedItems.list: recycle-bin probe for ` +
-        `'${uniqueName}' unavailable (${String(err)})`,
+        `'${label}' unavailable (${String(err)})`,
     );
     return undefined;
   }
+}
+
+/**
+ * Find a soft-deleted application by its `uniqueName` — the lookup the
+ * app-registration step makes when Entra reports a name it cannot see.
+ */
+export async function findDeletedApplicationByUniqueName(
+  http: Pick<ProvisioningHttp, 'request'>,
+  uniqueName: string,
+  scopes: readonly string[],
+  log: (msg: string) => void,
+): Promise<DeletedApplication | undefined> {
+  return scanDeletedApplications(
+    http,
+    (candidate) => candidate.uniqueName === uniqueName,
+    uniqueName,
+    scopes,
+    log,
+  );
+}
+
+/**
+ * Find a soft-deleted application by its APPLICATION (client) id.
+ *
+ * The mirror of {@link findDeletedApplicationByUniqueName}, and it exists for
+ * exactly one reason: {@link purgeDeletedApplication} addresses the OBJECT id,
+ * and passing an `appId` there answers a perfectly ordinary 404. Without this
+ * probe the purge would report the name as freed while the recycle-bin entry —
+ * and the `uniqueName` reservation with it — is still sitting there. See the
+ * purge's doc for the whole trap.
+ */
+export async function findDeletedApplicationByAppId(
+  http: Pick<ProvisioningHttp, 'request'>,
+  appId: string,
+  scopes: readonly string[],
+  log: (msg: string) => void,
+): Promise<DeletedApplication | undefined> {
+  const wanted = appId.toLowerCase();
+  return scanDeletedApplications(
+    http,
+    (candidate) => candidate.appId?.toLowerCase() === wanted,
+    appId,
+    scopes,
+    log,
+  );
+}
+
+/** Idempotent purge signal — a bin entry that is gone is a purge already done. */
+export type PurgeDeletedApplicationOutcome = 'purged' | 'already-absent';
+
+/**
+ * PERMANENTLY delete a soft-deleted application — `DELETE
+ * /directory/deletedItems/{objectId}`.
+ *
+ * THE POINT OF THIS FUNCTION is the `uniqueName` reservation, not the storage.
+ * A deleted Entra app keeps its name reserved for
+ * {@link DELETED_ITEM_RETENTION_DAYS} days while sitting invisibly in the
+ * recycle bin, which is how one transient failure burned an agent slug for a
+ * month in byte5ai/omadia#916: the rollback deleted, the retry collided with
+ * its own corpse, and nothing in `GET /applications` explained why. A reset
+ * that deletes without purging therefore makes the situation WORSE than
+ * leaving the app alone. This is the call that frees the name.
+ *
+ * ADDRESSED BY OBJECT ID. `/directory/deletedItems/{id}` takes the directory
+ * `application.id` — NOT the `appId` that every other rollback step here is
+ * keyed by. There is no `deletedItems(appId='…')` form, and both ids are
+ * GUIDs, so the wrong one does not fail loudly: it 404s exactly like an entry
+ * that was already purged. The caller must not turn that into
+ * `'already-absent'` on its own — `AppRegistrationClient.purgeDeletedAppRegistration`
+ * re-probes the bin before it dares say the name is free.
+ *
+ * Idempotent: a 404 is the answer `'already-absent'`, never an error.
+ */
+export async function purgeDeletedApplication(
+  http: Pick<ProvisioningHttp, 'request'>,
+  objectId: string,
+  scopes: readonly string[],
+): Promise<PurgeDeletedApplicationOutcome> {
+  const response = await http.request({
+    resource: 'graph',
+    method: 'DELETE',
+    url: `${GRAPH_BASE}/directory/deletedItems/${encodeURIComponent(objectId)}`,
+    step: 'directory.deletedItems.delete',
+    missingScopesOn403: scopes,
+    // Already gone = the purge this call was asked for has happened.
+    extraOkStatuses: [404],
+  });
+  if (response.kind !== 'ok') {
+    throw new Error(
+      `graph directory.deletedItems.delete unexpected conflict for '${objectId}'`,
+    );
+  }
+  return response.status === 404 ? 'already-absent' : 'purged';
 }
 
 function parseDeletedApplication(item: unknown): DeletedApplication | undefined {

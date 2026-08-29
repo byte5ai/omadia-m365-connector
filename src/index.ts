@@ -102,6 +102,18 @@ export {
   PUBLISHER_APP_UNIQUE_NAME_PREFIX,
   publisherAppUniqueName,
   redactSecrets,
+  // Install-target enumeration + reset primitives (0.8.0). listTeams runs on
+  // the app role Team.ReadBasic.All the connector already has; listChats is
+  // DELEGATED because Graph offers no tenant-wide app-only route for chats,
+  // and its Chat.ReadBasic scope means one more admin sign-in.
+  TEAM_LIST_SCOPE,
+  CHAT_READ_DELEGATED_SCOPE,
+  CHAT_READ_DELEGATED_PERMISSION_ID,
+  DELEGATED_SIGN_IN_SCOPES,
+  PUBLISHER_APP_DELEGATED_PERMISSION_IDS,
+  coversChatList,
+  DelegatedScopeRequiredError,
+  DeletedObjectIdMismatchError,
   // ARM config / registration-only degradation (config unit).
   ARM_MANAGEMENT_HOST,
   ARM_TOKEN_SCOPE,
@@ -160,6 +172,17 @@ export type {
   DeleteAppRegistrationOutcome,
   DeleteAppRegistrationResult,
   ProvisionedAppRegistration,
+  PurgeDeletedAppRegistrationInput,
+  PurgeDeletedAppRegistrationOutcome,
+  PurgeDeletedAppRegistrationResult,
+  RemoveFromCatalogInput,
+  RemoveFromCatalogOutcome,
+  RemoveFromCatalogResult,
+  // Install-target enumeration (0.8.0).
+  ChatSummary,
+  ChatSummaryType,
+  ListChatsInput,
+  TeamSummary,
   AppPackageIcons,
   AppPackageParamValue,
   AppPackageParams,

@@ -42,6 +42,8 @@ import {
   type DeleteAppRegistrationInput,
   type DeleteAppRegistrationResult,
   type ProvisionedAppRegistration,
+  type PurgeDeletedAppRegistrationInput,
+  type PurgeDeletedAppRegistrationResult,
 } from './appRegistration.js';
 import {
   buildAppPackage,
@@ -57,6 +59,8 @@ import {
   type DelegatedCatalogUploadResult,
   type GetCatalogAppInput,
   type GetCatalogAppResult,
+  type RemoveFromCatalogInput,
+  type RemoveFromCatalogResult,
   type UploadToCatalogDelegatedInput,
 } from './catalog.js';
 import {
@@ -78,6 +82,12 @@ import {
   type GetTeamInput,
   type GetTeamResult,
 } from './teamLookup.js';
+import {
+  InstallTargetsClient,
+  type ChatSummary,
+  type ListChatsInput,
+  type TeamSummary,
+} from './targets.js';
 import { ProvisioningHttp } from './http.js';
 import {
   ChatInstallClient,
@@ -359,6 +369,92 @@ export interface TeamsProvisionerAccessor {
    * id-only branch.
    */
   getTeam(input: GetTeamInput): Promise<GetTeamResult>;
+
+  /**
+   * Every team in the organisation (since 0.8.0) — the list a target picker
+   * offers instead of asking an operator to type an id.
+   *
+   * The counterpart to {@link getTeam}: that one names an id you have, this
+   * one produces the ids that exist. Application permissions
+   * (`Team.ReadBasic.All`, already in the setup guide), all pages followed.
+   *
+   * FEATURE-DETECT it, as with every method here — the middleware mirrors this
+   * contract structurally rather than importing it.
+   */
+  listTeams(): Promise<readonly TeamSummary[]>;
+
+  /**
+   * The chats the signed-in administrator is in (since 0.8.0) — the chat half
+   * of the target picker.
+   *
+   * DELEGATED, and not by choice: Microsoft Graph has no tenant-wide
+   * application-permission route for listing chats at all. Bare `GET /chats`
+   * is delegated-only, and the application form is the per-user
+   * `GET /users/{id}/chats`, which would mean enumerating every user in the
+   * tenant to assemble a list of conversations the operator is mostly not in.
+   * See `targets.ts` for the full reasoning.
+   *
+   * WHAT THIS COSTS THE OPERATOR: the sign-in now asks for `Chat.ReadBasic` in
+   * addition to `AppCatalog.ReadWrite.All`, and a credential stored before
+   * 0.8.0 cannot grow that scope by refreshing — the administrator signs in
+   * once more. Publishing is untouched by this; only chat listing needs the
+   * wider grant, and it says so with a typed
+   * `DelegatedScopeRequiredError('scope-missing')` instead of a bare Graph 403.
+   *
+   * Does NOT refresh the passed credential: the result carries no token set
+   * back, so refreshing here would rotate the caller's refresh token and drop
+   * it. A stale token throws `DelegatedTokenExpiredError` — renew via
+   * {@link refreshDelegatedToken}, persist, retry.
+   *
+   * FEATURE-DETECT it, as above.
+   */
+  listChats(input?: ListChatsInput): Promise<readonly ChatSummary[]>;
+
+  /**
+   * Free a soft-deleted Entra app's `uniqueName` for good (since 0.8.0) —
+   * the second half of a reset that {@link deleteAppRegistration} cannot do.
+   *
+   * A deleted app is only SOFT-deleted: Entra parks it in the recycle bin and
+   * reserves its `uniqueName` for 30 days. A cleanup that stops at the delete
+   * therefore leaves the next provisioning run colliding with an object nobody
+   * can see — which is exactly how byte5ai/omadia#916 burned an agent slug for
+   * a month. This is the call that actually frees the name.
+   *
+   * TAKES THE DIRECTORY OBJECT ID, not the `appId` every other rollback step
+   * is keyed by. Both are GUIDs, so the wrong one 404s indistinguishably from
+   * an entry that was already purged; the implementation re-probes the recycle
+   * bin and throws `DeletedObjectIdMismatchError` (carrying the id that WOULD
+   * have worked) rather than reporting a name as freed while it is still
+   * reserved.
+   *
+   * Idempotent: an entry that is not in the bin answers `'already-absent'`.
+   * Irreversible: the appId dies with the object — use it when the intent is
+   * to reuse the slug, not to keep the app recoverable.
+   *
+   * FEATURE-DETECT it, as above.
+   */
+  purgeDeletedAppRegistration(
+    input: PurgeDeletedAppRegistrationInput,
+  ): Promise<PurgeDeletedAppRegistrationResult>;
+
+  /**
+   * Reverse of {@link uploadToCatalog} (since 0.8.0) — remove the published
+   * app from the tenant catalog.
+   *
+   * DELEGATED for the same reason the upload is: Graph documents application
+   * permissions for `DELETE /appCatalogs/teamsApps/{id}` as "Not supported."
+   * It needs no NEW scope though — the `AppCatalog.ReadWrite.All` the publish
+   * sign-in already acquired covers it, so a tenant that can publish can
+   * already remove.
+   *
+   * Idempotent: an app that is not in the catalog answers `'already-absent'`,
+   * which is the case a reset of a half-finished provisioning actually hits.
+   *
+   * FEATURE-DETECT it, as above.
+   */
+  removeFromCatalog(
+    input: RemoveFromCatalogInput,
+  ): Promise<RemoveFromCatalogResult>;
 }
 
 /** Everything {@link createTeamsProvisioner} needs — assembled by `activate()`. */
@@ -472,6 +568,14 @@ export function createTeamsProvisioner(
   const installs = new TeamInstallClient({ http, log: options.log });
   const chatInstalls = new ChatInstallClient({ http, log: options.log });
   const teamLookup = new TeamLookupClient({ http, log: options.log });
+  // The picker shares the catalog client's consent-URL resolver: a delegated
+  // 403 on either has the same remedy and must name the same publisher app.
+  const targets = new InstallTargetsClient({
+    http,
+    log: options.log,
+    adminConsentUrlFor: (tokens) =>
+      adminConsentUrl(tokens.tenantId, tokens.clientId),
+  });
 
   return {
     tenantMode,
@@ -515,6 +619,11 @@ export function createTeamsProvisioner(
     installToChat: (input) => chatInstalls.installToChat(input),
     uninstallFromChat: (input) => chatInstalls.uninstallFromChat(input),
     getTeam: (input) => teamLookup.getTeam(input),
+    listTeams: () => targets.listTeams(),
+    listChats: (input) => targets.listChats(input),
+    purgeDeletedAppRegistration: (input) =>
+      appRegistrations.purgeDeletedAppRegistration(input),
+    removeFromCatalog: (input) => catalog.removeFromCatalog(input),
   };
 }
 
@@ -570,6 +679,9 @@ export {
   DelegatedConsentRequiredError,
   DelegatedTokenExpiredError,
   DeviceCodeFlowError,
+  // Enumeration + reset taxonomy (0.8.0).
+  DelegatedScopeRequiredError,
+  DeletedObjectIdMismatchError,
   DELETED_ITEM_RETENTION_DAYS,
   isTransientProvisioningFailure,
 } from './errors.js';
@@ -580,9 +692,15 @@ export {
   APP_CATALOG_DELEGATED_SCOPE,
   APP_CATALOG_DELEGATED_PERMISSION_ID,
   DELEGATED_PUBLISH_SCOPES,
+  // 0.8.0 — the sign-in now also asks for Chat.ReadBasic so the target picker
+  // can list the administrator's chats. DELEGATED_PUBLISH_SCOPES is unchanged.
+  CHAT_READ_DELEGATED_SCOPE,
+  CHAT_READ_DELEGATED_PERMISSION_ID,
+  DELEGATED_SIGN_IN_SCOPES,
   GRAPH_RESOURCE_APP_ID,
   adminConsentUrl,
   coversCatalogPublish,
+  coversChatList,
   describeSignInStatus,
   isAccessTokenStale,
   revokeInstructions,
@@ -606,6 +724,7 @@ export type {
 export {
   PUBLISHER_APP_DISPLAY_NAME,
   PUBLISHER_APP_UNIQUE_NAME_PREFIX,
+  PUBLISHER_APP_DELEGATED_PERMISSION_IDS,
   publisherAppUniqueName,
 } from './publisherApp.js';
 export type { PublisherApp } from './publisherApp.js';
@@ -648,7 +767,20 @@ export type {
   DeleteAppRegistrationOutcome,
   DeleteAppRegistrationResult,
   ProvisionedAppRegistration,
+  PurgeDeletedAppRegistrationInput,
+  PurgeDeletedAppRegistrationOutcome,
+  PurgeDeletedAppRegistrationResult,
 } from './appRegistration.js';
+
+// Install-target enumeration (0.8.0) — the lists a picker offers so an
+// operator never types a team or chat id by hand again.
+export { TEAM_LIST_SCOPE } from './targets.js';
+export type {
+  ChatSummary,
+  ChatSummaryType,
+  ListChatsInput,
+  TeamSummary,
+} from './targets.js';
 
 export { AppPackageError } from './appPackage.js';
 export type {
@@ -665,6 +797,9 @@ export type {
   DelegatedUploadAuthority,
   GetCatalogAppInput,
   GetCatalogAppResult,
+  RemoveFromCatalogInput,
+  RemoveFromCatalogOutcome,
+  RemoveFromCatalogResult,
   UploadToCatalogDelegatedInput,
 } from './catalog.js';
 

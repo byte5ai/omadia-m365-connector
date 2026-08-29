@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert';
 
 import {
   APP_CATALOG_DELEGATED_PERMISSION_ID,
+  CHAT_READ_DELEGATED_PERMISSION_ID,
   GRAPH_RESOURCE_APP_ID,
 } from '../src/teamsProvisioner/delegatedAuth.js';
 import { UniqueNameReservedError } from '../src/teamsProvisioner/errors.js';
@@ -11,6 +12,7 @@ import {
   PUBLISHER_APP_UNIQUE_NAME_PREFIX,
   PublisherAppClient,
   declaresCatalogScope,
+  declaresChatScope,
   mergeCatalogScope,
   publisherAppUniqueName,
 } from '../src/teamsProvisioner/publisherApp.js';
@@ -116,6 +118,10 @@ function applicationBody(
         resourceAppId: GRAPH_RESOURCE_APP_ID,
         resourceAccess: [
           { id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' },
+          // 0.8.0 — the publisher app also declares Chat.ReadBasic so the
+          // admin-consent URL can grant it. An app WITHOUT this is the
+          // pre-0.8.0 shape; the repair path is covered separately below.
+          { id: CHAT_READ_DELEGATED_PERMISSION_ID, type: 'Scope' },
         ],
       },
     ],
@@ -201,6 +207,7 @@ describe('PublisherAppClient.ensurePublisherApp — first run', () => {
     assert.equal(result.value.appId, APP_ID);
     assert.equal(result.value.isPublicClient, true);
     assert.equal(result.value.declaresCatalogScope, true);
+    assert.equal(result.value.declaresChatScope, true);
 
     const create = calls.find((c) => c.method === 'POST' && c.url.endsWith('/applications'));
     assert.ok(create);
@@ -213,12 +220,17 @@ describe('PublisherAppClient.ensurePublisherApp — first run', () => {
     // No redirect URI is registered — that is the point of choosing the device
     // code grant for a self-hosted product with a different URL per install.
     assert.deepEqual(body['publicClient'], { redirectUris: [] });
-    // Exactly one permission, and it must be DELEGATED ('Scope'); 'Role' would
-    // be an application permission, which Graph refuses for this verb.
+    // Two permissions since 0.8.0 — catalog publish and the chat read behind
+    // the target picker — and BOTH must be DELEGATED ('Scope'). 'Role' would
+    // be an application permission, which Graph refuses for the publish verb
+    // and does not offer tenant-wide for chats at all.
     assert.deepEqual(body['requiredResourceAccess'], [
       {
         resourceAppId: GRAPH_RESOURCE_APP_ID,
-        resourceAccess: [{ id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' }],
+        resourceAccess: [
+          { id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' },
+          { id: CHAT_READ_DELEGATED_PERMISSION_ID, type: 'Scope' },
+        ],
       },
     ]);
 
@@ -343,6 +355,45 @@ describe('PublisherAppClient.ensurePublisherApp — adopt path', () => {
     assert.equal(written.length, 2, 'the foreign permission must survive');
     assert.ok(declaresCatalogScope(written));
     assert.ok(written.some((e) => JSON.stringify(e) === JSON.stringify(foreign)));
+  });
+
+  it('repairs a pre-0.8.0 publisher app by declaring Chat.ReadBasic', async () => {
+    // THE UPGRADE PATH. Every tenant that signed in before 0.8.0 has a
+    // publisher app declaring only the catalog scope. Declaring is not
+    // consenting — but the admin-consent URL grants what the app DECLARES, so
+    // a tenant with user consent switched off could never consent to a scope
+    // that is missing here, no matter how often the admin signs in.
+    const catalogOnly = {
+      resourceAppId: GRAPH_RESOURCE_APP_ID,
+      resourceAccess: [
+        { id: APP_CATALOG_DELEGATED_PERMISSION_ID, type: 'Scope' },
+      ],
+    };
+    const { client, calls } = harness([
+      route('/v1.0/applications', 'POST', UNIQUE_NAME_TAKEN),
+      route(FIND, 'GET', {
+        status: 200,
+        body: applicationBody({ requiredResourceAccess: [catalogOnly] }),
+      }),
+      route(`/applications/${OBJECT_ID}?$select=requiredResourceAccess`, 'GET', {
+        status: 200,
+        body: { requiredResourceAccess: [catalogOnly] },
+      }),
+      route(`/applications/${OBJECT_ID}`, 'PATCH', { status: 204 }),
+      route('/servicePrincipals', 'POST', { status: 409, body: {} }),
+    ]);
+
+    const result = await client.ensurePublisherApp();
+
+    const patch = calls.find((c) => c.method === 'PATCH');
+    assert.ok(patch, 'a pre-0.8.0 app must be repaired, not left as it is');
+    const written = (patch.body as Record<string, unknown>)[
+      'requiredResourceAccess'
+    ] as unknown[];
+    // Both scopes present, and the catalog one is not disturbed on the way in.
+    assert.ok(declaresCatalogScope(written));
+    assert.ok(declaresChatScope(written));
+    assert.equal(result.value.declaresChatScope, true);
   });
 
   it('does not PATCH an adopted app that is already correct', async () => {

@@ -3,7 +3,9 @@ import { strict as assert } from 'node:assert';
 
 import {
   APP_CATALOG_DELEGATED_SCOPE,
+  CHAT_READ_DELEGATED_SCOPE,
   DELEGATED_PUBLISH_SCOPES,
+  DELEGATED_SIGN_IN_SCOPES,
   DelegatedAuthClient,
   adminConsentUrl,
   coversCatalogPublish,
@@ -121,11 +123,15 @@ describe('DelegatedAuthClient.startDeviceCode', () => {
     // Without offline_access there is no refresh token, and the whole
     // "one admin sign-in per tenant" promise collapses into an hourly one.
     assert.ok(scopes.includes('offline_access'));
+    // 0.8.0 — the sign-in also carries Chat.ReadBasic so the target picker can
+    // list the administrator's chats. Graph has no tenant-wide app-only route
+    // for that, so widening the sign-in is the only way to get the list.
+    assert.ok(scopes.includes(CHAT_READ_DELEGATED_SCOPE));
 
     assert.equal(start.userCode, USER_CODE);
     assert.equal(start.verificationUri, 'https://microsoft.com/devicelogin');
     assert.equal(start.intervalSeconds, 5);
-    assert.deepEqual(start.scopes, DELEGATED_PUBLISH_SCOPES);
+    assert.deepEqual(start.scopes, DELEGATED_SIGN_IN_SCOPES);
     assert.equal(start.adminConsentUrl, adminConsentUrl(TENANT_ID, CLIENT_ID));
     assert.ok(Date.parse(start.expiresAt) > Date.now());
   });
@@ -275,7 +281,7 @@ describe('DelegatedAuthClient.pollDeviceCode', () => {
       (err: unknown) => {
         assert.ok(err instanceof DelegatedConsentRequiredError);
         assert.equal(err.adminConsentUrl, adminConsentUrl(TENANT_ID, CLIENT_ID));
-        assert.deepEqual(err.requiredScopes, DELEGATED_PUBLISH_SCOPES);
+        assert.deepEqual(err.requiredScopes, DELEGATED_SIGN_IN_SCOPES);
         return true;
       },
     );

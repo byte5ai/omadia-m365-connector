@@ -45,10 +45,13 @@
 
 import {
   APP_CATALOG_DELEGATED_SCOPE,
+  coversCatalogPublish,
+  isAccessTokenStale,
   type DelegatedTokenSet,
 } from './delegatedAuth.js';
 import {
   DelegatedConsentRequiredError,
+  DelegatedScopeRequiredError,
   DelegatedSignInRequiredError,
   DelegatedTokenExpiredError,
   ProvisioningRequestError,
@@ -105,6 +108,8 @@ const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 const ZIP_CONTENT_TYPE = 'application/zip';
 /** Step label of the delegated publish — reused across its typed errors. */
 const UPLOAD_STEP = 'appCatalogs.teamsApps.publish';
+/** Step label of the delegated removal — the reset direction of the publish. */
+const REMOVE_STEP = 'appCatalogs.teamsApps.remove';
 /**
  * Fallback for DelegatedConsentRequiredError.adminConsentUrl when this client
  * was built without a delegated-auth client (only reachable via the low-level
@@ -158,6 +163,30 @@ export interface UploadToCatalogDelegatedInput {
   readonly externalId: string;
   /** SECRET. The stored delegated credential, refreshed here when stale. */
   readonly tokens: DelegatedTokenSet;
+}
+
+/** Idempotent removal signal — an entry already gone is a removal already done. */
+export type RemoveFromCatalogOutcome = 'removed' | 'already-absent';
+
+/** Input for {@link CatalogUploadClient.removeFromCatalog}. */
+export interface RemoveFromCatalogInput {
+  /**
+   * CATALOG id (`CatalogTeamsApp.teamsAppId`) — the id `getCatalogApp` and the
+   * install steps hand around, NOT the manifest `externalId`. Graph's own note
+   * on the delete verb spells the trap out: use the id returned by the catalog
+   * listing, never the one from the package manifest.
+   */
+  readonly teamsAppId: string;
+  /**
+   * SECRET. The stored delegated credential. REQUIRED here, unlike on the
+   * upload: that field stayed optional only to keep an older consumer
+   * compiling, and this method has no such history.
+   */
+  readonly tokens: DelegatedTokenSet;
+}
+
+export interface RemoveFromCatalogResult {
+  readonly outcome: RemoveFromCatalogOutcome;
 }
 
 export interface CatalogUploadClientOptions {
@@ -384,6 +413,96 @@ export class CatalogUploadClient {
       );
       throw err;
     }
+  }
+
+  /**
+   * Reset counterpart of the upload: remove the published app from the tenant
+   * catalog — `DELETE /appCatalogs/teamsApps/{id}`.
+   *
+   * DELEGATED, for exactly the reason the upload is (byte5ai/omadia#924).
+   * Graph's permission table for this verb reads "Not supported." under
+   * Application in BOTH the least- and higher-privileged columns, so no app
+   * role makes it work. The good news is that it needs the same delegated
+   * scope the publish already acquired — `AppCatalog.ReadWrite.All` — so a
+   * tenant that can publish can already remove: no second sign-in, no new
+   * consent. (`AppCatalog.Submit`, Graph's least-privileged entry here, is
+   * deliberately not used: it only withdraws app definitions still in review,
+   * never a published entry.)
+   *
+   * Idempotent: a 404 answers `'already-absent'`. That is the case a reset
+   * actually meets — a half-finished provisioning whose catalog step never ran
+   * — and it has to be a success, or the second pass of a cleanup fails on the
+   * work the first pass already did.
+   *
+   * DOES NOT REFRESH THE TOKEN, on purpose. The result carries no token set
+   * back (unlike {@link uploadToCatalogDelegated}), so refreshing here would
+   * rotate the caller's stored refresh token and then drop it on the floor,
+   * stranding them on a dead credential. A stale access token is reported as
+   * `DelegatedTokenExpiredError('access-token-expired')` instead — the caller
+   * renews via `refreshDelegatedToken`, persists what comes back, and retries.
+   *
+   * @throws {DelegatedScopeRequiredError} the credential does not carry
+   *   `AppCatalog.ReadWrite.All`.
+   * @throws {DelegatedTokenExpiredError} stale access token (pre-flight), or
+   *   Graph answered 401.
+   * @throws {DelegatedConsentRequiredError} 403 — tenant consent withdrawn.
+   */
+  async removeFromCatalog(
+    input: RemoveFromCatalogInput,
+  ): Promise<RemoveFromCatalogResult> {
+    const teamsAppId = requireNonEmpty(input.teamsAppId, 'teamsAppId');
+    const tokens = input.tokens as DelegatedTokenSet | undefined;
+    if (tokens === undefined) {
+      throw new DelegatedScopeRequiredError(
+        REMOVE_STEP,
+        [APP_CATALOG_DELEGATED_SCOPE],
+        'no-token',
+      );
+    }
+    if (!coversCatalogPublish(tokens.scopes)) {
+      throw new DelegatedScopeRequiredError(
+        REMOVE_STEP,
+        [APP_CATALOG_DELEGATED_SCOPE],
+        'scope-missing',
+        tokens.scopes,
+      );
+    }
+    if (isAccessTokenStale(tokens)) {
+      throw new DelegatedTokenExpiredError('access-token-expired');
+    }
+
+    let response: ProvisioningResponse;
+    try {
+      response = await this.http.request({
+        resource: 'graph',
+        method: 'DELETE',
+        url: `${GRAPH_BASE}/appCatalogs/teamsApps/${encodeURIComponent(teamsAppId)}`,
+        step: REMOVE_STEP,
+        // SECRET — forwarded, never cached, never logged by the http layer.
+        bearerToken: tokens.accessToken,
+        missingScopesOn403: [APP_CATALOG_DELEGATED_SCOPE],
+        // Not published (any more) = the removal this call asked for is done.
+        extraOkStatuses: [404],
+      });
+    } catch (err) {
+      if (err instanceof ConsentMissingError) {
+        throw new DelegatedConsentRequiredError(
+          REMOVE_STEP,
+          [APP_CATALOG_DELEGATED_SCOPE],
+          this.delegatedAuth?.adminConsentUrlFor(tokens) ??
+            UNKNOWN_CONSENT_URL_HINT,
+          err,
+        );
+      }
+      if (err instanceof ProvisioningRequestError && err.status === 401) {
+        throw new DelegatedTokenExpiredError('access-token-expired', err);
+      }
+      throw err;
+    }
+    if (response.kind === 'conflict') {
+      throw new Error(`graph ${REMOVE_STEP} unexpected conflict`);
+    }
+    return { outcome: response.status === 404 ? 'already-absent' : 'removed' };
   }
 
   /**

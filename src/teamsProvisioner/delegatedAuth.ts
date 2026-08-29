@@ -83,6 +83,48 @@ export const DELEGATED_PUBLISH_SCOPES: readonly string[] = [
   'profile',
 ];
 
+/**
+ * Delegated scope for listing the signed-in administrator's chats (0.8.0).
+ *
+ * `Chat.ReadBasic` is the least-privileged delegated permission on `GET
+ * /chats` — names and members, no messages. Graph offers no tenant-wide
+ * APPLICATION route for this at all: the reference maps bare `GET /chats` to
+ * delegated permissions only and gives application permissions just the
+ * per-user `GET /users/{id}/chats` form. So the chat picker is delegated by
+ * necessity, not by preference — see `targets.ts` for the whole finding.
+ *
+ * Requires NO admin consent of its own (Entra marks it AdminConsentRequired:
+ * No), which is why adding it costs a sign-in and not a consent round.
+ */
+export const CHAT_READ_DELEGATED_SCOPE =
+  'https://graph.microsoft.com/Chat.ReadBasic';
+
+/** `resourceAccess.id` of the DELEGATED `Chat.ReadBasic` scope. */
+export const CHAT_READ_DELEGATED_PERMISSION_ID =
+  '9547fcb5-d03f-419d-9948-5928bbf71b0f';
+
+/**
+ * What a device-code sign-in asks for since 0.8.0 — publishing PLUS the chat
+ * read that makes a target picker possible.
+ *
+ * WIDENING THIS FORCES A RE-SIGN-IN, and that is the honest cost of the
+ * feature: a credential minted against the old set carries no `Chat.ReadBasic`
+ * and cannot grow one by refreshing. Existing tokens keep publishing exactly
+ * as before — only `listChats` reports the gap, and it reports it as the typed
+ * `DelegatedScopeRequiredError('scope-missing')` rather than a Graph 403.
+ *
+ * {@link DELEGATED_PUBLISH_SCOPES} stays exported unchanged: it is what the
+ * PUBLISH step alone needs, and `coversCatalogPublish` still answers `true`
+ * for an old credential.
+ */
+export const DELEGATED_SIGN_IN_SCOPES: readonly string[] = [
+  APP_CATALOG_DELEGATED_SCOPE,
+  CHAT_READ_DELEGATED_SCOPE,
+  'offline_access',
+  'openid',
+  'profile',
+];
+
 const LOGIN_HOST = 'https://login.microsoftonline.com';
 /** Device-code polling is a background operation, not a hot path. */
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -286,7 +328,7 @@ export class DelegatedAuthClient {
   constructor(opts: DelegatedAuthClientOptions) {
     this.tenantId = requireNonEmpty(opts.tenantId, 'tenantId');
     this.clientId = requireNonEmpty(opts.clientId, 'clientId');
-    this.scopes = opts.scopes ?? DELEGATED_PUBLISH_SCOPES;
+    this.scopes = opts.scopes ?? DELEGATED_SIGN_IN_SCOPES;
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.sleep = opts.sleep ?? defaultSleep;
     this.log =
@@ -732,15 +774,41 @@ export function describeSignInStatus(
  * as insufficient.
  */
 export function coversCatalogPublish(scopes: readonly string[]): boolean {
-  const shortName = APP_CATALOG_DELEGATED_SCOPE.slice(
-    APP_CATALOG_DELEGATED_SCOPE.lastIndexOf('/') + 1,
-  ).toLowerCase();
+  return coversScope(scopes, APP_CATALOG_DELEGATED_SCOPE);
+}
+
+/**
+ * Does this credential carry `Chat.ReadBasic` (0.8.0)?
+ *
+ * Answers `false` for every credential minted before 0.8.0 widened the
+ * sign-in scope set — which is the point: `listChats` turns that into a typed
+ * "sign in again" instead of spending a Graph call to collect a 403.
+ *
+ * A wider chat scope counts too. An administrator who consented to
+ * `Chat.Read` or `Chat.ReadWrite` can list chats; refusing them because the
+ * string does not match the narrowest permission would be a bug in this
+ * check, not a safety property.
+ */
+export function coversChatList(scopes: readonly string[]): boolean {
+  return (
+    coversScope(scopes, CHAT_READ_DELEGATED_SCOPE) ||
+    coversScope(scopes, 'https://graph.microsoft.com/Chat.Read') ||
+    coversScope(scopes, 'https://graph.microsoft.com/Chat.ReadWrite')
+  );
+}
+
+/**
+ * Entra echoes granted scopes either bare (`AppCatalog.ReadWrite.All`) or
+ * fully qualified with the resource URI, and it does so inconsistently —
+ * comparing only against the spelling we SENT would report a perfectly good
+ * credential as insufficient. Both forms count, case-insensitively.
+ */
+function coversScope(scopes: readonly string[], wanted: string): boolean {
+  const qualified = wanted.toLowerCase();
+  const shortName = wanted.slice(wanted.lastIndexOf('/') + 1).toLowerCase();
   return scopes.some((scope) => {
     const normalised = scope.toLowerCase();
-    return (
-      normalised === APP_CATALOG_DELEGATED_SCOPE.toLowerCase() ||
-      normalised === shortName
-    );
+    return normalised === qualified || normalised === shortName;
   });
 }
 
