@@ -64,6 +64,28 @@ describe('classifyInstallTarget — chats', () => {
       'group-chat',
     );
   });
+
+  // REGRESSION (byte5 field test, 0.8.1). `GET /me/chats` lists these ids with
+  // `chatType: 'group'`, so refusing them refused a chat Graph had just handed
+  // the operator out of their own picker.
+  it('classifies the legacy 19:…@thread.skype form as a group chat', () => {
+    const target = classifyInstallTarget(
+      '19:abc8af8ec7fc471785d3b83c4d84b667@thread.skype',
+    );
+    assert.equal(target.kind, 'group-chat');
+    assert.ok(isChatTarget(target));
+    assert.equal(
+      target.chatId,
+      '19:abc8af8ec7fc471785d3b83c4d84b667@thread.skype',
+    );
+  });
+
+  it('matches the legacy suffix case-insensitively too', () => {
+    assert.equal(
+      classifyInstallTarget('19:ABC@THREAD.SKYPE').kind,
+      'group-chat',
+    );
+  });
 });
 
 describe('classifyInstallTarget — the channel trap', () => {
@@ -145,12 +167,10 @@ describe('classifyInstallTarget — unknown shapes', () => {
     assert.match(target.hint, /thread\.v2/);
   });
 
-  it('gives a legacy @thread.skype id its own remedy text', () => {
-    const target = classifyInstallTarget('19:abc@thread.skype');
-    // Still 'unknown' — the contract lists exactly four known shapes.
-    assert.equal(target.kind, 'unknown');
+  it('names the legacy group-chat spelling in the remedy text', () => {
+    const target = classifyInstallTarget('Marketing');
     assert.ok(target.kind === 'unknown');
-    assert.match(target.hint.toLowerCase(), /skype/);
+    assert.match(target.hint, /thread\.skype/);
   });
 
   it('rejects a 19: prefix with no recognised suffix', () => {
