@@ -80,6 +80,9 @@ export {
   // team. Application-permission only, no delegated sign-in needed.
   ChatNotFoundError,
   InstallTargetMismatchError,
+  // 0.8.2 — Graph refused the RSC consent an install carried (or could not
+  // carry). A tenant-side role grant, never a wrong target id.
+  RscPermissionsMismatchError,
   classifyInstallTarget,
   isChatTarget,
   // Delegated catalog publishing (byte5ai/omadia#924) — POST
@@ -194,6 +197,7 @@ export type {
   DeleteBotResult,
   GetBotResult,
   ConsentedPermissionSet,
+  InstallToChatRequest,
   InstallToTeamRequest,
   ResourceSpecificPermission,
   ResourceSpecificPermissionType,

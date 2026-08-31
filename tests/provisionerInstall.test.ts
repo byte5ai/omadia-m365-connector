@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 
 import {
+  TEAM_INSTALL_CONSENT_SCOPE,
   TEAM_INSTALL_SCOPE,
   TeamInstallClient,
   type ConsentedPermissionSet,
@@ -10,7 +11,9 @@ import { ProvisioningHttp } from '../src/teamsProvisioner/http.js';
 import {
   ConsentMissingError,
   ProvisioningThrottledError,
+  RscPermissionsMismatchError,
   TeamsProvisionerError,
+  isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
 
 // The team-install step: POST /teams/{id}/installedApps behind the shared
@@ -92,6 +95,33 @@ const CONSENTED: ConsentedPermissionSet = {
   ],
 };
 
+/** See the twin in tests/provisionerChatInstall.test.ts — the 0.8.2 lookup of
+ *  the app's own declared RSC permissions. Default: the app declares none, so
+ *  the body keeps its pre-0.8.2 shape. */
+const RSC_LOOKUP_MATCH = '/appCatalogs/teamsApps?';
+
+const rscLookupRoute = (
+  permissions: readonly { permissionValue: string; permissionType: string }[],
+): Route =>
+  route(RSC_LOOKUP_MATCH, {
+    status: 200,
+    body: {
+      value: [
+        {
+          id: TEAMS_APP_ID,
+          appDefinitions: [
+            {
+              id: 'definition-1',
+              authorization: {
+                requiredPermissionSet: { resourceSpecificPermissions: permissions },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+
 function harness(routes: Route[]): {
   client: TeamInstallClient;
   calls: FetchCall[];
@@ -105,7 +135,7 @@ function harness(routes: Route[]): {
       clientId: 'app-graph',
       clientSecret: 'graph-secret-value',
     },
-    fetchImpl: mockFetch(routes, calls),
+    fetchImpl: mockFetch([...routes, rscLookupRoute([])], calls),
     log: () => {},
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -536,5 +566,67 @@ describe('TeamInstallClient.uninstallFromTeam', () => {
       /invalid_argument: 'teamsAppId'/,
     );
     assert.equal(calls.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resource-specific consent (0.8.2) — the team direction carried the SAME bug
+// as the chat direction, latently: it offered `consentedPermissionSet` as a
+// caller field and no caller ever filled it, so an app declaring RSC was
+// refused with 400 ResourceSpecificPermissionsMismatch the moment a tenant
+// held the consent-capable role. It had simply never been run at a tenant
+// that got that far. The resolution is now shared with the chat direction.
+// ---------------------------------------------------------------------------
+
+const DECLARED_RSC = [
+  { permissionValue: 'ChannelMessage.Read.Group', permissionType: 'application' },
+  { permissionValue: 'TeamsActivity.Send.Group', permissionType: 'application' },
+];
+
+describe('TeamInstallClient.installToTeam — resource-specific consent', () => {
+  it('consents to the declared permissions without the caller passing any', async () => {
+    const { client, calls } = harness([
+      route(INSTALL_URL_MATCH, { status: 201, body: { id: INSTALLATION_ID } }),
+      rscLookupRoute(DECLARED_RSC),
+    ]);
+
+    const result = await client.installToTeam({
+      teamId: TEAM_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'created');
+    const [call] = installCalls(calls);
+    assert.ok(call);
+    assert.deepEqual(parsedBody(call)['consentedPermissionSet'], {
+      resourceSpecificPermissions: DECLARED_RSC,
+    });
+  });
+
+  it('maps 400 ResourceSpecificPermissionsMismatch to the team consent role', async () => {
+    const { client } = harness([
+      route(INSTALL_URL_MATCH, {
+        status: 400,
+        body: {
+          error: {
+            code: 'ResourceSpecificPermissionsMismatch',
+            message: 'The app requires resource-specific permissions.',
+          },
+        },
+      }),
+      rscLookupRoute(DECLARED_RSC),
+    ]);
+
+    await assert.rejects(
+      client.installToTeam({ teamId: TEAM_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof RscPermissionsMismatchError);
+        assert.equal(err.step, 'teams.installedApps.add');
+        assert.equal(err.consentRole, TEAM_INSTALL_CONSENT_SCOPE);
+        assert.equal(err.sentPermissionCount, DECLARED_RSC.length);
+        assert.equal(isTransientProvisioningFailure(err), false);
+        return true;
+      },
+    );
   });
 });
