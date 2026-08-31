@@ -20,11 +20,30 @@
  * module-private helpers at the bottom.
  *
  * One Graph write: `POST /teams/{teamId}/installedApps` with the
- * `teamsApp@odata.bind` reference to the catalog app. When the caller passes
- * a {@link ConsentedPermissionSet} (resource-specific consent the tenant
- * admin pre-approved), it is included in the request body — and ONLY then:
- * the body shape changes with it, so an absent set must not serialise as
- * `consentedPermissionSet: undefined`/`null`.
+ * `teamsApp@odata.bind` reference to the catalog app, plus — since 0.8.2, in
+ * BOTH directions — the {@link ConsentedPermissionSet} the app package itself
+ * declares. It is included only when there is one: the body shape changes with
+ * it, so an absent set must not serialise as `consentedPermissionSet:
+ * undefined`/`null`.
+ *
+ * WHERE THAT SET COMES FROM (0.8.2, the field failure this release fixes).
+ * Graph requires the installer to state the resource-specific permissions it
+ * consents to whenever the app declares any, and requires them to MATCH the
+ * app's own `teamsAppDefinition` — "the permissions consented to during the
+ * installation must match the resource-specific permissions defined in the
+ * teamsAppDefinition of the app". So the set is neither a fixed list nor
+ * something a caller should have to retype: it is read back from Graph's own
+ * record of the app being installed
+ * ({@link resolveDeclaredPermissionSet}, the query Graph's own docs point at).
+ * A caller MAY still pass one explicitly — an explicit set wins and skips the
+ * lookup — but nothing has to.
+ *
+ * Before 0.8.2 the team direction offered the field and no caller ever filled
+ * it, and the chat direction did not offer it at all. Our generated packages
+ * declare seven RSC permissions, so BOTH directions were refused with
+ * `400 ResourceSpecificPermissionsMismatch` the moment the tenant had the
+ * consent-capable app role — the team direction latently, because nobody had
+ * run it yet.
  *
  * IDEMPOTENCY — 409 is success. Graph answers 409 when the app is already
  * installed in the team (idempotency key: (teamId, teamsAppId)). The shared
@@ -49,8 +68,17 @@
  * fetch of its own.
  */
 
-import { ChatNotFoundError, InstallTargetMismatchError } from './errors.js';
-import type { ProvisioningConflictRule, ProvisioningHttp } from './http.js';
+import {
+  ChatNotFoundError,
+  InstallTargetMismatchError,
+  ProvisioningRequestError,
+  RscPermissionsMismatchError,
+} from './errors.js';
+import type {
+  ProvisioningConflictRule,
+  ProvisioningHttp,
+  ProvisioningResponse,
+} from './http.js';
 import {
   classifyInstallTarget,
   isChatTarget,
@@ -73,6 +101,27 @@ import type {
  * surfaced on 403 via `ConsentMissingError.missingScopes`.
  */
 export const TEAM_INSTALL_SCOPE = 'TeamsAppInstallation.ReadWriteForTeam.All';
+
+/**
+ * The app role a TEAM install needs ON TOP of {@link TEAM_INSTALL_SCOPE} once
+ * the package declares resource-specific permissions.
+ *
+ * Graph is explicit that the plain `…ReadWriteForTeam.All` "cannot be used to
+ * install apps that require consent to resource-specific consent permissions".
+ * Reported on 403 (and named in {@link RscPermissionsMismatchError}) only when
+ * a set is actually being sent — a plain install must keep pointing at the
+ * plain role, or an operator grants a wider role than the install needs.
+ */
+export const TEAM_INSTALL_CONSENT_SCOPE =
+  'TeamsAppInstallation.ReadWriteAndConsentForTeam.All';
+
+/**
+ * Graph app role the catalog lookup behind {@link resolveDeclaredPermissionSet}
+ * needs. The same role the catalog step already requires — the chain has
+ * always held it by the time an install runs, which is why the resolution can
+ * live inside the install step instead of becoming a caller obligation.
+ */
+const APP_CATALOG_SCOPE = 'AppCatalog.ReadWrite.All';
 
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
@@ -187,23 +236,22 @@ export class TeamInstallClient {
   ): Promise<Idempotent<TeamAppInstallation>> {
     const teamId = requireNonEmpty(input.teamId, 'teamId');
     const teamsAppId = requireNonEmpty(input.teamsAppId, 'teamsAppId');
+    const step = 'teams.installedApps.add';
 
-    const jsonBody: Record<string, unknown> = {
-      'teamsApp@odata.bind': `${GRAPH_BASE}/appCatalogs/teamsApps/${encodeURIComponent(teamsAppId)}`,
-      // Only present when the caller consented — the key must not appear
-      // (not even as undefined/null) on the plain install body shape.
-      ...(input.consentedPermissionSet !== undefined
-        ? { consentedPermissionSet: input.consentedPermissionSet }
-        : {}),
-    };
+    const permissions = await resolveConsentedPermissionSet(this.http, {
+      teamsAppId,
+      explicit: input.consentedPermissionSet,
+      step,
+      log: this.log,
+    });
 
-    const response = await this.http.request({
-      resource: 'graph',
-      method: 'POST',
+    const response = await installRequest(this.http, {
       url: `${GRAPH_BASE}/teams/${encodeURIComponent(teamId)}/installedApps`,
-      step: 'teams.installedApps.add',
-      jsonBody,
-      missingScopesOn403: [TEAM_INSTALL_SCOPE],
+      step,
+      teamsAppId,
+      permissions,
+      baseScope: TEAM_INSTALL_SCOPE,
+      consentScope: TEAM_INSTALL_CONSENT_SCOPE,
     });
 
     if (response.kind === 'conflict') {
@@ -310,6 +358,33 @@ export class TeamInstallClient {
 export const CHAT_INSTALL_SCOPE = 'TeamsAppInstallation.ReadWriteForChat.All';
 
 /**
+ * Chat twin of {@link TEAM_INSTALL_CONSENT_SCOPE} — the app role a chat
+ * install needs once the package declares resource-specific permissions.
+ *
+ * This is the role the field test had already granted while the request body
+ * still omitted the set, which is precisely why the install kept failing:
+ * having the role is half of it, the caller must also SAY what it consents to.
+ */
+export const CHAT_INSTALL_CONSENT_SCOPE =
+  'TeamsAppInstallation.ReadWriteAndConsentForChat.All';
+
+/**
+ * Input for {@link ChatInstallClient.installToChat}: the shared
+ * `InstallToChatInput` of `types.ts` plus the optional consented-permission
+ * set — the exact shape {@link InstallToTeamRequest} has, deliberately, so the
+ * two directions stay one mechanism rather than two.
+ *
+ * OPTIONAL BECAUSE IT IS RESOLVED, NOT BECAUSE IT IS RARE. Left out, the step
+ * reads the app's declared permissions from Graph itself
+ * ({@link resolveDeclaredPermissionSet}); passed in, the caller's set is sent
+ * verbatim and no lookup happens.
+ */
+export interface InstallToChatRequest extends InstallToChatInput {
+  /** Sent to Graph verbatim when present; resolved from the app otherwise. */
+  readonly consentedPermissionSet?: ConsentedPermissionSet;
+}
+
+/**
  * How the chat endpoint reports "this app is already installed here" — and
  * what is actually KNOWN about that, which is less than one would like.
  *
@@ -390,16 +465,21 @@ export interface ChatInstallClientOptions {
  * The genuinely shared parts — the installation lookup, the OData escaping,
  * the result assembly — are module-private functions both clients call.
  *
- * NO `consentedPermissionSet` HERE, unlike {@link installToTeam}. Graph
- * documents that `TeamsAppInstallation.ReadWriteForChat.All` "cannot be used
- * to install apps that require consent to resource-specific permissions" —
- * consenting RSC on a chat install needs `…ReadWriteAndConsentForChat.All`
- * instead, and the refusal is real: this endpoint answers **400
- * `ResourceSpecificPermissionsMismatch`** when the app's manifest declares RSC
- * the caller's role cannot consent to. Offering the field on this scope would
- * let a caller build a request that is refused by construction, so it is left
- * out until a consumer actually needs RSC in chats (and with it, the wider app
- * role). That 400 is deliberately NOT folded into the idempotent path.
+ * `consentedPermissionSet` IS SENT HERE, exactly as {@link installToTeam}
+ * sends it (since 0.8.2). Until then it was left out on the reading that
+ * `TeamsAppInstallation.ReadWriteForChat.All` "cannot be used to install apps
+ * that require consent to resource-specific permissions", so offering the
+ * field would build a request refused by construction. That reading was right
+ * about the WEAK role and wrong about the outcome: with the weak role the
+ * install is refused whether or not the field is sent, and with the
+ * consent-capable `…ReadWriteAndConsentForChat.All` role Graph REQUIRES the
+ * field, because an installer has to state which resource-specific
+ * permissions it consents to. Omitting it is what produced the field failure.
+ *
+ * The 400 `ResourceSpecificPermissionsMismatch` is still deliberately NOT
+ * folded into the idempotent path — it surfaces as
+ * {@link RscPermissionsMismatchError}, whose text differs by whether a set was
+ * actually sent.
  */
 export class ChatInstallClient {
   private readonly http: Pick<ProvisioningHttp, 'request'>;
@@ -438,27 +518,37 @@ export class ChatInstallClient {
    *   separate "no such chat" from "no such catalog app" on this verb, but
    *   the app id comes from our own upload step, so the chat is the honest
    *   thing to name.
+   * - 400 `ResourceSpecificPermissionsMismatch` → `RscPermissionsMismatchError`,
+   *   naming {@link CHAT_INSTALL_CONSENT_SCOPE} and whether a permission set
+   *   was actually carried.
    * - 403 → `ConsentMissingError([CHAT_INSTALL_SCOPE], 'graph')` from the
-   *   http layer — the same typed family as every other step, so callers keep
-   *   ONE fallback branch.
+   *   http layer — plus {@link CHAT_INSTALL_CONSENT_SCOPE} when this install
+   *   carries a permission set, since that is the role it then needs. Same
+   *   typed family as every other step, so callers keep ONE fallback branch.
    * - 429 → retried by the http layer honouring `Retry-After`; exhausted
    *   budget → `ProvisioningThrottledError`.
    */
   async installToChat(
-    input: InstallToChatInput,
+    input: InstallToChatRequest,
   ): Promise<Idempotent<ChatAppInstallation>> {
-    const chatId = this.requireChatId(input.chatId, 'chats.installedApps.add');
+    const step = 'chats.installedApps.add';
+    const chatId = this.requireChatId(input.chatId, step);
     const teamsAppId = requireNonEmpty(input.teamsAppId, 'teamsAppId');
 
-    const response = await this.http.request({
-      resource: 'graph',
-      method: 'POST',
+    const permissions = await resolveConsentedPermissionSet(this.http, {
+      teamsAppId,
+      explicit: input.consentedPermissionSet,
+      step,
+      log: this.log,
+    });
+
+    const response = await installRequest(this.http, {
       url: `${GRAPH_BASE}/chats/${encodeURIComponent(chatId)}/installedApps`,
-      step: 'chats.installedApps.add',
-      jsonBody: {
-        'teamsApp@odata.bind': `${GRAPH_BASE}/appCatalogs/teamsApps/${encodeURIComponent(teamsAppId)}`,
-      },
-      missingScopesOn403: [CHAT_INSTALL_SCOPE],
+      step,
+      teamsAppId,
+      permissions,
+      baseScope: CHAT_INSTALL_SCOPE,
+      consentScope: CHAT_INSTALL_CONSENT_SCOPE,
       conflictOn: CHAT_ALREADY_INSTALLED_RULES,
       // Taken off the generic error path so it can be re-thrown as the typed,
       // chat-specific not-found below.
@@ -569,6 +659,244 @@ export class ChatInstallClient {
       targetHint(target),
     );
   }
+}
+
+/**
+ * The ONE install POST, shared by both directions — including the
+ * `consentedPermissionSet` handling and the typed 400 both of them need.
+ *
+ * The body key is present only when a set was resolved: the shape changes with
+ * it, so an absent set must not serialise as `consentedPermissionSet:
+ * undefined`/`null`.
+ *
+ * WHY THE 400 IS CAUGHT HERE AND NOT DECLARED AS A CONFLICT RULE. The http
+ * layer's `extraOkStatuses` is consulted BEFORE its conflict rules, so listing
+ * 400 there would disable the chat direction's Bad-Request-shaped
+ * already-installed detection. Catching the thrown
+ * {@link ProvisioningRequestError} keeps both behaviours, at the price of
+ * matching Graph's error code in the message — the same duck-typing the
+ * middleware does one level up, and for the same reason: the code is the only
+ * thing carried across that seam.
+ */
+async function installRequest(
+  http: Pick<ProvisioningHttp, 'request'>,
+  opts: {
+    readonly url: string;
+    readonly step: string;
+    readonly teamsAppId: string;
+    readonly permissions: ConsentedPermissionSet | undefined;
+    readonly baseScope: string;
+    readonly consentScope: string;
+    readonly conflictOn?: readonly ProvisioningConflictRule[];
+    readonly extraOkStatuses?: readonly number[];
+  },
+): Promise<ProvisioningResponse> {
+  const sentCount = opts.permissions?.resourceSpecificPermissions.length ?? 0;
+  try {
+    return await http.request({
+      resource: 'graph',
+      method: 'POST',
+      url: opts.url,
+      step: opts.step,
+      jsonBody: {
+        'teamsApp@odata.bind': `${GRAPH_BASE}/appCatalogs/teamsApps/${encodeURIComponent(opts.teamsAppId)}`,
+        ...(opts.permissions !== undefined
+          ? { consentedPermissionSet: opts.permissions }
+          : {}),
+      },
+      // The consent-capable role is named only when this install actually
+      // consents to something — otherwise a 403 would ask an operator to grant
+      // a wider role than the call needs.
+      missingScopesOn403:
+        sentCount > 0
+          ? [opts.baseScope, opts.consentScope]
+          : [opts.baseScope],
+      ...(opts.conflictOn !== undefined ? { conflictOn: opts.conflictOn } : {}),
+      ...(opts.extraOkStatuses !== undefined
+        ? { extraOkStatuses: opts.extraOkStatuses }
+        : {}),
+    });
+  } catch (err) {
+    if (isRscMismatchResponse(err)) {
+      throw new RscPermissionsMismatchError(
+        opts.step,
+        opts.consentScope,
+        sentCount,
+        err.message,
+        err,
+      );
+    }
+    throw err;
+  }
+}
+
+/** Graph's `ResourceSpecificPermissionsMismatch` on a 400, as it reaches us. */
+function isRscMismatchResponse(err: unknown): err is ProvisioningRequestError {
+  return (
+    err instanceof ProvisioningRequestError &&
+    err.status === 400 &&
+    /ResourceSpecificPermissionsMismatch/i.test(err.message)
+  );
+}
+
+/**
+ * The permission set an install should carry: the caller's, when it passed
+ * one, else the app's own declared set read back from Graph.
+ *
+ * An EXPLICIT set is authoritative and skips the lookup entirely — including
+ * an explicitly EMPTY one, which is how a caller says "send nothing" without
+ * the step second-guessing it.
+ */
+async function resolveConsentedPermissionSet(
+  http: Pick<ProvisioningHttp, 'request'>,
+  opts: {
+    readonly teamsAppId: string;
+    readonly explicit: ConsentedPermissionSet | undefined;
+    readonly step: string;
+    readonly log: (msg: string) => void;
+  },
+): Promise<ConsentedPermissionSet | undefined> {
+  if (opts.explicit !== undefined) {
+    return opts.explicit.resourceSpecificPermissions.length > 0
+      ? opts.explicit
+      : undefined;
+  }
+  return resolveDeclaredPermissionSet(http, opts);
+}
+
+/**
+ * The resource-specific permissions the catalog app itself declares —
+ * `GET /appCatalogs/teamsApps?$filter=id eq '…'&$expand=appDefinitions($select=id,authorization)`,
+ * reading `appDefinitions[].authorization.requiredPermissionSet`.
+ *
+ * THIS QUERY IS NOT A GUESS. Graph's own install reference points at it as the
+ * way to obtain the set an install must consent to, and requires the consented
+ * set to match what the app declares. Reading it back from Graph — rather than
+ * from the manifest template that produced the package — also means the set
+ * matches the DEFINITION THAT IS ACTUALLY PUBLISHED, which is the thing Graph
+ * compares against; a package rebuilt locally after the upload cannot drift
+ * this set out from under the install.
+ *
+ * Entries are passed through VERBATIM, `delegated` ones included: the docs
+ * allow omitting the field when the app declares delegated permissions ONLY,
+ * they never ask for a filtered set, and filtering would be exactly the
+ * mismatch this call exists to avoid.
+ *
+ * DEGRADES, LOUDLY. A 403/404 on the lookup, an app with no declared
+ * permissions, or a definition Graph returns without an `authorization` block
+ * all answer `undefined` — the install then proceeds with the pre-0.8.2 body
+ * shape and, if the app really did need consent, fails with a
+ * {@link RscPermissionsMismatchError} that says the set could not be resolved.
+ * Every one of those paths logs why. What it does NOT do is swallow a
+ * transport error or an unexpected status: those propagate.
+ */
+async function resolveDeclaredPermissionSet(
+  http: Pick<ProvisioningHttp, 'request'>,
+  opts: {
+    readonly teamsAppId: string;
+    readonly step: string;
+    readonly log: (msg: string) => void;
+  },
+): Promise<ConsentedPermissionSet | undefined> {
+  const filter = `id eq '${escapeODataString(opts.teamsAppId)}'`;
+  const response = await http.request({
+    resource: 'graph',
+    method: 'GET',
+    url:
+      `${GRAPH_BASE}/appCatalogs/teamsApps?$filter=${encodeURIComponent(filter)}` +
+      `&$expand=${encodeURIComponent('appDefinitions($select=id,authorization)')}`,
+    step: 'appCatalogs.teamsApps.rscLookup',
+    missingScopesOn403: [APP_CATALOG_SCOPE],
+    // Both mean "nothing declared that we can read": a tenant that withheld
+    // AppCatalog.ReadWrite.All, or an app id the catalog does not resolve.
+    // Neither should turn an install that used to work into an exception.
+    extraOkStatuses: [403, 404],
+  });
+
+  if (response.kind !== 'ok' || response.status === 403 || response.status === 404) {
+    opts.log(
+      `provisioner ${opts.step}: could not read the declared RSC permissions of app ` +
+        `${opts.teamsAppId} (appCatalogs.teamsApps.rscLookup answered ${String(response.status)}) — ` +
+        `installing without a consentedPermissionSet; grant ${APP_CATALOG_SCOPE} if the install is refused`,
+    );
+    return undefined;
+  }
+
+  const permissions = declaredPermissions(response.json, opts.teamsAppId);
+  if (permissions.length === 0) {
+    opts.log(
+      `provisioner ${opts.step}: app ${opts.teamsAppId} declares no resource-specific permissions — installing without a consentedPermissionSet`,
+    );
+    return undefined;
+  }
+  opts.log(
+    `provisioner ${opts.step}: consenting to ${String(permissions.length)} resource-specific permission(s) declared by app ${opts.teamsAppId}`,
+  );
+  return { resourceSpecificPermissions: permissions };
+}
+
+/**
+ * `authorization.requiredPermissionSet.resourceSpecificPermissions` of the
+ * matching catalog entry, flattened across its app definitions and
+ * de-duplicated on (value, type).
+ *
+ * The entry is re-checked against the requested `id` client-side for the same
+ * reason the installation lookup re-checks `teamsApp.id`: a tenant that
+ * ignores the `$filter` must not be able to make us consent to a DIFFERENT
+ * app's permissions. Malformed entries are skipped rather than defaulted —
+ * a permission we cannot read is one we must not claim to have consented to.
+ */
+function declaredPermissions(
+  json: unknown,
+  teamsAppId: string,
+): readonly ResourceSpecificPermission[] {
+  const out: ResourceSpecificPermission[] = [];
+  const seen = new Set<string>();
+  for (const entry of listEntries(json)) {
+    if (!entry || typeof entry !== 'object') continue;
+    const app = entry as Record<string, unknown>;
+    if (app['id'] !== teamsAppId) continue;
+    const definitions = app['appDefinitions'];
+    if (!Array.isArray(definitions)) continue;
+    for (const definition of definitions) {
+      for (const permission of permissionsOfDefinition(definition)) {
+        const key = `${permission.permissionType}:${permission.permissionValue}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(permission);
+      }
+    }
+  }
+  return out;
+}
+
+/** The RSC permissions of ONE `teamsAppDefinition`, ignoring malformed entries. */
+function permissionsOfDefinition(
+  definition: unknown,
+): readonly ResourceSpecificPermission[] {
+  if (!definition || typeof definition !== 'object') return [];
+  const authorization = (definition as Record<string, unknown>)['authorization'];
+  if (!authorization || typeof authorization !== 'object') return [];
+  const set = (authorization as Record<string, unknown>)['requiredPermissionSet'];
+  if (!set || typeof set !== 'object') return [];
+  const list = (set as Record<string, unknown>)['resourceSpecificPermissions'];
+  if (!Array.isArray(list)) return [];
+
+  const out: ResourceSpecificPermission[] = [];
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue;
+    const record = raw as Record<string, unknown>;
+    const value = record['permissionValue'];
+    const type = record['permissionType'];
+    if (typeof value !== 'string' || value.length === 0) continue;
+    if (typeof type !== 'string') continue;
+    // Graph's enum members are lowercase; its own examples are inconsistent
+    // about casing, so normalise rather than pass an unusable literal on.
+    const normalized = type.toLowerCase();
+    if (normalized !== 'application' && normalized !== 'delegated') continue;
+    out.push({ permissionValue: value, permissionType: normalized });
+  }
+  return out;
 }
 
 /**

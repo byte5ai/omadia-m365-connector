@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.8.1"
+  version: "0.8.2"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -75,12 +75,21 @@ setup:
 
       For the Teams provisioning capability (`teamsProvisioner@1`) additionally
       add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-      `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
+      `TeamsAppInstallation.ReadWriteForTeam.All`,
+      `TeamsAppInstallation.ReadWriteAndConsentForTeam.All`,
+      `Team.ReadBasic.All`.
 
       To install an agent into a **group chat** (since 0.7.0) also add
-      `TeamsAppInstallation.ReadWriteForChat.All`. Not the `…SelfForChat.All`
-      variant — that one only lets an app install *itself*, while the
-      provisioner installs the per-agent app it generated.
+      `TeamsAppInstallation.ReadWriteForChat.All` **and**
+      `TeamsAppInstallation.ReadWriteAndConsentForChat.All`. Not the
+      `…SelfForChat.All` variant — that one only lets an app install *itself*,
+      while the provisioner installs the per-agent app it generated.
+
+      The two `…AndConsent…` roles are not optional extras: the generated app
+      packages declare seven resource-specific permissions, and an install that
+      cannot consent to them is refused with
+      `400 ResourceSpecificPermissionsMismatch` (since 0.8.2 the connector
+      sends the consent itself — the role is the half you grant).
 
       Listing the teams an agent can be installed into (`listTeams`, since
       0.8.0) needs no new permission: it reuses `Team.ReadBasic.All` from the
@@ -159,12 +168,22 @@ setup:
 
       Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
       `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-      `TeamsAppInstallation.ReadWriteForTeam.All`, `Team.ReadBasic.All`.
+      `TeamsAppInstallation.ReadWriteForTeam.All`,
+      `TeamsAppInstallation.ReadWriteAndConsentForTeam.All`,
+      `Team.ReadBasic.All`.
 
       Für die Installation eines Agenten in einen **Gruppenchat** (ab 0.7.0)
-      zusätzlich `TeamsAppInstallation.ReadWriteForChat.All`. Nicht die
+      zusätzlich `TeamsAppInstallation.ReadWriteForChat.All` **und**
+      `TeamsAppInstallation.ReadWriteAndConsentForChat.All`. Nicht die
       `…SelfForChat.All`-Variante — die erlaubt einer App nur, *sich selbst* zu
       installieren; der Provisioner installiert die generierte Agent-App.
+
+      Die beiden `…AndConsent…`-Rollen sind kein Beiwerk: die generierten
+      App-Pakete deklarieren sieben ressourcenspezifische Berechtigungen, und
+      eine Installation, die ihnen nicht zustimmen darf, wird mit
+      `400 ResourceSpecificPermissionsMismatch` abgelehnt (ab 0.8.2 schickt der
+      Connector die Zustimmung selbst mit — die Rolle ist die Hälfte, die ihr
+      vergebt).
 
       Das Auflisten der Teams als Installationsziele (`listTeams`, ab 0.8.0)
       braucht keine neue Berechtigung — es nutzt `Team.ReadBasic.All` aus der

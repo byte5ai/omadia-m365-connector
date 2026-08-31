@@ -69,6 +69,14 @@ Graph client via the service registry.
      device-code sign-in, and it is not a Teams protected API. Not the
      `…SelfForChat.All` variant, which only lets an app install *itself*.
      Needed only for chat installs; team-only deployments can skip it.
+   - `TeamsAppInstallation.ReadWriteAndConsentForTeam.All` and
+     `TeamsAppInstallation.ReadWriteAndConsentForChat.All` — required in
+     practice since 0.8.2. The generated app packages declare seven
+     resource-specific permissions, and the two plain roles above may not
+     consent to them: without these, an install answers **400
+     `ResourceSpecificPermissionsMismatch`**. The connector sends the matching
+     `consentedPermissionSet` itself, read back from the published app
+     definition; the role is the half a tenant admin grants.
    - `Team.ReadBasic.All` — since 0.5.0, resolve a team id to its display name
      (`GET /teams/{id}?$select=id,displayName`) so consumers can show operators
      a team NAME instead of a GUID. Read-only, and the narrowest scope that

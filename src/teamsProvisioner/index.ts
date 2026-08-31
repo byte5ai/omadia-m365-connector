@@ -92,6 +92,7 @@ import { ProvisioningHttp } from './http.js';
 import {
   ChatInstallClient,
   TeamInstallClient,
+  type InstallToChatRequest,
   type InstallToTeamRequest,
   type UninstallFromChatInput,
   type UninstallFromChatResult,
@@ -330,7 +331,7 @@ export interface TeamsProvisionerAccessor {
    * against a connector < 0.7.0 must keep its team-only branch.
    */
   installToChat(
-    input: InstallToChatInput,
+    input: InstallToChatRequest,
   ): Promise<Idempotent<ChatAppInstallation>>;
 
   /**
@@ -674,6 +675,9 @@ export {
   // each carry their own operator remedy.
   ChatNotFoundError,
   InstallTargetMismatchError,
+  // 0.8.2 — the install carried (or failed to resolve) an RSC consent set
+  // Graph refused. Distinct from a wrong id and from a plain 403.
+  RscPermissionsMismatchError,
   // Delegated catalog-publish taxonomy (byte5ai/omadia#924).
   DelegatedSignInRequiredError,
   DelegatedConsentRequiredError,
@@ -825,6 +829,7 @@ export type {
 // over on `ConsentMissingError.missingScopes`.
 export type {
   ConsentedPermissionSet,
+  InstallToChatRequest,
   InstallToTeamRequest,
   ResourceSpecificPermission,
   ResourceSpecificPermissionType,

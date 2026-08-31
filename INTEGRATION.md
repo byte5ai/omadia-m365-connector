@@ -174,8 +174,10 @@ extends it by exactly three scopes:
 | `Application.ReadWrite.OwnedBy` | `registerApplication` / `addClientSecret` — `POST /applications`, `POST /applications/{id}/addPassword`; per-agent apps stay owned by the connector app |
 | `AppCatalog.ReadWrite.All` | `getCatalogApp` and the idempotent 409 re-resolution — `GET /appCatalogs/teamsApps`. Since 0.6.0 it does **not** cover `uploadToCatalog`: Graph lists application permissions for `POST /appCatalogs/teamsApps` as "Not supported.", so that one step needs a DELEGATED token (below) |
 | `TeamsAppInstallation.ReadWriteForTeam.All` | `installToTeam` — `POST /teams/{id}/installedApps`; since 0.4.0 also `uninstallFromTeam` — `GET /teams/{id}/installedApps` + `DELETE /teams/{id}/installedApps/{installationId}` |
+| `TeamsAppInstallation.ReadWriteAndConsentForTeam.All` | Required in practice since 0.8.2: the generated app packages declare resource-specific permissions, and the plain `…ReadWriteForTeam.All` above may not consent to them. Without it a team install answers **400 `ResourceSpecificPermissionsMismatch`** |
 | `Team.ReadBasic.All` | `getTeam` (since 0.5.0) — `GET /teams/{id}?$select=id,displayName`; resolves a team id to a NAME so consumers can label a team instead of printing its GUID. Optional in practice: without consent the lookup 403s and the consumer keeps showing the id |
 | `TeamsAppInstallation.ReadWriteForChat.All` | `installToChat` (since 0.7.0) — `POST /chats/{id}/installedApps`, plus `uninstallFromChat` — `GET /chats/{id}/installedApps` + `DELETE /chats/{id}/installedApps/{installationId}`. Needed only to install an agent into a group or 1:1 CHAT; team-only deployments can leave it out |
+| `TeamsAppInstallation.ReadWriteAndConsentForChat.All` | Chat twin of the row above, and required for the same reason (see *Chats work on APPLICATION permissions*). This is the grant the 0.8.2 field failure was missing half of |
 
 ### Chats work on APPLICATION permissions (since 0.7.0)
 
@@ -194,11 +196,37 @@ variants only let an app install *itself* into a chat; the provisioner installs
 the per-agent app it generated, which is a different app from the connector's
 own identity.
 
-One limit that comes with this role: Graph documents that it "cannot be used to
-install apps that require consent to resource-specific permissions", and the
-endpoint enforces it with **400 `ResourceSpecificPermissionsMismatch`**.
-`installToChat` therefore takes no `consentedPermissionSet` (unlike
-`installToTeam`) — RSC in chats would need `…ReadWriteAndConsentForChat.All`.
+One limit comes with this role, and since 0.8.2 it has a name and a fix. Graph
+documents that `…ReadWriteForChat.All` "cannot be used to install apps that
+require consent to resource-specific permissions", and the endpoint enforces it
+with **400 `ResourceSpecificPermissionsMismatch`**. The app packages this
+connector generates declare **seven** RSC permissions, so that limit is not an
+edge case — it is every install.
+
+The remedy is TWO things, and having only the first is what made 0.7.0–0.8.1
+fail in the field:
+
+1. Grant `TeamsAppInstallation.ReadWriteAndConsentForChat.All` (and
+   `…ReadWriteAndConsentForTeam.All` for team installs) **in addition to** the
+   plain role above, and admin-consent it.
+2. Send the consent. An installer with the consent-capable role must state
+   which resource-specific permissions it consents to
+   (`consentedPermissionSet` on the install body), and Graph requires that set
+   to match the app's own `teamsAppDefinition`.
+
+Since 0.8.2 the connector does (2) by itself, in **both** directions: before
+each install it reads the app's declared permissions back from Graph
+(`GET /appCatalogs/teamsApps?$filter=id eq '…'&$expand=appDefinitions($select=id,authorization)`)
+and consents to exactly that set. A caller may still pass its own
+`consentedPermissionSet`, which wins and skips the lookup. An app that declares
+no RSC is installed with the plain body, as before, and only then is the plain
+app role enough.
+
+The lookup rides on the `AppCatalog.ReadWrite.All` the chain already holds. If
+it is refused, the install still runs with the plain body and — when the app
+really needed consent — fails with `RscPermissionsMismatchError`, whose message
+distinguishes "the role cannot consent to the set we sent" from "no set could
+be resolved at all".
 
 ### The one delegated step: catalog upload (since 0.6.0)
 
@@ -267,8 +295,12 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 
 > For the Teams provisioning capability (`teamsProvisioner@1`) additionally
 > add: `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-> `TeamsAppInstallation.ReadWriteForTeam.All`, and — for chat installs, since
-> 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All`.
+> `TeamsAppInstallation.ReadWriteForTeam.All` +
+> `TeamsAppInstallation.ReadWriteAndConsentForTeam.All`, and — for chat
+> installs, since 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All` +
+> `TeamsAppInstallation.ReadWriteAndConsentForChat.All`. The `…AndConsent…`
+> pair is what lets an install carry the seven resource-specific permissions
+> our app packages declare.
 >
 > Extending an existing app registration requires **renewed admin consent**:
 > click **Grant admin consent for &lt;Tenant&gt;** again. If Graph still
@@ -280,8 +312,12 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 
 > Für die Teams-Provisionierung (`teamsProvisioner@1`) zusätzlich hinzufügen:
 > `Application.ReadWrite.OwnedBy`, `AppCatalog.ReadWrite.All`,
-> `TeamsAppInstallation.ReadWriteForTeam.All` und — für Chat-Installationen,
-> ab 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All`.
+> `TeamsAppInstallation.ReadWriteForTeam.All` +
+> `TeamsAppInstallation.ReadWriteAndConsentForTeam.All` und — für
+> Chat-Installationen, ab 0.7.0 — `TeamsAppInstallation.ReadWriteForChat.All`
+> + `TeamsAppInstallation.ReadWriteAndConsentForChat.All`. Erst das
+> `…AndConsent…`-Paar erlaubt der Installation, die sieben
+> ressourcenspezifischen Berechtigungen unserer App-Pakete mitzuführen.
 >
 > Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
 > **erneuten Admin-Consent**: **Grant admin consent for &lt;Tenant&gt;**

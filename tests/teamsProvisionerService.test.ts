@@ -406,7 +406,10 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         primitives (purge, catalog removal).
     // 0.8.1 — the legacy `19:…@thread.skype` group chat is an install target
     //         again; listChats had been offering chats classify refused.
-    assert.equal(pkg.version, '0.8.1');
+    // 0.8.2 — installs carry the app's declared resource-specific consent
+    //         (`consentedPermissionSet`) in BOTH directions; without it Graph
+    //         refuses every install of our seven-RSC packages.
+    assert.equal(pkg.version, '0.8.2');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
@@ -455,6 +458,11 @@ describe('manifest.yaml / package.json hub edits', () => {
       'TeamsAppInstallation.ReadWriteForTeam.All',
       // 0.7.0 — the chat install target.
       'TeamsAppInstallation.ReadWriteForChat.All',
+      // 0.8.2 — the consent-capable pair. Without them Graph refuses an
+      // install of a package that declares resource-specific permissions,
+      // which every generated package does.
+      'TeamsAppInstallation.ReadWriteAndConsentForTeam.All',
+      'TeamsAppInstallation.ReadWriteAndConsentForChat.All',
     ]) {
       const first = manifest.indexOf(`\`${scope}\``);
       const last = manifest.lastIndexOf(`\`${scope}\``);

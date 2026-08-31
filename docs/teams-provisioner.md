@@ -141,11 +141,57 @@ one of the [Teams protected APIs](https://learn.microsoft.com/en-us/graph/teams-
 **not** the `…SelfForChat.All` variant: that only lets an app install *itself*,
 and the provisioner installs the per-agent app it generated.
 
-No `consentedPermissionSet` parameter here, unlike `installToTeam`: Graph
-documents that this app role "cannot be used to install apps that require
-consent to resource-specific permissions", and the endpoint enforces it with
-**400 `ResourceSpecificPermissionsMismatch`**. RSC in chats would need
-`…ReadWriteAndConsentForChat.All`.
+### Resource-specific consent — both directions (since 0.8.2)
+
+Graph documents that the plain `…ReadWriteForChat.All` / `…ReadWriteForTeam.All`
+roles "cannot be used to install apps that require consent to resource-specific
+permissions", and enforces it with **400 `ResourceSpecificPermissionsMismatch`**.
+Our generated app packages declare seven RSC permissions, so every install is
+subject to that rule.
+
+Until 0.8.1 the two directions read this differently and both were wrong in
+practice. `installToTeam` offered an optional `consentedPermissionSet` that no
+caller ever filled; `installToChat` offered none at all, on the reasoning that
+the weak role could not consent anyway. The reasoning was right about the weak
+role and wrong about the outcome: once a tenant grants
+`…ReadWriteAndConsentForChat.All`, Graph *requires* the installer to state what
+it consents to, so omitting the field is itself the refusal. The team direction
+carried the identical bug — it had simply never run at a tenant that got that
+far.
+
+Since 0.8.2 **both** directions send the set, and neither asks the caller for
+it. Before the install the step reads the app's own declared permissions back
+from Graph:
+
+```
+GET /appCatalogs/teamsApps?$filter=id eq '{teamsAppId}'
+    &$expand=appDefinitions($select=id,authorization)
+→ value[].appDefinitions[].authorization.requiredPermissionSet
+                          .resourceSpecificPermissions
+```
+
+That is the query Graph's own install reference points at, and reading it back
+(rather than re-deriving it from the manifest template that built the package)
+guarantees the consented set matches the **published** definition — which is
+what Graph compares against. Entries go through verbatim, `delegated` ones
+included; filtering would create the very mismatch this avoids. `permissionType`
+is lower-cased, because Graph's own examples disagree about its casing while the
+enum members are lowercase.
+
+- A caller MAY pass `consentedPermissionSet` explicitly — it wins and skips the
+  lookup. An explicitly empty set means "send nothing".
+- An app that declares no RSC is installed with the plain body, as before.
+- A refused lookup (403/404) degrades to the plain body and logs why; it never
+  turns an install that used to work into an exception.
+- `400 ResourceSpecificPermissionsMismatch` becomes `RscPermissionsMismatchError`,
+  which reads differently depending on whether a set was actually carried:
+  *the role cannot consent to what we sent* is a different remedy from *no set
+  could be resolved*. It is never transient.
+
+Required app roles therefore become `…ReadWriteForChat.All` **plus**
+`…ReadWriteAndConsentForChat.All` (and the `…ForTeam` pair for team installs).
+The lookup itself rides on the `AppCatalog.ReadWrite.All` the chain already
+holds.
 
 **How "already installed" arrives — and what is actually known.** Graph's
 reference documents *no* failure response for this verb, only `201 Created`.
@@ -310,7 +356,8 @@ collision by design: `graphObo.ts` already exports `ConsentRequiredError`
 ## Credentials & scopes (issue #2 — config unit)
 
 Additional Graph **application** permissions: `Application.ReadWrite.OwnedBy`,
-`AppCatalog.ReadWrite.All`, `TeamsAppInstallation.ReadWriteForTeam.All`.
+`AppCatalog.ReadWrite.All`, `TeamsAppInstallation.ReadWriteForTeam.All`,
+`TeamsAppInstallation.ReadWriteAndConsentForTeam.All`.
 New setup fields: Azure subscription id, resource group, region, and a
 service-principal credential for `management.azure.com` (ARM). All ARM fields
 are optional — absence triggers registration-only mode, never a crash.

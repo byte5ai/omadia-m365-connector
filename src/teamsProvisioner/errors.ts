@@ -319,6 +319,72 @@ export class ChatNotFoundError extends TeamsProvisionerError {
 }
 
 /**
+ * Graph answered `400 ResourceSpecificPermissionsMismatch` to an install.
+ *
+ * NOT a generic bad request, and NOT a wrong target id: the install body is
+ * well-formed and the team/chat exists. What Graph refuses is the RSC consent
+ * itself — the app package declares resource-specific permissions, and either
+ * the installing identity's app role may not consent to them, or the
+ * `consentedPermissionSet` in the body does not match what the app's
+ * `teamsAppDefinition` declares.
+ *
+ * THE TWO CASES READ DIFFERENTLY ON PURPOSE, keyed by
+ * {@link sentPermissionCount}. A request that carried the set and was still
+ * refused points at the ROLE; a request that carried none points at the
+ * resolution that produced none. Reporting both as "grant the role" sent the
+ * operator to a portal blade that was already correct
+ * (byte5ai/omadia-m365-connector 0.8.2).
+ *
+ * Deterministic: no retry makes a missing grant appear, so it is excluded from
+ * {@link isTransientProvisioningFailure}.
+ */
+export class RscPermissionsMismatchError extends TeamsProvisionerError {
+  /** Which step was refused, e.g. `chats.installedApps.add`. */
+  public readonly step: string;
+  /** App role that lets THIS scope's install carry RSC consent. */
+  public readonly consentRole: string;
+  /**
+   * How many resource-specific permissions the request actually carried.
+   * `0` means the body had no `consentedPermissionSet` at all — a different
+   * situation with a different remedy, which is why the count is a field and
+   * not just prose.
+   */
+  public readonly sentPermissionCount: number;
+
+  constructor(
+    step: string,
+    consentRole: string,
+    sentPermissionCount: number,
+    graphDetail: string,
+    cause?: unknown,
+  ) {
+    super(
+      // Graph's own code stays in the text verbatim: consumers (the omadia
+      // middleware among them) duck-type on it rather than importing this
+      // class, so removing it would silently reclassify the failure.
+      `rsc_permissions_mismatch: '${step}' was refused with ` +
+        'ResourceSpecificPermissionsMismatch — ' +
+        (sentPermissionCount > 0
+          ? `the request DID carry a consentedPermissionSet of ${String(sentPermissionCount)} ` +
+            'resource-specific permission(s) read from the app package itself, so the ' +
+            `set is not what is missing: the installing identity may not consent to it. Grant the app role ${consentRole} ` +
+            'and admin-consent it in the customer tenant'
+          : 'the app package declares resource-specific permissions but NO ' +
+            'consentedPermissionSet could be resolved for it — the catalog ' +
+            'lookup of the app definition returned none (see the log line ' +
+            `above). Grant ${consentRole} AND AppCatalog.ReadWrite.All, then ` +
+            're-run provisioning') +
+        `. Graph said: ${graphDetail}`,
+      cause,
+    );
+    this.name = 'RscPermissionsMismatchError';
+    this.step = step;
+    this.consentRole = consentRole;
+    this.sentPermissionCount = sentPermissionCount;
+  }
+}
+
+/**
  * The identifier handed to an install step names a Teams scope the step cannot
  * act on — a channel id passed to the chat install, a team GUID passed to the
  * chat install, or a shape that is no Teams identifier at all.
@@ -635,6 +701,9 @@ export function isTransientProvisioningFailure(err: unknown): boolean {
   // id. Listed explicitly so neither leans on the message-pattern fallback.
   if (err instanceof ChatNotFoundError) return false;
   if (err instanceof InstallTargetMismatchError) return false;
+  // A refused RSC consent is a tenant-side role grant, not a hiccup: replaying
+  // the identical install cannot make the grant appear.
+  if (err instanceof RscPermissionsMismatchError) return false;
   // Every delegated-auth failure needs a DIFFERENT action (sign in, consent,
   // refresh) — none of them is fixed by replaying the identical call, so they
   // are listed explicitly rather than left to the message-pattern fallback

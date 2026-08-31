@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 
 import {
+  CHAT_INSTALL_CONSENT_SCOPE,
   CHAT_INSTALL_SCOPE,
   ChatInstallClient,
 } from '../src/teamsProvisioner/install.js';
@@ -12,6 +13,7 @@ import {
   InstallTargetMismatchError,
   ProvisioningRequestError,
   ProvisioningThrottledError,
+  RscPermissionsMismatchError,
   TeamsProvisionerError,
   isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
@@ -102,6 +104,40 @@ const INSTALLATION_ID = 'NmFiOTZlZm-installation-id';
 const CHAT_PATH = `/chats/${encodeURIComponent(CHAT_ID)}/installedApps`;
 const CHAT_URL = `https://graph.microsoft.com/v1.0${CHAT_PATH}`;
 
+/**
+ * The catalog lookup every install now makes first (0.8.2) — the app's OWN
+ * declared RSC permissions, which Graph requires the install to consent to.
+ *
+ * The DEFAULT answer declares none, so a test that says nothing about RSC
+ * still describes the pre-0.8.2 body shape exactly: an app without
+ * resource-specific permissions is installed without a `consentedPermissionSet`.
+ * A test that cares routes `RSC_LOOKUP_MATCH` itself and wins, because
+ * explicit routes are matched before this fallback.
+ */
+const RSC_LOOKUP_MATCH = '/appCatalogs/teamsApps?';
+
+const rscLookupRoute = (
+  permissions: readonly { permissionValue: string; permissionType: string }[],
+): Route =>
+  route(RSC_LOOKUP_MATCH, {
+    status: 200,
+    body: {
+      value: [
+        {
+          id: TEAMS_APP_ID,
+          appDefinitions: [
+            {
+              id: 'definition-1',
+              authorization: {
+                requiredPermissionSet: { resourceSpecificPermissions: permissions },
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+
 function harness(routes: Route[]): {
   client: ChatInstallClient;
   calls: FetchCall[];
@@ -115,7 +151,7 @@ function harness(routes: Route[]): {
       clientId: 'app-graph',
       clientSecret: 'graph-secret-value',
     },
-    fetchImpl: mockFetch(routes, calls),
+    fetchImpl: mockFetch([...routes, rscLookupRoute([])], calls),
     log: () => {},
     sleep: async (ms) => {
       sleeps.push(ms);
@@ -126,9 +162,21 @@ function harness(routes: Route[]): {
   return { client, calls, sleeps };
 }
 
-/** Graph calls only (token POSTs filtered out). */
+/**
+ * The install/uninstall Graph calls: token POSTs filtered out, and so is the
+ * RSC lookup of 0.8.2 — every assertion below counts calls against the
+ * `installedApps` collection, which is what the step is actually about.
+ */
 function graphCalls(calls: FetchCall[]): FetchCall[] {
-  return calls.filter((c) => c.url.includes('graph.microsoft.com'));
+  return calls.filter(
+    (c) =>
+      c.url.includes('graph.microsoft.com') && !c.url.includes(RSC_LOOKUP_MATCH),
+  );
+}
+
+/** The RSC lookups a run made — 0 when an explicit set skipped the query. */
+function rscLookups(calls: FetchCall[]): FetchCall[] {
+  return calls.filter((c) => c.url.includes(RSC_LOOKUP_MATCH));
 }
 
 function parsedBody(call: FetchCall): Record<string, unknown> {
@@ -181,7 +229,8 @@ describe('ChatInstallClient.installToChat', () => {
       body['teamsApp@odata.bind'],
       `https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/${TEAMS_APP_ID}`,
     );
-    // The chat scope cannot consent RSC — the key must never appear.
+    // This app declares no RSC, so there is nothing to consent to and the
+    // key must not appear — not even as null (0.8.2).
     assert.ok(!('consentedPermissionSet' in body));
     const headers = call.init?.headers as Record<string, string>;
     assert.equal(headers['Authorization'], 'Bearer tok');
@@ -293,10 +342,181 @@ describe('ChatInstallClient.installToChat — already installed is idempotent', 
   });
 
   it('does NOT swallow an ordinary 400 — the leniency is duplicate-only', async () => {
-    // The real 400 this endpoint is known to answer: the app declares RSC
-    // permissions the caller's app role cannot consent to. It must stay a
-    // failure — reporting it as 'already-existed' would claim an install that
-    // never happened.
+    // A 400 that is neither a duplicate nor an RSC mismatch stays the generic
+    // typed request failure. Reporting it as 'already-existed' would claim an
+    // install that never happened.
+    const { client } = harness([
+      route(CHAT_PATH, {
+        status: 400,
+        body: {
+          error: { code: 'BadRequest', message: 'Invalid request payload.' },
+        },
+      }),
+    ]);
+
+    await assert.rejects(
+      client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ProvisioningRequestError);
+        assert.equal(err.status, 400);
+        assert.equal(err.step, 'chats.installedApps.add');
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Resource-specific consent (0.8.2) — the field failure this release fixes.
+//
+// The chat install used to send no `consentedPermissionSet` at all, on the
+// reading that the weak `…ReadWriteForChat.All` role could not consent to RSC
+// anyway. True about the weak role, wrong about the strong one: with
+// `…ReadWriteAndConsentForChat.All` granted, Graph REQUIRES the installer to
+// state what it consents to, and refuses the install without it. What the
+// install consents to is the app's OWN declared set, read back from Graph.
+// ---------------------------------------------------------------------------
+
+const DECLARED_RSC = [
+  { permissionValue: 'ChatMessage.Read.Chat', permissionType: 'application' },
+  { permissionValue: 'TeamsActivity.Send.Chat', permissionType: 'application' },
+  { permissionValue: 'ChannelMeeting.ReadBasic.Group', permissionType: 'delegated' },
+];
+
+describe('ChatInstallClient.installToChat — resource-specific consent', () => {
+  it('reads the declared RSC permissions of the app and consents verbatim', async () => {
+    const { client, calls } = harness([
+      route(CHAT_PATH, { status: 201, body: { id: INSTALLATION_ID } }),
+      rscLookupRoute(DECLARED_RSC),
+    ]);
+
+    const result = await client.installToChat({
+      chatId: CHAT_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    assert.equal(result.outcome, 'created');
+
+    const [lookup] = rscLookups(calls);
+    assert.ok(lookup, 'expected the catalog lookup of the declared permissions');
+    assert.equal(lookup.init?.method, 'GET');
+    // Graph's own documented query for "which RSC does this app require".
+    assert.ok(lookup.url.includes(encodeURIComponent(`id eq '${TEAMS_APP_ID}'`)));
+    assert.ok(
+      lookup.url.includes(
+        encodeURIComponent('appDefinitions($select=id,authorization)'),
+      ),
+    );
+
+    const [install] = graphCalls(calls);
+    assert.ok(install);
+    // Delegated entries ride along untouched: the docs require the consented
+    // set to MATCH what the app declares, so filtering would be the mismatch.
+    assert.deepEqual(parsedBody(install)['consentedPermissionSet'], {
+      resourceSpecificPermissions: DECLARED_RSC,
+    });
+  });
+
+  it('normalises the permissionType casing Graph is inconsistent about', async () => {
+    const { client, calls } = harness([
+      route(CHAT_PATH, { status: 201, body: { id: INSTALLATION_ID } }),
+      rscLookupRoute([
+        { permissionValue: 'ChatMember.Read.Chat', permissionType: 'Application' },
+      ]),
+    ]);
+
+    await client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID });
+
+    const [install] = graphCalls(calls);
+    assert.ok(install);
+    assert.deepEqual(parsedBody(install)['consentedPermissionSet'], {
+      resourceSpecificPermissions: [
+        { permissionValue: 'ChatMember.Read.Chat', permissionType: 'application' },
+      ],
+    });
+  });
+
+  it('prefers an explicit set and then makes no lookup at all', async () => {
+    const explicit = {
+      resourceSpecificPermissions: [
+        {
+          permissionValue: 'ChannelMessage.Read.Group',
+          permissionType: 'application' as const,
+        },
+      ],
+    };
+    const { client, calls } = harness([
+      route(CHAT_PATH, { status: 201, body: { id: INSTALLATION_ID } }),
+      rscLookupRoute(DECLARED_RSC),
+    ]);
+
+    await client.installToChat({
+      chatId: CHAT_ID,
+      teamsAppId: TEAMS_APP_ID,
+      consentedPermissionSet: explicit,
+    });
+
+    assert.equal(rscLookups(calls).length, 0);
+    const [install] = graphCalls(calls);
+    assert.ok(install);
+    assert.deepEqual(parsedBody(install)['consentedPermissionSet'], explicit);
+  });
+
+  it('ignores a catalog entry whose id is not the app being installed', async () => {
+    // A tenant that ignores the $filter must not be able to make us consent to
+    // a DIFFERENT app's permissions — the same client-side re-check the
+    // installation lookup does.
+    const { client, calls } = harness([
+      route(CHAT_PATH, { status: 201, body: { id: INSTALLATION_ID } }),
+      route(RSC_LOOKUP_MATCH, {
+        status: 200,
+        body: {
+          value: [
+            {
+              id: 'some-other-catalog-app',
+              appDefinitions: [
+                {
+                  id: 'definition-1',
+                  authorization: {
+                    requiredPermissionSet: {
+                      resourceSpecificPermissions: DECLARED_RSC,
+                    },
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    await client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID });
+
+    const [install] = graphCalls(calls);
+    assert.ok(install);
+    assert.ok(!('consentedPermissionSet' in parsedBody(install)));
+  });
+
+  it('degrades to the plain body when the lookup is refused (403)', async () => {
+    const { client, calls } = harness([
+      route(CHAT_PATH, { status: 201, body: { id: INSTALLATION_ID } }),
+      route(RSC_LOOKUP_MATCH, { status: 403, body: { error: { code: 'Forbidden' } } }),
+    ]);
+
+    const result = await client.installToChat({
+      chatId: CHAT_ID,
+      teamsAppId: TEAMS_APP_ID,
+    });
+
+    // A missing AppCatalog.ReadWrite.All must not turn an install that used to
+    // work into an exception — it degrades, and the RSC error below says so.
+    assert.equal(result.outcome, 'created');
+    const [install] = graphCalls(calls);
+    assert.ok(install);
+    assert.ok(!('consentedPermissionSet' in parsedBody(install)));
+  });
+
+  it('maps 400 ResourceSpecificPermissionsMismatch to its own typed error', async () => {
     const { client } = harness([
       route(CHAT_PATH, {
         status: 400,
@@ -308,14 +528,81 @@ describe('ChatInstallClient.installToChat — already installed is idempotent', 
           },
         },
       }),
+      rscLookupRoute(DECLARED_RSC),
     ]);
 
     await assert.rejects(
       client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID }),
       (err: unknown) => {
-        assert.ok(err instanceof ProvisioningRequestError);
-        assert.equal(err.status, 400);
+        assert.ok(err instanceof RscPermissionsMismatchError);
         assert.equal(err.step, 'chats.installedApps.add');
+        assert.equal(err.consentRole, CHAT_INSTALL_CONSENT_SCOPE);
+        // The set WAS carried — so the remedy is the role, not the set.
+        assert.equal(err.sentPermissionCount, DECLARED_RSC.length);
+        assert.ok(err.message.includes('DID carry a consentedPermissionSet'));
+        assert.ok(err.message.includes(CHAT_INSTALL_CONSENT_SCOPE));
+        // Graph's own code survives into the text: consumers duck-type on it.
+        assert.ok(err.message.includes('ResourceSpecificPermissionsMismatch'));
+        // A tenant-side grant is never fixed by replaying the same call.
+        assert.equal(isTransientProvisioningFailure(err), false);
+        return true;
+      },
+    );
+  });
+
+  it('reads differently when NO set could be resolved — a different remedy', async () => {
+    const { client } = harness([
+      route(CHAT_PATH, {
+        status: 400,
+        body: {
+          error: {
+            code: 'ResourceSpecificPermissionsMismatch',
+            message: 'The app requires resource-specific permissions.',
+          },
+        },
+      }),
+      route(RSC_LOOKUP_MATCH, { status: 403, body: { error: { code: 'Forbidden' } } }),
+    ]);
+
+    await assert.rejects(
+      client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof RscPermissionsMismatchError);
+        assert.equal(err.sentPermissionCount, 0);
+        assert.ok(err.message.includes('NO'));
+        assert.ok(err.message.includes('AppCatalog.ReadWrite.All'));
+        return true;
+      },
+    );
+  });
+
+  it('asks for the consent-capable role on 403 only when it consents to something', async () => {
+    const withRsc = harness([
+      route(CHAT_PATH, { status: 403, body: { error: { code: 'Forbidden' } } }),
+      rscLookupRoute(DECLARED_RSC),
+    ]);
+    await assert.rejects(
+      withRsc.client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConsentMissingError);
+        assert.deepEqual(err.missingScopes, [
+          CHAT_INSTALL_SCOPE,
+          CHAT_INSTALL_CONSENT_SCOPE,
+        ]);
+        return true;
+      },
+    );
+
+    // No RSC declared → the plain role is all the call needs, and asking for
+    // more would have an operator grant a wider role than the install uses.
+    const withoutRsc = harness([
+      route(CHAT_PATH, { status: 403, body: { error: { code: 'Forbidden' } } }),
+    ]);
+    await assert.rejects(
+      withoutRsc.client.installToChat({ chatId: CHAT_ID, teamsAppId: TEAMS_APP_ID }),
+      (err: unknown) => {
+        assert.ok(err instanceof ConsentMissingError);
+        assert.deepEqual(err.missingScopes, [CHAT_INSTALL_SCOPE]);
         return true;
       },
     );
