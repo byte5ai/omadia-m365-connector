@@ -13,6 +13,7 @@
  * |---------------------------|-------------------|--------------------|
  * | `xxxxxxxx-xxxx-…` (GUID)  | team (group id)   | yes — via a team   |
  * | `19:…@thread.v2`          | group chat        | yes — via a chat   |
+ * | `19:…@thread.skype`       | group chat (old)  | yes — via a chat   |
  * | `19:…@unq.gbl.spaces`     | 1:1 chat          | yes — via a chat   |
  * | `19:…@thread.tacv2`       | CHANNEL           | NO                 |
  * | anything else             | unknown           | no                 |
@@ -23,6 +24,30 @@
  * Graph buys a bare 404 that says nothing about the actual mistake. So
  * {@link classifyInstallTarget} names it and {@link ChannelTarget.hint} says
  * what to paste instead.
+ *
+ * `@thread.skype` IS A GROUP CHAT, AND THAT REPLACES AN EARLIER GUESS.
+ * Until 0.8.1 this module answered `'unknown'` for `19:…@thread.skype` and
+ * said, in its own hint, that "the Graph /chats resource does not accept it".
+ * That sentence was written from ONE observation — a `400` from
+ * `GET /chats/{id}` during the 0.19.2 name-resolution work — and generalised
+ * into a rule. {@link InstallTargetsClient.listChats} disproved it:
+ * `GET /me/chats` returns these ids with `chatType: 'group'` and a member
+ * roster, which is Graph itself calling them chats.
+ *
+ * `@thread.skype` is simply the OLD spelling. Teams threads minted before the
+ * `v2` split all carry it; the split later gave channels `@thread.tacv2` and
+ * group chats `@thread.v2`, and everything older kept the original suffix. So
+ * a legacy id is read as the kind of thing Graph listed it as, and the one
+ * shape this module still refuses on sight stays the one with a wider blast
+ * radius than the operator asked for — a channel.
+ *
+ * A caveat this module cannot resolve, and does not pretend to: a legacy
+ * CHANNEL id also ends `@thread.skype`, and no part of the string separates
+ * the two. Reading it as a chat is the cheap way to be wrong — the id reaches
+ * `POST /chats/{id}/installedApps`, which cannot install into a team, so the
+ * mistake costs one refused Graph call. Reading it as a channel is the
+ * expensive way to be wrong: it blocks a chat the operator can see in their
+ * own picker, which is the failure this change exists to end.
  *
  * THE AMBIGUITY IS ALSO THE POINT (byte5 field test). A bare 32-hex string
  * such as `abc8af8ec7fc471785d3b83c4d84b667` — no dashes, no `19:` prefix, no
@@ -111,6 +136,9 @@ const BARE_32_HEX = /^[0-9a-f]{32}$/i;
  * Suffix table, ordered longest-discriminator-first. `@thread.tacv2` must be
  * tested before `@thread.v2`; the anchored patterns cannot overlap, but the
  * ordering keeps that independent of regex subtleties.
+ *
+ * `@thread.skype` is the pre-`v2` spelling of a group chat thread — see the
+ * module header for why it stopped being `'unknown'` in 0.8.1.
  */
 const SUFFIX_PATTERNS: readonly {
   readonly pattern: RegExp;
@@ -118,17 +146,9 @@ const SUFFIX_PATTERNS: readonly {
 }[] = [
   { pattern: /^19:.+@thread\.tacv2$/i, kind: 'channel' },
   { pattern: /^19:.+@thread\.v2$/i, kind: 'group-chat' },
+  { pattern: /^19:.+@thread\.skype$/i, kind: 'group-chat' },
   { pattern: /^19:.+@unq\.gbl\.spaces$/i, kind: 'one-on-one-chat' },
 ];
-
-/**
- * Legacy Skype-interop threads. Teams shows them like chats, but the Graph
- * `/chats` resource does not accept them — a `19:…@thread.skype` id answers
- * 400 there rather than resolving (byte5 field test, omadia teams 0.19.2).
- * Classified `'unknown'` like any other unrecognised shape; the hint is what
- * differs, because "not a chat id" is a much shorter search than "400".
- */
-const SKYPE_THREAD = /^19:.+@thread\.skype$/i;
 
 const CHANNEL_HINT =
   'this is a CHANNEL id (`@thread.tacv2`). A Teams app is not installed into ' +
@@ -143,14 +163,10 @@ const AMBIGUOUS_HINT =
   'Re-enter it in full form: dashed (8-4-4-4-12) for a team, or ' +
   '`19:<value>@thread.v2` for a group chat.';
 
-const SKYPE_HINT =
-  'this is a legacy Skype-interop thread (`@thread.skype`). Teams renders it ' +
-  'like a chat, but the Graph /chats resource does not accept it — it is not ' +
-  'an install target. Use a `19:…@thread.v2` group chat or a team id.';
-
 const UNKNOWN_HINT =
   'not a recognised Teams identifier. Expected a team id (dashed GUID), a ' +
-  'group chat (`19:…@thread.v2`) or a 1:1 chat (`19:…@unq.gbl.spaces`).';
+  'group chat (`19:…@thread.v2`, or `19:…@thread.skype` for one created ' +
+  'before the v2 split) or a 1:1 chat (`19:…@unq.gbl.spaces`).';
 
 /**
  * Classify an operator-supplied install target by its SHAPE.
@@ -189,11 +205,7 @@ export function classifyInstallTarget(value: string): InstallTarget {
     };
   }
 
-  return {
-    kind: 'unknown',
-    value: trimmed,
-    hint: SKYPE_THREAD.test(trimmed) ? SKYPE_HINT : UNKNOWN_HINT,
-  };
+  return { kind: 'unknown', value: trimmed, hint: UNKNOWN_HINT };
 }
 
 /** Does this classification name something an app can be installed INTO a chat? */

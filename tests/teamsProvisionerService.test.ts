@@ -404,7 +404,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     // 0.7.0 — chat install/uninstall + install-target classification.
     // 0.8.0 — install-target ENUMERATION (listTeams/listChats) + the reset
     //         primitives (purge, catalog removal).
-    assert.equal(pkg.version, '0.8.0');
+    // 0.8.1 — the legacy `19:…@thread.skype` group chat is an install target
+    //         again; listChats had been offering chats classify refused.
+    assert.equal(pkg.version, '0.8.1');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
