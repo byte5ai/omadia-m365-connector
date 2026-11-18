@@ -9,6 +9,9 @@
  *   createInvitation  POST /users/{organiser}/events
  *   sendMail          POST /users/{organiser}/sendMail
  *
+ * `freeBusy` sends one getSchedule request per 20 attendees and refuses a
+ * window of 62 days or more (both are documented Graph limits).
+ *
  * Order of checks in every operation, all before any Graph request:
  *   1. everyone the call names is inside `grant.allowed`, else
  *      `recipient_not_allowed` for the whole call;
@@ -59,6 +62,11 @@ const NOT_BUSY_STATUSES: ReadonlySet<string> = new Set(['free', 'workingElsewher
 /** An instant with an explicit offset; a local time would be ambiguous. */
 const INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+/** Documented getSchedule limit: schedules per request. */
+const MAX_SCHEDULES_PER_REQUEST = 20;
+/** Documented getSchedule limit: the window has to stay below 62 days. */
+const MAX_FREE_BUSY_WINDOW_DAYS = 62;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const MAX_ERROR_DETAIL_LENGTH = 200;
 const MAX_LOGGED_ID_LENGTH = 80;
 
@@ -149,28 +157,42 @@ export function createFacilitationFollowupService(
   return {
     async freeBusy(grant, request) {
       const prepared = prepare(request.attendees, grant, () =>
-        toUtcWindow(request.from, request.to, 'from', 'to'),
+        toUtcWindow(request.from, request.to, 'from', 'to', MAX_FREE_BUSY_WINDOW_DAYS),
       );
       if (!prepared.ready) {
         audit('freeBusy', grant, countOf(request.attendees), prepared.refusal.code);
         return prepared.refusal;
       }
-      const response = await post(
-        'getSchedule',
-        prepared.mailbox,
-        {
-          schedules: prepared.addresses,
-          startTime: { dateTime: prepared.value.start, timeZone: UTC },
-          endTime: { dateTime: prepared.value.end, timeZone: UTC },
-        },
-        PREFER_UTC_HEADER,
-      );
-      if ('outcome' in response) {
-        audit('freeBusy', grant, prepared.addresses.length, response.code);
-        return response;
+      // One request per 20 schedules, one after the other. A failed request
+      // fails the lookup (it has no side effect, so the caller can repeat it);
+      // a single unresolvable schedule inside an answer does not.
+      const busy: { attendee: string; intervals: Interval[] }[] = [];
+      for (const schedules of chunk(prepared.addresses, MAX_SCHEDULES_PER_REQUEST)) {
+        const response = await post(
+          'getSchedule',
+          prepared.mailbox,
+          {
+            schedules,
+            startTime: { dateTime: prepared.value.start, timeZone: UTC },
+            endTime: { dateTime: prepared.value.end, timeZone: UTC },
+          },
+          PREFER_UTC_HEADER,
+        );
+        if ('outcome' in response) {
+          audit('freeBusy', grant, prepared.addresses.length, response.code);
+          return response;
+        }
+        busy.push(...readBusy(response.json, schedules));
       }
-      audit('freeBusy', grant, prepared.addresses.length, 'ok');
-      return { outcome: 'ok', busy: readBusy(response.json, prepared.addresses) };
+      audit(
+        'freeBusy',
+        grant,
+        prepared.addresses.length,
+        busy.length === prepared.addresses.length
+          ? 'ok'
+          : `ok_unknown=${String(prepared.addresses.length - busy.length)}`,
+      );
+      return { outcome: 'ok', busy };
     },
 
     async createInvitation(grant, request) {
@@ -208,7 +230,16 @@ export function createFacilitationFollowupService(
         return refuse('provider_error', 'graph createEvent answered without an event id');
       }
       const joinUrl = asRecord(created?.['onlineMeeting'])?.['joinUrl'];
-      audit('createInvitation', grant, prepared.addresses.length, 'created');
+      // An online meeting was asked for and Graph created the event without a
+      // link. The contract has no code for that: the event exists, so this is
+      // `created` without `joinUrl`, and the audit line names it.
+      const isLinkMissing = request.online === true && !isNonEmptyString(joinUrl);
+      audit(
+        'createInvitation',
+        grant,
+        prepared.addresses.length,
+        isLinkMissing ? 'created_without_join_url' : 'created',
+      );
       return {
         outcome: 'created',
         eventId,
@@ -260,12 +291,16 @@ function toUtcWindow(
   endInput: string,
   startName: string,
   endName: string,
+  maxDays?: number,
 ): { start: string; end: string } | string {
   const start = parseInstant(startInput);
   if (start === undefined) return `${startName} is not an ISO 8601 instant with an offset`;
   const end = parseInstant(endInput);
   if (end === undefined) return `${endName} is not an ISO 8601 instant with an offset`;
   if (end <= start) return `${endName} is not after ${startName}`;
+  if (maxDays !== undefined && end - start >= maxDays * MS_PER_DAY) {
+    return `the window from ${startName} to ${endName} has to be shorter than ${String(maxDays)} days`;
+  }
   return { start: toGraphDateTime(start), end: toGraphDateTime(end) };
 }
 
@@ -369,6 +404,12 @@ function safeDetail(text: string): string {
 
 function loggableId(id: unknown): string {
   return truncate(String(id).replace(/[^\w.:-]/g, '_'), MAX_LOGGED_ID_LENGTH);
+}
+
+function chunk<T>(items: readonly T[], size: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < items.length; i += size) chunks.push(items.slice(i, i + size));
+  return chunks;
 }
 
 function countOf(list: unknown): number {

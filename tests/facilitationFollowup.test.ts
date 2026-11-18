@@ -231,6 +231,72 @@ describe('freeBusy', () => {
     assert.deepEqual(result, { outcome: 'ok', busy: [{ attendee: ANNA, intervals: [] }] });
   });
 
+  it('asks in chunks of 20 schedules and joins the answers', async () => {
+    const people = Array.from({ length: 45 }, (_, i) => `p${String(i)}@contoso.example`);
+    const graph = fakeGraph((call) => ({
+      status: 200,
+      body: {
+        value: (call.body as { schedules: string[] }).schedules.map((scheduleId) => ({
+          scheduleId,
+          scheduleItems: [],
+        })),
+      },
+    }));
+    const result = await serviceOn(graph).freeBusy(
+      { facilitationId: 'fac-42', allowed: people },
+      { attendees: people, from: '2026-11-20T08:00:00Z', to: '2026-11-20T17:00:00Z' },
+    );
+
+    assert.deepEqual(
+      graph.graphCalls.map((c) => (c.body as { schedules: string[] }).schedules.length),
+      [20, 20, 5],
+    );
+    assert.equal(result.outcome, 'ok');
+    if (result.outcome !== 'ok') return;
+    assert.deepEqual(result.busy.map((b) => b.attendee), people);
+  });
+
+  it('a failing chunk fails the lookup', async () => {
+    const people = Array.from({ length: 21 }, (_, i) => `p${String(i)}@contoso.example`);
+    let calls = 0;
+    const graph = fakeGraph(() => {
+      calls += 1;
+      return calls === 1
+        ? { status: 200, body: { value: [] } }
+        : { status: 429, body: { error: { code: 'ApplicationThrottled', message: 'slow down' } } };
+    });
+    const result = await serviceOn(graph).freeBusy(
+      { facilitationId: 'fac-42', allowed: people },
+      { attendees: people, from: '2026-11-20T08:00:00Z', to: '2026-11-20T17:00:00Z' },
+    );
+    assert.equal(result.outcome === 'refused' && result.code, 'provider_error');
+  });
+
+  it('refuses a window of 62 days or more without a request', async () => {
+    const graph = fakeGraph(failIfCalled);
+    const service = serviceOn(graph);
+    const tooLong = await service.freeBusy(GRANT, {
+      attendees: [ANNA],
+      from: '2026-11-01T00:00:00Z',
+      to: '2027-01-02T00:00:00Z',
+    });
+    assert.equal(tooLong.outcome, 'refused');
+    if (tooLong.outcome !== 'refused') return;
+    assert.equal(tooLong.code, 'provider_error');
+    assert.match(tooLong.message, /shorter than 62 days/);
+    assert.equal(graph.graphCalls.length + graph.tokenCalls.length, 0);
+  });
+
+  it('accepts a window just below 62 days', async () => {
+    const graph = fakeGraph(() => ({ status: 200, body: { value: [] } }));
+    const result = await serviceOn(graph).freeBusy(GRANT, {
+      attendees: [ANNA],
+      from: '2026-11-01T00:00:00Z',
+      to: '2027-01-01T23:59:00Z',
+    });
+    assert.equal(result.outcome, 'ok');
+  });
+
   it('refuses a window without an offset or with the end before the start, without a request', async () => {
     const graph = fakeGraph(failIfCalled);
     const service = serviceOn(graph);
@@ -301,6 +367,24 @@ describe('createInvitation', () => {
     const body = graph.graphCalls[0]!.body as Record<string, unknown>;
     assert.equal(body['isOnlineMeeting'], true);
     assert.equal(body['onlineMeetingProvider'], 'teamsForBusiness');
+  });
+
+  it('an online meeting that comes back without a link is created without joinUrl, and audited as such', async () => {
+    const logs: string[] = [];
+    const graph = fakeGraph(() => ({
+      status: 201,
+      body: { id: 'AAMkAGI=', isOnlineMeeting: false, onlineMeeting: null },
+    }));
+    const result = await serviceOn(graph, undefined, logs).createInvitation(GRANT, {
+      ...request,
+      online: true,
+    });
+
+    assert.deepEqual(result, { outcome: 'created', eventId: 'AAMkAGI=' });
+    assert.ok(!('joinUrl' in result), 'no joinUrl key, so the caller can tell');
+    assert.deepEqual(logs, [
+      '[microsoft365] facilitation.followup op=createInvitation facilitation=fac-42 people=2 outcome=created_without_join_url',
+    ]);
   });
 
   it('reports a Graph refusal as provider_error with status and code', async () => {

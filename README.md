@@ -129,9 +129,10 @@ The connector also publishes `facilitation.followup` (capability
 `facilitation.followup@1`): free/busy as busy intervals only, event
 invitations, and protocol mail, for the people a facilitation's grant lists
 and nobody else. It runs app-only from one organiser mailbox you set in the
-optional setup field `facilitation_organizer_mailbox`, needs the application
-permissions `Calendars.ReadWrite` and `Mail.Send`, and never reads mailbox or
-calendar contents. Setup, least-privilege options and a manual verification
+optional setup field `facilitation_organizer_mailbox` and never reads mailbox
+or calendar contents. An administrator has to grant `Calendars.ReadWrite` and
+`Mail.Send` first, preferably with Exchange Online RBAC for Applications
+scoped to that mailbox and not in Entra ID as well. The steps and the owner
 checklist are in [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
 The permissions and consent steps are taken from Microsoft's documentation and
 have not been verified against a tenant.

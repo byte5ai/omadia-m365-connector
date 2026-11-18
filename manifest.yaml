@@ -142,18 +142,21 @@ setup:
 
       A native facilitator can send the confirmed protocol and schedule the
       follow-up meetings a group agreed on (`facilitation.followup@1`). It does
-      so from ONE mailbox you name in the field **Facilitation organiser
-      mailbox** — a shared or dedicated mailbox, not a person's. Leave the
+      so from ONE mailbox you name in the field **Organisator-Postfach für
+      Facilitation** — a licensed user mailbox created for this purpose, not a
+      person's own (a shared mailbox is unproven). Leave the
       field empty and the capability answers "not configured"; nothing else
       changes.
 
-      Application permissions needed: `Calendars.ReadWrite` (free/busy lookup
-      and creating the invitation) and `Mail.Send` (protocol mail). Both are
-      tenant-wide by default. Restrict the app to the organiser mailbox with
-      Exchange Online **RBAC for Applications** (or a legacy application access
-      policy) — see `docs/facilitation-followup.md` for the steps. The
+      An administrator has to grant two roles first: `Calendars.ReadWrite`
+      (free/busy lookup and creating the invitation) and `Mail.Send` (protocol
+      mail). Grant them with Exchange Online **RBAC for Applications**, scoped
+      to the organiser mailbox — four PowerShell steps, in
+      `docs/facilitation-followup.md`. Do NOT also grant the same permissions
+      in Entra ID: that grant is tenant-wide and would undo the scope. The
       connector itself only ever calls the organiser mailbox and never reads
-      mail or calendar contents.
+      mail or calendar contents. These steps come from Microsoft's
+      documentation and are not yet verified against a tenant.
 
       Extending an existing app registration requires **renewed admin consent**:
       click **Grant admin consent for <Tenant>** again. If Graph still
@@ -257,17 +260,21 @@ setup:
       Ein nativer Facilitator kann das bestätigte Protokoll verschicken und die
       vereinbarten Folgetermine anlegen (`facilitation.followup@1`). Er tut das
       aus GENAU EINEM Postfach, das ihr im Feld **Organisator-Postfach für
-      Facilitation** angebt — ein geteiltes oder eigens angelegtes Postfach,
-      nicht das einer Person. Bleibt das Feld leer, meldet die Funktion "nicht
+      Facilitation** angebt — ein eigens angelegtes, lizenziertes
+      Benutzerpostfach, nicht das einer Person (ein geteiltes Postfach ist
+      nicht erprobt). Bleibt das Feld leer, meldet die Funktion "nicht
       konfiguriert"; sonst ändert sich nichts.
 
-      Nötige Application-Permissions: `Calendars.ReadWrite` (Frei/Gebucht und
-      Anlegen der Einladung) und `Mail.Send` (Protokoll-Mail). Beide gelten
-      zunächst mandantenweit. Beschränkt die App mit **RBAC for Applications**
-      in Exchange Online (oder einer älteren Application Access Policy) auf das
-      Organisator-Postfach — die Schritte stehen in
-      `docs/facilitation-followup.md`. Der Connector selbst ruft nur das
-      Organisator-Postfach auf und liest nie Mail- oder Kalenderinhalte.
+      Vorher muss ein Administrator zwei Rollen vergeben: `Calendars.ReadWrite`
+      (Frei/Gebucht und Anlegen der Einladung) und `Mail.Send`
+      (Protokoll-Mail). Vergebt sie mit **RBAC for Applications** in Exchange
+      Online, beschränkt auf das Organisator-Postfach — vier
+      PowerShell-Schritte, siehe `docs/facilitation-followup.md`. Dieselben
+      Berechtigungen NICHT zusätzlich in Entra ID vergeben: diese Vergabe gilt
+      mandantenweit und hebt die Beschränkung auf. Der Connector selbst ruft
+      nur das Organisator-Postfach auf und liest nie Mail- oder
+      Kalenderinhalte. Die Schritte stammen aus der Microsoft-Dokumentation
+      und sind noch nicht an einem Tenant geprüft.
 
       Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
       **erneuten Admin-Consent**: **Grant admin consent for <Tenant>**
@@ -302,7 +309,7 @@ setup:
     - key: "facilitation_organizer_mailbox"
       type: "string"
       label: "Organisator-Postfach für Facilitation"
-      help: "Postfach, aus dem native Facilitatoren Protokolle versenden und Folgetermine anlegen (am besten ein eigenes, geteiltes Postfach). Leer lassen, wenn Facilitatoren weder Mail noch Kalender nutzen sollen."
+      help: "Postfach, aus dem native Facilitatoren Protokolle versenden und Folgetermine anlegen (am besten ein eigens angelegtes, lizenziertes Benutzerpostfach). Leer lassen, wenn Facilitatoren weder Mail noch Kalender nutzen sollen."
       required: false
       pattern: "^[^@ ]+@[^@ ]+[.][^@ ]+$"
     # --- teamsProvisioner@1: OPTIONAL ARM fields ---------------------------

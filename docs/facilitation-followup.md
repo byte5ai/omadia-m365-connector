@@ -44,19 +44,32 @@ Details that matter to a consumer:
 - **Times** are ISO 8601 instants with an explicit offset (`2026-11-27T10:00:00+01:00`
   or `…Z`). A time without an offset is refused, not guessed. Graph is asked
   and answers in UTC; results are UTC (`…Z`).
+- **Free/busy limits.** Graph takes 20 schedules per request and a window
+  below 62 days. More than 20 attendees are asked in several requests and the
+  answers joined; a window of 62 days or more is refused as `provider_error`
+  without a request.
 - **Free/busy** returns merged intervals only. Of each schedule item just
   `status`, `start` and `end` are read; `subject`, `location` and `isPrivate`
   are never touched, and overlapping appointments are merged so their number
   does not show either. `free` and `workingElsewhere` do not count as busy;
   everything else does.
 - An attendee **missing from `busy`** means Graph could not resolve that
-  person's schedule (typically an external address). That is "availability
-  unknown", not "free"; an attendee with no appointments is present with
-  `intervals: []`.
+  person's schedule: the schedule came back with an error, or not at all
+  (typically an external address, or a mailbox the app may not look into).
+  That is "availability unknown", not "free", and it does not fail the call;
+  an attendee with no appointments is present with `intervals: []`.
 - **Invitations** are created with a plain-text body and all attendees as
   required. Creating the event is what sends the invitations. `online: true`
-  asks for a Teams meeting (`isOnlineMeeting`, `onlineMeetingProvider:
-  teamsForBusiness`).
+  asks for a Teams meeting (`isOnlineMeeting: true`, `onlineMeetingProvider:
+  "teamsForBusiness"`); the link is read from `onlineMeeting.joinUrl`.
+- **An online invitation can come back without a link.** If Graph creates the
+  event but returns no `onlineMeeting.joinUrl` (expected, though not
+  documented, for an organiser mailbox that cannot organise Teams meetings),
+  the result is `{ outcome: 'created', eventId }` **without `joinUrl`**. The
+  invitation has been sent and has no Teams link. A caller that asked for
+  `online: true` has to check for `joinUrl` and say "invitation created
+  without Teams link" instead of reporting plain success. The audit line reads
+  `outcome=created_without_join_url`.
 - **Mail** is plain text, to `toRecipients`, saved to the organiser's Sent
   Items. Graph answers `202 Accepted`, which means accepted for delivery, not
   delivered.
@@ -74,7 +87,7 @@ endpoint:
 |---|---|
 | `recipient_not_allowed` | At least one attendee or recipient is not in `grant.allowed`. The whole call is refused; `rejected` lists the addresses. Comparison is case-insensitive on the trimmed address. A string that is not one bare address (`a@x; b@y`, `Name <a@x>`) is rejected even if the grant contains it. |
 | `not_configured` | The setup field `facilitation_organizer_mailbox` is empty or not a mailbox address. |
-| `provider_error` | The request is unusable (no addresses, empty subject, bad time window), or the token request or Graph call failed. The message carries the Graph status and error code. |
+| `provider_error` | The request is unusable (no addresses, empty subject, bad time window, free/busy window of 62 days or more), or the token request or Graph call failed. The message carries the Graph status and error code. |
 
 Each call writes one audit line to the plugin log: operation, facilitation id,
 number of people, outcome. Addresses and content are not logged.
@@ -92,18 +105,27 @@ change or cancel an event, including the ones it created.
 
 ## Setup
 
+An administrator has to act before any of this works. A connector app
+registration holds no calendar or mail permission unless someone added one; as
+of 2026-11-18 neither of byte5's own instances holds `Calendars.*` or
+`Mail.Send`.
+
 ### 1. Organiser mailbox
 
 Set the setup field **Organisator-Postfach für Facilitation**
 (`facilitation_organizer_mailbox`) to the mailbox that sends the protocol and
 organises the follow-up meetings. There is no default.
 
-Use a shared or dedicated mailbox, not a person's: everything the facilitator
-sends appears in its Sent Items and its calendar. For online meetings the
-mailbox needs to be able to organise Teams meetings (licence; from
-documentation, not verified).
+Use a **licensed user mailbox** created for this purpose (for example
+`facilitator@…`), not a person's own. Recipients see this mailbox as the
+sender, with no "on behalf of" marker, and everything sent is in its Sent
+Items and calendar.
 
-### 2. Graph application permissions
+A shared mailbox is unproven: the documentation does not cover it for app-only
+calls, and a Teams link is expected to need a licence. Use one only after
+checklist item F4.
+
+### 2. Which permissions
 
 From the Graph v1.0 reference, "Permissions" table, row "Application":
 
@@ -113,130 +135,151 @@ From the Graph v1.0 reference, "Permissions" table, row "Application":
 | `Create event` | `Calendars.ReadWrite` | — |
 | `user: sendMail` | `Mail.Send` | not available |
 
-The set to grant is therefore **`Calendars.ReadWrite`** and **`Mail.Send`**.
-`Calendars.ReadWrite` is needed for the invitation anyway and also covers
-`getSchedule`, so no third permission is required.
+The working set is **`Calendars.ReadWrite`** and **`Mail.Send`**.
+`Calendars.ReadWrite` is needed for the invitation anyway and covers
+`getSchedule`.
 
-Note on `Calendars.ReadBasic`: the `getSchedule` page lists it for
-applications, but the permissions reference has no application permission of
-that name, only `Calendars.ReadBasic.All`. Since `Calendars.ReadWrite` is
-required regardless, this discrepancy does not affect the set above.
+Note on `Calendars.ReadBasic`: Microsoft's pages disagree (the API page lists
+it for applications, the permissions reference only has
+`Calendars.ReadBasic.All`, the concept page names `Calendars.Read`), and RBAC
+for Applications has no ReadBasic role. `Calendars.ReadWrite` is the only
+choice that works in both the Entra and the RBAC model.
 
-Both permissions are tenant-wide when granted in Entra ID: "send mail as any
-user" and "read and write calendars in all mailboxes". The connector only ever
-addresses the organiser mailbox, but the token could do more. Restrict it:
+### 3. Grant them: RBAC for Applications (current mechanism)
 
-### 3. Least privilege, by tenant situation
-
-**A. Exchange Online with an Exchange administrator available (recommended).**
-Use *RBAC for Applications in Exchange Online* and scope both roles to the
-organiser mailbox. In this option the two permissions are **not** granted in
-Entra ID at all: Microsoft documents the Exchange grants as independent of the
-unscoped Entra grants, and states that an existing organisation-wide grant of
-the same permission has to be removed for the scope to take effect.
+Exchange Online *RBAC for Applications* grants the two roles for the organiser
+mailbox only. Exchange Online PowerShell, role Organization Management:
 
 ```powershell
 Connect-ExchangeOnline
 
-# The connector app's service principal: AppId = App (Client) ID,
-# ObjectId = object id of the ENTERPRISE APPLICATION (not the app registration).
-New-ServicePrincipal -AppId <app-id> -ObjectId <enterprise-app-object-id> -DisplayName "omadia M365 connector"
+# 1. Register the connector app's service principal in Exchange. Both ids are
+#    on the ENTERPRISE APPLICATION, not on the app registration.
+New-ServicePrincipal -AppId <app id> -ObjectId <service principal object id> -DisplayName "omadia M365 connector"
 
-# Scope = exactly the organiser mailbox. The filter is our example.
+# 2. A scope that matches exactly the organiser mailbox (the filter is our example).
 New-ManagementScope -Name "omadia facilitation organiser" `
   -RecipientRestrictionFilter "PrimarySmtpAddress -eq 'facilitator@contoso.com'"
 
-New-ManagementRoleAssignment -App <app-id> -Role "Application Calendars.ReadWrite" `
+# 3. The two roles, limited to that scope.
+New-ManagementRoleAssignment -App <app id> -Role "Application Calendars.ReadWrite" `
   -CustomResourceScope "omadia facilitation organiser"
-New-ManagementRoleAssignment -App <app-id> -Role "Application Mail.Send" `
+New-ManagementRoleAssignment -App <app id> -Role "Application Mail.Send" `
   -CustomResourceScope "omadia facilitation organiser"
 
-# Expect InScope = True for the organiser, False for any other mailbox.
-Test-ServicePrincipalAuthorization -Identity <app-id> -Resource facilitator@contoso.com
-Test-ServicePrincipalAuthorization -Identity <app-id> -Resource someone.else@contoso.com
+# 4. Check: in scope for the organiser, not for any other mailbox.
+Test-ServicePrincipalAuthorization -Identity <app id> -Resource facilitator@contoso.com
+Test-ServicePrincipalAuthorization -Identity <app id> -Resource someone.else@contoso.com
 ```
 
-Changes take effect after 30 minutes to 2 hours (permission cache); the test
-cmdlet bypasses the cache. No admin consent click is involved in this option.
+**Do not grant the same permission in Entra ID as well.** Effective rights are
+the union of both, and an Entra grant is tenant-wide ("send mail as any user",
+"read and write calendars in all mailboxes"), so it would undo the scope. If
+`Calendars.ReadWrite` or `Mail.Send` is already granted to the app in Entra,
+remove it there.
 
-**B. Tenants that already use application access policies (legacy).**
-Grant `Calendars.ReadWrite` and `Mail.Send` in Entra ID with admin consent (as
-in C), then restrict the app to a mail-enabled security group that contains
-only the organiser mailbox:
+Changes take 30 minutes to 2 hours to apply; the test cmdlet in step 4
+bypasses that cache. No admin consent click is involved.
+
+#### Fallback if scoped free/busy does not work
+
+Whether `getSchedule` returns colleagues' availability when the app is scoped
+to the organiser mailbox only is **not documented** and could not be tested
+(checklist F1). The call runs in the organiser's mailbox and is expected to
+resolve the others through the organisation's free/busy sharing, but that is
+an assumption.
+
+If F1 shows an error for each schedule, keep the two assignments above and add
+a second, read-only one for the participants:
 
 ```powershell
-New-ApplicationAccessPolicy -AppId <app-id> -PolicyScopeGroupId <group> `
-  -AccessRight RestrictAccess -Description "omadia facilitation follow-ups"
-Test-ApplicationAccessPolicy -Identity facilitator@contoso.com -AppId <app-id>
+New-ManagementScope -Name "omadia facilitation participants" `
+  -RecipientRestrictionFilter "<filter matching the participant group>"
+New-ManagementRoleAssignment -App <app id> -Role "Application Calendars.Read" `
+  -CustomResourceScope "omadia facilitation participants"
 ```
 
-Microsoft states that RBAC for Applications replaces application access
-policies, and its former policy page now leads to the RBAC article. The two
-cmdlets above are written from the earlier documentation and were not
-re-checked against a current page. Prefer A for a new setup. A policy applies
-to all Exchange permissions of the app, so check that no other consumer of
-this connector app needs another mailbox.
+(An administrative unit can be used as the scope instead.) Until then the
+service keeps working: those people are simply reported as "availability
+unknown".
 
-**C. Unscoped (own tenant, evaluation, or no Exchange administrator).**
+### 4. Other ways to grant
 
-1. Azure Portal → **Microsoft Entra ID** → **App registrations** → the
-   connector app → **API permissions** → **Add a permission** → **Microsoft
-   Graph** → **Application permissions**.
-2. Add `Calendars.ReadWrite` and `Mail.Send`.
-3. **Grant admin consent for \<Tenant\>** (needs an administrator). Extending
-   an existing registration requires this renewed admin consent; see
-   *Consent semantics* in [`INTEGRATION.md`](../INTEGRATION.md) for the
-   `appRoleAssignments` fallback and the restart.
+**Legacy: application access policy.** Microsoft: application access policies
+"are replaced by Role Based Access Control for Applications", and new ones
+should not be created. For a tenant that still runs on them: grant
+`Calendars.ReadWrite` and `Mail.Send` in Entra ID with admin consent, put the
+organiser mailbox into a mail-enabled security group (a shared mailbox can
+only be covered through such a group), then
 
-This works, and the connector still only calls the organiser mailbox, but the
-app could send as anyone and write any calendar. Treat it as a stopgap in a
-customer tenant.
+```powershell
+New-ApplicationAccessPolicy -AppId <app id> -PolicyScopeGroupId <group> -AccessRight RestrictAccess
+```
 
-In all three options the connector app's secret is the credential to protect.
+A policy applies to all Exchange permissions of the app, so check that no
+other consumer of this connector app needs another mailbox.
+
+**Unscoped Entra grant (own tenant or evaluation only).** Azure Portal →
+**Microsoft Entra ID** → **App registrations** → the connector app → **API
+permissions** → **Add a permission** → **Microsoft Graph** → **Application
+permissions** → add `Calendars.ReadWrite` and `Mail.Send` → **Grant admin
+consent for \<Tenant\>**. Extending an existing registration requires this
+renewed admin consent; see *Consent semantics* in
+[`INTEGRATION.md`](../INTEGRATION.md) for the `appRoleAssignments` fallback and
+the restart. The connector still only calls the organiser mailbox, but the app
+could send as anyone and write any calendar.
+
+In every variant the connector app's secret is the credential to protect.
 
 ## Manual verification on a real instance
 
-Nothing below has been run against a tenant yet. Use a facilitation whose
-grant lists two internal test users, and one address that is not in it.
+Nothing below has been run against a tenant yet.
 
-1. **Not configured.** Leave the organiser field empty, trigger a follow-up:
-   the protocol records `not_configured`, and no mail or event exists.
-2. **Free/busy.** Give one test user an appointment with a recognisable
-   subject in the window. `freeBusy` returns the interval for that user and
-   nothing of the subject or location; the other user appears with
-   `intervals: []`.
-3. **Free/busy under option A or B.** Repeat step 2 with the mailbox
-   restriction active. This is the open question: `getSchedule` runs on the
-   organiser's calendar but returns other people's availability, and whether a
-   scope limited to the organiser mailbox still allows that is not documented.
-   If it answers 403 or an `error` per schedule, the scope has to include the
-   participants for `Calendars.ReadWrite`, or free/busy stays unavailable.
-4. **Invitation.** `createInvitation` for the two users: both receive the
-   invitation from the organiser mailbox with subject, time (check the time
-   zone) and agenda; the event is in the organiser's calendar.
-5. **Online meeting.** With `online: true` the result carries a `joinUrl` and
-   the invitation contains the Teams link. Without a `joinUrl`, check the
-   organiser mailbox's Teams licence.
-6. **Mail.** `sendMail` to the two users: both receive the plain-text protocol
-   from the organiser mailbox; it is in Sent Items.
-7. **Outside the grant.** Add the third address to any of the three calls:
-   the answer is `recipient_not_allowed` naming it, and neither of the granted
-   users receives anything from that call.
-8. **Restriction holds.** Under A or B, `Test-ServicePrincipalAuthorization`
-   (or `Test-ApplicationAccessPolicy`) denies a mailbox other than the
-   organiser.
-9. **Log.** The plugin log has one `facilitation.followup op=… outcome=…` line
-   per call, with no address and no content.
+### Owner checklist
+
+- **F1 (scoped free/busy).** After the RBAC assignment for the organiser only
+  (wait up to 2 hours): trigger one follow-up availability check for two
+  colleagues. Expect availability for both. If instead each schedule carries
+  an error (both are reported as "availability unknown"), apply the
+  [fallback](#fallback-if-scoped-freebusy-does-not-work).
+- **F2 (invitation).** Create one follow-up invitation with Teams link to
+  yourself. Expect: the invitation mail from the organiser mailbox, a working
+  join link, the event in the organiser's calendar, `joinUrl` in the tool
+  result.
+- **F3 (mail).** Send one follow-up mail to yourself. Expect: sender is the
+  organiser mailbox without "on behalf of", a copy in the organiser's Sent
+  Items.
+- **F4 (shared mailbox, optional).** Repeat F2 with a shared mailbox as
+  organiser. Expect either a join link or an event without one; that decides
+  whether shared mailboxes are allowed.
+
+### Connector behaviour to confirm alongside
+
+- With the organiser field empty, a follow-up records `not_configured` and no
+  mail or event exists.
+- In F1, give one colleague an appointment with a recognisable subject: the
+  result has the interval and nothing of the subject or location.
+- In F2, check the time zone of the invitation.
+- Add an address that is not in the grant to any call: the answer is
+  `recipient_not_allowed` naming it, and nobody receives anything from that
+  call.
+- The plugin log has one `facilitation.followup op=… outcome=…` line per call,
+  with no address and no content.
 
 ## Sources
 
-Read on 2026-11-18:
+Microsoft Learn, read on 2026-11-18; the full source list with page dates is
+in the Teams evaluation for byte5ai/omadia#2043.
 
 - Graph v1.0 reference: `calendar: getSchedule`, `Create event`, `user: sendMail`
+- Graph: *Get free/busy schedule* (limits: 20 schedules, 62 days), *Online
+  meetings in calendar events* and `onlineMeetingInfo` (`joinUrl`), *Send mail
+  from another user*
 - Graph permissions reference (`Calendars.ReadBasic.All`, `Calendars.ReadWrite`, `Mail.Send`)
-- Exchange Online: *Role Based Access Control for Applications*
-  (roles, cmdlets, relation to Entra grants, cache delay)
+- Exchange Online: *Role Based Access Control for Applications* (roles,
+  cmdlets, union with Entra grants, cache delay)
+- Exchange PowerShell: `New-ApplicationAccessPolicy` (legacy notice)
 
-The `isOnlineMeeting` / `onlineMeeting.joinUrl` shape and the application
-access policy cmdlets are from earlier knowledge of those pages, not from a
-verbatim read on that date.
+Not stated on any of these pages, so open until the checklist is done: free/busy
+under a mailbox scope (F1), the licence an organiser needs for a Teams link
+(F2, F4), and shared mailboxes with app-only calls (F4).

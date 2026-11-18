@@ -353,8 +353,14 @@ if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | 
   answers `not_configured`.
 - Anyone outside `grant.allowed` refuses the whole call with
   `recipient_not_allowed` before any Graph request.
-- Graph application permissions: `Calendars.ReadWrite` and `Mail.Send`,
-  restricted to the organiser mailbox where the tenant allows it.
+- `freeBusy` asks Graph in chunks of 20 schedules and refuses a window of 62
+  days or more. A person whose schedule Graph cannot resolve is missing from
+  `busy` (availability unknown); the call still succeeds.
+- `createInvitation` with `online: true` can return `created` without
+  `joinUrl`: the invitation went out without a Teams link. Check for it.
+- Permissions: `Calendars.ReadWrite` and `Mail.Send`, granted by an
+  administrator with Exchange Online RBAC for Applications scoped to the
+  organiser mailbox, and not in Entra ID as well.
 
 Operations, refusals, permissions, consent steps and the manual verification
 checklist: [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
