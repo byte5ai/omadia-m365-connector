@@ -13,7 +13,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import type { PluginContext } from '@omadia/plugin-api';
+import type { FacilitationFollowupService, PluginContext } from '@omadia/plugin-api';
 
 import { activate } from '../src/plugin.js';
 import * as barrel from '../src/index.js';
@@ -198,7 +198,24 @@ describe('activate() — service registration', () => {
     await handle.close();
   });
 
-  it('close() disposes both service registrations', async () => {
+  it('publishes facilitation.followup, answering not_configured until a mailbox is set', async () => {
+    const { ctx, provided, logs } = fakeContext();
+
+    const handle = await activate(ctx);
+    const followup = provided.get('facilitation.followup') as
+      | FacilitationFollowupService
+      | undefined;
+    assert.ok(followup, 'published even without the optional setup field');
+    const result = await followup.sendMail(
+      { facilitationId: 'fac-1', allowed: ['anna@contoso.example'] },
+      { recipients: ['anna@contoso.example'], subject: 'Protocol', body: 'Decisions' },
+    );
+    assert.equal(result.outcome === 'refused' && result.code, 'not_configured');
+    assert.ok(logs.some((l) => l.includes("'facilitation.followup' published")));
+    await handle.close();
+  });
+
+  it('close() disposes every service registration', async () => {
     const { ctx, disposed } = fakeContext();
 
     const handle = await activate(ctx);
@@ -206,7 +223,11 @@ describe('activate() — service registration', () => {
     await handle.close();
     assert.deepEqual(
       [...disposed].sort(),
-      [MICROSOFT365_SERVICE_NAME, TEAMS_PROVISIONER_SERVICE_NAME].sort(),
+      [
+        MICROSOFT365_SERVICE_NAME,
+        TEAMS_PROVISIONER_SERVICE_NAME,
+        'facilitation.followup',
+      ].sort(),
     );
   });
 });
@@ -409,7 +430,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     // 0.8.2 — installs carry the app's declared resource-specific consent
     //         (`consentedPermissionSet`) in BOTH directions; without it Graph
     //         refuses every install of our seven-RSC packages.
-    assert.equal(pkg.version, '0.8.2');
+    // 0.9.0 — `facilitation.followup@1`: free/busy, invitations and protocol
+    //         mail for native facilitators (#18, epic byte5ai/omadia#2043).
+    assert.equal(pkg.version, '0.9.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

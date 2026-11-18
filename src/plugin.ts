@@ -1,4 +1,7 @@
-import type { PluginContext } from '@omadia/plugin-api';
+import type {
+  FacilitationFollowupService,
+  PluginContext,
+} from '@omadia/plugin-api';
 
 import {
   MICROSOFT365_SERVICE_NAME,
@@ -8,6 +11,12 @@ import { GraphClient } from './graphClient.js';
 import { GraphOboClient } from './graphObo.js';
 import { GraphCalendarClient } from './graphCalendarClient.js';
 import { SlotCache } from './slotCache.js';
+import {
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+  createAppOnlyGraphTransport,
+  createFacilitationFollowupService,
+  readOrganizerMailbox,
+} from './facilitationFollowup/index.js';
 import {
   TEAMS_PROVISIONER_CAPABILITY,
   TEAMS_PROVISIONER_SERVICE_NAME,
@@ -19,7 +28,7 @@ import {
 /**
  * @omadia/integration-microsoft365 — plugin entry point.
  *
- * `kind: integration`. Exposes two things to the kernel on activate():
+ * `kind: integration`. Exposes three things to the kernel on activate():
  *
  * 1. The `microsoft365.graph` service (`Microsoft365Accessor`) bundling the
  *    four underlying clients:
@@ -33,6 +42,14 @@ import {
  *    `teamsProvisioner@1`) — per-agent Teams bot provisioning (Entra app +
  *    Azure bot + app package + catalog + team install) for the agent factory
  *    (byte5ai/omadia#863-865).
+ *
+ * 3. The `facilitation.followup` service (`FacilitationFollowupService` from
+ *    `@omadia/plugin-api`, capability `facilitation.followup@1`) — free/busy,
+ *    invitations and protocol mail for native facilitators
+ *    (byte5ai/omadia#2043), app-only and limited to the people each call's
+ *    grant lists. Needs the OPTIONAL setup field
+ *    `facilitation_organizer_mailbox`; without it the service is still
+ *    published and answers `not_configured`.
  *
  * Required config (via `ctx.config`):
  *   - `microsoft_tenant_id`   Azure AD tenant GUID
@@ -119,9 +136,32 @@ export async function activate(
         })`,
   );
 
+  // facilitation.followup@1 — its own app-only transport that can only POST
+  // the three follow-up calls; the delegated calendar clients above are not
+  // reused, because a facilitator acts for no user.
+  const organizer = readOrganizerMailbox(ctx.config);
+  const followup = createFacilitationFollowupService({
+    organizer,
+    transport: createAppOnlyGraphTransport({
+      credential: { tenantId, clientId, clientSecret },
+    }),
+    log: (msg) => ctx.log(msg),
+  });
+  const disposeFollowup = ctx.services.provide<FacilitationFollowupService>(
+    FACILITATION_FOLLOWUP_SERVICE_NAME,
+    followup,
+  );
+
+  ctx.log(
+    organizer.kind === 'configured'
+      ? `[microsoft365] service '${FACILITATION_FOLLOWUP_SERVICE_NAME}' published (organiser mailbox configured)`
+      : `[microsoft365] service '${FACILITATION_FOLLOWUP_SERVICE_NAME}' published, answering not_configured (${organizer.reason})`,
+  );
+
   return {
     async close(): Promise<void> {
       ctx.log('deactivating microsoft365 integration');
+      disposeFollowup();
       disposeProvisioner();
       disposeService();
     },

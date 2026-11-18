@@ -325,6 +325,50 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 > per REST `appRoleAssignments` zuweisen und die Middleware neu starten —
 > Portal-/CLI-Consent greift manchmal stillschweigend nicht.
 
+## `facilitation.followup` (since 0.9.0)
+
+A third service, for native facilitators only (epic byte5ai/omadia#2043). The
+contract (`FacilitationFollowupService`, `FollowupGrant`) lives in
+`@omadia/plugin-api` ≥ 1.55.0; this connector is its Microsoft 365 provider.
+
+```ts
+import {
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+  type FacilitationFollowupService,
+} from '@omadia/plugin-api';
+
+const followup = ctx.services.get<FacilitationFollowupService>(
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+);
+const result = await followup.sendMail(
+  { facilitationId, allowed },          // the grant, with every call
+  { recipients, subject, body },
+);
+if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | provider_error */ }
+```
+
+- Three operations: `freeBusy` (busy intervals only), `createInvitation`,
+  `sendMail`. Each is one app-only `POST` on the organiser mailbox from the
+  setup field `facilitation_organizer_mailbox`; without that field every call
+  answers `not_configured`.
+- Anyone outside `grant.allowed` refuses the whole call with
+  `recipient_not_allowed` before any Graph request.
+- `freeBusy` asks Graph in chunks of 20 schedules and refuses a window of 62
+  days or more. A person whose schedule Graph cannot resolve is missing from
+  `busy` (availability unknown); the call still succeeds. Intervals come from
+  the availability view in 15-minute slots; schedule items, which can carry
+  subject and location, are never read.
+- `createInvitation` with `online: true` can return `created` without
+  `joinUrl`: the invitation went out without a Teams link. Check for it.
+- Permissions: `Calendars.ReadWrite` and `Mail.Send`, granted by an
+  administrator with Exchange Online RBAC for Applications scoped to the
+  organiser mailbox, and not in Entra ID as well.
+
+Operations, refusals, permissions, consent steps and the manual verification
+checklist: [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
+The Graph calls were checked live at platform level (scoped free/busy, Teams
+invitation, mail accepted); the connector code itself against a fake Graph.
+
 ## Was NICHT geht
 
 - ❌ **Importing the Microsoft Graph SDK directly** (`@microsoft/microsoft-graph-client`)
