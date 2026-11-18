@@ -134,8 +134,8 @@ or calendar contents. An administrator has to grant `Calendars.ReadWrite` and
 `Mail.Send` first, preferably with Exchange Online RBAC for Applications
 scoped to that mailbox and not in Entra ID as well. The steps and the owner
 checklist are in [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
-The permissions and consent steps are taken from Microsoft's documentation and
-have not been verified against a tenant.
+The three Graph calls were checked live at platform level with such a scope;
+the connector's own code is verified against a fake Graph.
 
 ## Build & install
 

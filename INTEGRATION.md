@@ -355,7 +355,9 @@ if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | 
   `recipient_not_allowed` before any Graph request.
 - `freeBusy` asks Graph in chunks of 20 schedules and refuses a window of 62
   days or more. A person whose schedule Graph cannot resolve is missing from
-  `busy` (availability unknown); the call still succeeds.
+  `busy` (availability unknown); the call still succeeds. Intervals come from
+  the availability view in 15-minute slots; schedule items, which can carry
+  subject and location, are never read.
 - `createInvitation` with `online: true` can return `created` without
   `joinUrl`: the invitation went out without a Teams link. Check for it.
 - Permissions: `Calendars.ReadWrite` and `Mail.Send`, granted by an
@@ -364,8 +366,8 @@ if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | 
 
 Operations, refusals, permissions, consent steps and the manual verification
 checklist: [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
-The permissions and consent steps there are taken from documentation and are
-not tenant-verified.
+The Graph calls were checked live at platform level (scoped free/busy, Teams
+invitation, mail accepted); the connector code itself against a fake Graph.
 
 ## Was NICHT geht
 

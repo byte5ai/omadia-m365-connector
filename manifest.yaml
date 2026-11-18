@@ -155,8 +155,8 @@ setup:
       `docs/facilitation-followup.md`. Do NOT also grant the same permissions
       in Entra ID: that grant is tenant-wide and would undo the scope. The
       connector itself only ever calls the organiser mailbox and never reads
-      mail or calendar contents. These steps come from Microsoft's
-      documentation and are not yet verified against a tenant.
+      mail or calendar contents. Free/busy and the Teams invitation were
+      checked live with such a scope; a shared mailbox was not.
 
       Extending an existing app registration requires **renewed admin consent**:
       click **Grant admin consent for <Tenant>** again. If Graph still
@@ -273,8 +273,8 @@ setup:
       Berechtigungen NICHT zusätzlich in Entra ID vergeben: diese Vergabe gilt
       mandantenweit und hebt die Beschränkung auf. Der Connector selbst ruft
       nur das Organisator-Postfach auf und liest nie Mail- oder
-      Kalenderinhalte. Die Schritte stammen aus der Microsoft-Dokumentation
-      und sind noch nicht an einem Tenant geprüft.
+      Kalenderinhalte. Frei/Gebucht und die Teams-Einladung wurden mit einer
+      solchen Beschränkung live geprüft, ein geteiltes Postfach nicht.
 
       Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
       **erneuten Admin-Consent**: **Grant admin consent for <Tenant>**

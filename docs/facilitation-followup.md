@@ -4,12 +4,15 @@ Since 0.9.0. Issue
 [#18](https://github.com/byte5ai/omadia-m365-connector/issues/18), epic
 byte5ai/omadia#2043, kernel spec §5.11.
 
-> **Verification status.** There is no test tenant for this feature. The three
-> operations are verified against a fake Graph only (`tests/facilitationFollowup.test.ts`),
-> shaped after the Graph v1.0 reference. The permissions, the mailbox
-> restriction and the consent steps below come from Microsoft's documentation
-> and are **not tenant-verified**. Run the [manual checklist](#manual-verification-on-a-real-instance)
-> before relying on them.
+> **Verification status (2026-11-18).** The three Graph calls were run live in
+> the byte5 tenant with an app scoped by RBAC for Applications to one organiser
+> mailbox: free/busy for colleagues (F1) and an online-meeting event with join
+> link (F2) worked, and a mail was accepted (F3). That is verification **at
+> platform level**: the calls were made directly against Graph, not through
+> this connector. The connector's own code is verified against a fake Graph
+> only (`tests/facilitationFollowup.test.ts`). Still open: how the sender shows
+> to a recipient (F3), shared mailboxes (F4), and one end-to-end run through an
+> installed connector. See [Manual verification](#manual-verification-on-a-real-instance).
 
 ## What it is
 
@@ -48,13 +51,22 @@ Details that matter to a consumer:
   below 62 days. More than 20 attendees are asked in several requests and the
   answers joined; a window of 62 days or more is refused as `provider_error`
   without a request.
-- **Free/busy** returns merged intervals only. Of each schedule item just
-  `status`, `start` and `end` are read; `subject`, `location` and `isPrivate`
-  are never touched, and overlapping appointments are merged so their number
-  does not show either. `free` and `workingElsewhere` do not count as busy;
-  everything else does.
+- **Free/busy never touches appointment details.** Graph's answer can
+  contain `subject` and `location` of a colleague's appointments, depending on
+  how far that person shares their calendar with the organiser (seen live:
+  one colleague's items carried both, another's only status and times). The
+  service therefore does not read the schedule items at all. It derives the
+  busy intervals from `availabilityView` alone, a string with one digit per
+  15-minute slot that cannot hold a subject. Nothing but `attendee`, `start`
+  and `end` is returned, and nothing of the answer is logged.
+- **Granularity.** Busy intervals are exact to 15-minute slots counted from
+  `from`, and neighbouring busy slots are one interval, so neither the number
+  of appointments nor their exact bounds show. Free and "working elsewhere"
+  do not count as busy; tentative, busy, out of office and anything unknown
+  do.
 - An attendee **missing from `busy`** means Graph could not resolve that
-  person's schedule: the schedule came back with an error, or not at all
+  person's schedule: the schedule came back with an error, without an
+  availability view, or not at all
   (typically an external address, or a mailbox the app may not look into).
   That is "availability unknown", not "free", and it does not fail the call;
   an attendee with no appointments is present with `intervals: []`.
@@ -62,8 +74,9 @@ Details that matter to a consumer:
   required. Creating the event is what sends the invitations. `online: true`
   asks for a Teams meeting (`isOnlineMeeting: true`, `onlineMeetingProvider:
   "teamsForBusiness"`); the link is read from `onlineMeeting.joinUrl`.
-- **An online invitation can come back without a link.** If Graph creates the
-  event but returns no `onlineMeeting.joinUrl` (expected, though not
+- **An online invitation can come back without a link.** With a licensed user
+  mailbox as organiser the link came back in the live test. If Graph creates
+  the event but returns no `onlineMeeting.joinUrl` (expected, though not
   documented, for an organiser mailbox that cannot organise Teams meetings),
   the result is `{ outcome: 'created', eventId }` **without `joinUrl`**. The
   invitation has been sent and has no Teams link. A caller that asked for
@@ -94,7 +107,8 @@ number of people, outcome. Addresses and content are not logged.
 
 ## What it cannot do
 
-The transport (`src/facilitationFollowup/transport.ts`) takes an operation
+Of a free/busy answer only the availability view is read (see above). The
+transport (`src/facilitationFollowup/transport.ts`) takes an operation
 name, not a URL, and knows three of them. It has no `GET`, no `PATCH`, no
 `DELETE`, and no path into `/messages`, `/mailFolders`, `/calendarView` or a
 stored event. The delegated clients (`graphObo.ts`, `graphCalendarClient.ts`,
@@ -178,19 +192,22 @@ the union of both, and an Entra grant is tenant-wide ("send mail as any user",
 `Calendars.ReadWrite` or `Mail.Send` is already granted to the app in Entra,
 remove it there.
 
-Changes take 30 minutes to 2 hours to apply; the test cmdlet in step 4
-bypasses that cache. No admin consent click is involved.
+Microsoft documents 30 minutes to 2 hours for changes to apply; the test
+cmdlet in step 4 bypasses that cache. In the live test the first Graph call
+worked 40 seconds after the assignment. No admin consent click is involved.
 
 #### Fallback if scoped free/busy does not work
 
-Whether `getSchedule` returns colleagues' availability when the app is scoped
-to the organiser mailbox only is **not documented** and could not be tested
-(checklist F1). The call runs in the organiser's mailbox and is expected to
-resolve the others through the organisation's free/busy sharing, but that is
-an assumption.
+**Not needed in the tested tenant.** With the app scoped to the organiser
+mailbox only, `getSchedule` on that mailbox returned availability for two
+colleagues without an error per schedule (F1, byte5 tenant, 2026-11-18); the
+same call through a colleague's mailbox was refused with `403
+ErrorAccessDenied`, so the scope holds. Microsoft does not document this
+behaviour, so another tenant can differ, for example with restricted free/busy
+sharing.
 
-If F1 shows an error for each schedule, keep the two assignments above and add
-a second, read-only one for the participants:
+Only if F1 shows every colleague as "availability unknown" there: keep the two
+assignments above and add a second, read-only one for the participants:
 
 ```powershell
 New-ManagementScope -Name "omadia facilitation participants" `
@@ -199,9 +216,7 @@ New-ManagementRoleAssignment -App <app id> -Role "Application Calendars.Read" `
   -CustomResourceScope "omadia facilitation participants"
 ```
 
-(An administrative unit can be used as the scope instead.) Until then the
-service keeps working: those people are simply reported as "availability
-unknown".
+(An administrative unit can be used as the scope instead.)
 
 ### 4. Other ways to grant
 
@@ -233,32 +248,46 @@ In every variant the connector app's secret is the credential to protect.
 
 ## Manual verification on a real instance
 
-Nothing below has been run against a tenant yet.
-
 ### Owner checklist
 
-- **F1 (scoped free/busy).** After the RBAC assignment for the organiser only
-  (wait up to 2 hours): trigger one follow-up availability check for two
-  colleagues. Expect availability for both. If instead each schedule carries
-  an error (both are reported as "availability unknown"), apply the
-  [fallback](#fallback-if-scoped-freebusy-does-not-work).
+Status from the live run in the byte5 tenant on 2026-11-18. "Platform level"
+means the Graph call was made directly with an app token scoped by RBAC for
+Applications to one licensed user mailbox, not through this connector.
+
+| | Check | Status |
+|---|---|---|
+| F1 | Scoped free/busy | **Live-verified at platform level.** |
+| F2 | Invitation with Teams link | **Live-verified at platform level.** |
+| F3 | Mail | **Accepted by Graph (202); sender display not inspected.** |
+| F4 | Shared mailbox as organiser | **Open.** |
+
+- **F1 (scoped free/busy).** After the RBAC assignment for the organiser only:
+  trigger one follow-up availability check for two colleagues. Expect
+  availability for both. Live: `200` with an availability view for each
+  person and no error per schedule; the fallback above was not needed.
 - **F2 (invitation).** Create one follow-up invitation with Teams link to
   yourself. Expect: the invitation mail from the organiser mailbox, a working
   join link, the event in the organiser's calendar, `joinUrl` in the tool
-  result.
+  result. Live: `201` with `onlineMeeting.joinUrl`, organiser = the mailbox.
+  The join link was not opened and the invitation mail was not looked at.
 - **F3 (mail).** Send one follow-up mail to yourself. Expect: sender is the
   organiser mailbox without "on behalf of", a copy in the organiser's Sent
-  Items.
+  Items. Live: `202 Accepted`. How the sender shows in the inbox and the copy
+  in Sent Items were **not inspected**; look at the received mail once.
 - **F4 (shared mailbox, optional).** Repeat F2 with a shared mailbox as
   organiser. Expect either a join link or an event without one; that decides
-  whether shared mailboxes are allowed.
+  whether shared mailboxes are allowed. Not attempted.
 
-### Connector behaviour to confirm alongside
+### Still to do through the connector
+
+None of the above ran through an installed connector 0.9.0. Repeat F1 to F3
+once from a real facilitation and confirm alongside:
 
 - With the organiser field empty, a follow-up records `not_configured` and no
   mail or event exists.
-- In F1, give one colleague an appointment with a recognisable subject: the
-  result has the interval and nothing of the subject or location.
+- In F1, pick a colleague who shares appointment details with the organiser
+  and has an appointment with a recognisable subject: the result has the
+  interval and nothing of the subject or location, and neither does the log.
 - In F2, check the time zone of the invitation.
 - Add an address that is not in the grant to any call: the answer is
   `recipient_not_allowed` naming it, and nobody receives anything from that
@@ -280,6 +309,7 @@ in the Teams evaluation for byte5ai/omadia#2043.
   cmdlets, union with Entra grants, cache delay)
 - Exchange PowerShell: `New-ApplicationAccessPolicy` (legacy notice)
 
-Not stated on any of these pages, so open until the checklist is done: free/busy
-under a mailbox scope (F1), the licence an organiser needs for a Teams link
-(F2, F4), and shared mailboxes with app-only calls (F4).
+Not stated on any of these pages: free/busy under a mailbox scope (settled
+for the tested tenant by F1), the licence an organiser needs for a Teams link
+(F2 worked with a licensed user mailbox; F4 open), and shared mailboxes with
+app-only calls (F4 open).

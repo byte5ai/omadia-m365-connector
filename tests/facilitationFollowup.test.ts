@@ -101,12 +101,26 @@ const failIfCalled: Responder = (call) => {
   throw new Error(`unexpected Graph request ${call.method} ${call.url}`);
 };
 
-/** A getSchedule answer as documented, including the fields we must ignore. */
+/**
+ * A getSchedule answer for 08:00 to 17:00 UTC in 15-minute slots, as Graph
+ * gives it for a colleague who shares details with the organiser: the items
+ * carry subject and location. Anna is busy 09:00-10:30 (busy, then tentative)
+ * and out of office 15:00-16:00; the "free" lunch entry does not block.
+ */
+const ANNA_VIEW = '0000' + '222211' + '0'.repeat(18) + '3333' + '0000';
+const SECRETS_IN_ITEMS = [
+  'Salary review',
+  'Room 4',
+  'Overlapping call',
+  'Dr. Weber, Praxis am Markt',
+  'Lunch reminder',
+  'Kantine',
+] as const;
 const scheduleAnswer = {
   value: [
     {
       scheduleId: ANNA,
-      availabilityView: '002200',
+      availabilityView: ANNA_VIEW,
       scheduleItems: [
         {
           isPrivate: false,
@@ -117,14 +131,17 @@ const scheduleAnswer = {
           end: { dateTime: '2026-11-20T10:00:00.0000000', timeZone: 'UTC' },
         },
         {
+          isPrivate: true,
           status: 'tentative',
           subject: 'Overlapping call',
+          location: 'Dr. Weber, Praxis am Markt',
           start: { dateTime: '2026-11-20T09:30:00.0000000', timeZone: 'UTC' },
           end: { dateTime: '2026-11-20T10:30:00.0000000', timeZone: 'UTC' },
         },
         {
           status: 'free',
           subject: 'Lunch reminder',
+          location: 'Kantine',
           start: { dateTime: '2026-11-20T12:00:00.0000000', timeZone: 'UTC' },
           end: { dateTime: '2026-11-20T13:00:00.0000000', timeZone: 'UTC' },
         },
@@ -136,7 +153,7 @@ const scheduleAnswer = {
       ],
       workingHours: { daysOfWeek: ['monday'] },
     },
-    { scheduleId: BEN, availabilityView: '000000', scheduleItems: [] },
+    { scheduleId: BEN, availabilityView: '0'.repeat(36), scheduleItems: [] },
   ],
 };
 
@@ -179,10 +196,11 @@ describe('freeBusy', () => {
       schedules: [ANNA, BEN],
       startTime: { dateTime: '2026-11-20T08:00:00', timeZone: 'UTC' },
       endTime: { dateTime: '2026-11-20T17:00:00', timeZone: 'UTC' },
+      availabilityViewInterval: 15,
     });
   });
 
-  it('returns merged busy intervals only, with no event details', async () => {
+  it('returns busy intervals from the availability view', async () => {
     const graph = fakeGraph(() => ({ status: 200, body: scheduleAnswer }));
     const result = await serviceOn(graph).freeBusy(GRANT, {
       attendees: [ANNA, BEN],
@@ -203,10 +221,109 @@ describe('freeBusy', () => {
         { attendee: BEN, intervals: [] },
       ],
     });
-    const serialised = JSON.stringify(result);
-    for (const leaked of ['Salary', 'Room 4', 'Overlapping', 'Lunch', 'subject', 'location']) {
-      assert.ok(!serialised.includes(leaked), `result must not contain "${leaked}"`);
+  });
+
+  it('subjects and locations in the answer reach neither the result nor a log line', async () => {
+    const logs: string[] = [];
+    const graph = fakeGraph(() => ({ status: 200, body: scheduleAnswer }));
+    const result = await serviceOn(graph, undefined, logs).freeBusy(GRANT, {
+      attendees: [ANNA, BEN],
+      from: '2026-11-20T08:00:00Z',
+      to: '2026-11-20T17:00:00Z',
+    });
+
+    const everythingThatLeaves = JSON.stringify(result) + '\n' + logs.join('\n');
+    for (const secret of [...SECRETS_IN_ITEMS, 'subject', 'location', 'isPrivate', 'scheduleItems']) {
+      assert.ok(!everythingThatLeaves.includes(secret), `"${secret}" must not leave the service`);
     }
+    assert.equal(result.outcome, 'ok');
+    if (result.outcome !== 'ok') return;
+    for (const entry of result.busy) {
+      assert.deepEqual(Object.keys(entry).sort(), ['attendee', 'intervals']);
+      for (const interval of entry.intervals) {
+        assert.deepEqual(Object.keys(interval).sort(), ['end', 'start']);
+      }
+    }
+    assert.deepEqual(logs, [
+      '[microsoft365] facilitation.followup op=freeBusy facilitation=fac-42 people=2 outcome=ok',
+    ]);
+  });
+
+  it('does not read schedule items at all: only the availability view decides', async () => {
+    const graph = fakeGraph(() => ({
+      status: 200,
+      body: {
+        value: [
+          {
+            scheduleId: ANNA,
+            // The view says free all day; the items claim a meeting.
+            availabilityView: '0'.repeat(36),
+            scheduleItems: [
+              {
+                status: 'busy',
+                subject: 'Salary review',
+                start: { dateTime: '2026-11-20T09:00:00.0000000', timeZone: 'UTC' },
+                end: { dateTime: '2026-11-20T10:00:00.0000000', timeZone: 'UTC' },
+              },
+            ],
+          },
+        ],
+      },
+    }));
+    const result = await serviceOn(graph).freeBusy(GRANT, {
+      attendees: [ANNA],
+      from: '2026-11-20T08:00:00Z',
+      to: '2026-11-20T17:00:00Z',
+    });
+    assert.deepEqual(result, { outcome: 'ok', busy: [{ attendee: ANNA, intervals: [] }] });
+  });
+
+  it('a schedule without an availability view is unknown, even if it has items', async () => {
+    const graph = fakeGraph(() => ({
+      status: 200,
+      body: {
+        value: [
+          {
+            scheduleId: ANNA,
+            scheduleItems: [
+              {
+                status: 'busy',
+                start: { dateTime: '2026-11-20T09:00:00.0000000', timeZone: 'UTC' },
+                end: { dateTime: '2026-11-20T10:00:00.0000000', timeZone: 'UTC' },
+              },
+            ],
+          },
+        ],
+      },
+    }));
+    const result = await serviceOn(graph).freeBusy(GRANT, {
+      attendees: [ANNA],
+      from: '2026-11-20T08:00:00Z',
+      to: '2026-11-20T17:00:00Z',
+    });
+    assert.deepEqual(result, { outcome: 'ok', busy: [] });
+  });
+
+  it('cuts the last interval at the end of the window and treats working elsewhere as free', async () => {
+    const graph = fakeGraph(() => ({
+      status: 200,
+      // 08:00 to 08:40: three slots, the last one only 10 minutes long.
+      body: { value: [{ scheduleId: ANNA, availabilityView: '422' }] },
+    }));
+    const result = await serviceOn(graph).freeBusy(GRANT, {
+      attendees: [ANNA],
+      from: '2026-11-20T08:00:00Z',
+      to: '2026-11-20T08:40:00Z',
+    });
+    assert.deepEqual(result, {
+      outcome: 'ok',
+      busy: [
+        {
+          attendee: ANNA,
+          intervals: [{ start: '2026-11-20T08:15:00.000Z', end: '2026-11-20T08:40:00.000Z' }],
+        },
+      ],
+    });
   });
 
   it('leaves out an attendee whose schedule Graph could not resolve', async () => {
@@ -214,12 +331,12 @@ describe('freeBusy', () => {
       status: 200,
       body: {
         value: [
-          { scheduleId: ANNA, scheduleItems: [] },
+          { scheduleId: ANNA, availabilityView: '0000' },
           {
             scheduleId: BEN,
             error: { message: 'Unable to resolve the recipient', responseCode: 'ErrorMailRecipientNotFound' },
           },
-          { scheduleId: OUTSIDER, scheduleItems: [] },
+          { scheduleId: OUTSIDER, availabilityView: '2222' },
         ],
       },
     }));
@@ -238,7 +355,7 @@ describe('freeBusy', () => {
       body: {
         value: (call.body as { schedules: string[] }).schedules.map((scheduleId) => ({
           scheduleId,
-          scheduleItems: [],
+          availabilityView: '0000',
         })),
       },
     }));
@@ -616,6 +733,10 @@ describe('no request reads message or event contents', () => {
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .replace(/^\s*\/\/.*$/gm, '');
     for (const forbidden of [
+      // Schedule items can carry subject and location; they are never read.
+      'scheduleItems',
+      "'location'",
+      'isPrivate',
       '/messages',
       '/mailFolders',
       '/calendarView',

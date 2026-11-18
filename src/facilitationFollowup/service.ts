@@ -55,10 +55,17 @@ const UTC = 'UTC';
 const PREFER_UTC_HEADER = { Prefer: 'outlook.timezone="UTC"' } as const;
 const ONLINE_MEETING_PROVIDER = 'teamsForBusiness';
 /**
- * `freeBusyStatus` values that do not block a slot. Everything else, including
- * `unknown` and values added later, counts as busy.
+ * Slot length asked of getSchedule (`availabilityViewInterval`, 5 to 1440).
+ * Busy intervals are exact to this grid, counted from the start of the window.
  */
-const NOT_BUSY_STATUSES: ReadonlySet<string> = new Set(['free', 'workingElsewhere']);
+const AVAILABILITY_SLOT_MINUTES = 15;
+const AVAILABILITY_SLOT_MS = AVAILABILITY_SLOT_MINUTES * 60 * 1000;
+/**
+ * `availabilityView` digits that do not block a slot: 0 free, 4 working
+ * elsewhere. Everything else (1 tentative, 2 busy, 3 out of office, and any
+ * value added later) counts as busy.
+ */
+const NOT_BUSY_SLOTS: ReadonlySet<string> = new Set(['0', '4']);
 /** An instant with an explicit offset; a local time would be ambiguous. */
 const INSTANT_PATTERN =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
@@ -175,6 +182,7 @@ export function createFacilitationFollowupService(
             schedules,
             startTime: { dateTime: prepared.value.start, timeZone: UTC },
             endTime: { dateTime: prepared.value.end, timeZone: UTC },
+            availabilityViewInterval: AVAILABILITY_SLOT_MINUTES,
           },
           PREFER_UTC_HEADER,
         );
@@ -182,7 +190,14 @@ export function createFacilitationFollowupService(
           audit('freeBusy', grant, prepared.addresses.length, response.code);
           return response;
         }
-        busy.push(...readBusy(response.json, schedules));
+        busy.push(
+          ...readBusy(
+            response.json,
+            schedules,
+            utcMs(prepared.value.start),
+            utcMs(prepared.value.end),
+          ),
+        );
       }
       audit(
         'freeBusy',
@@ -318,18 +333,22 @@ function toGraphDateTime(ms: number): string {
 /**
  * Reduce a getSchedule answer to busy intervals per requested attendee.
  *
- * Only `status`, `start` and `end` of a schedule item are read; `subject`,
- * `location` and `isPrivate` are never touched. Overlapping and adjacent
- * intervals are merged, so the result does not show how many appointments
- * someone has either.
+ * PRIVACY. A schedule's `scheduleItems` can carry `subject` and `location`,
+ * depending on how far that person shares their calendar with the organiser
+ * (seen live in the byte5 tenant, 2026-11-18). This function therefore does
+ * not look at `scheduleItems` at all. Of each schedule it reads three things:
+ * `scheduleId`, whether there is an `error`, and `availabilityView` — a string
+ * with one digit per slot that cannot hold any detail of an appointment.
  *
- * An attendee whose schedule Graph could not resolve (an `error` entry, or no
- * entry at all) is left out: missing from the result means "availability
- * unknown", which is not the same as an empty `intervals` list.
+ * An attendee whose schedule Graph could not resolve (an `error` entry, no
+ * entry, or no availability view) is left out: missing from the result means
+ * "availability unknown", which is not the same as an empty `intervals` list.
  */
 function readBusy(
   json: unknown,
   attendees: readonly string[],
+  windowStartMs: number,
+  windowEndMs: number,
 ): { attendee: string; intervals: Interval[] }[] {
   const entries = asRecord(json)?.['value'];
   if (!Array.isArray(entries)) return [];
@@ -338,52 +357,46 @@ function readBusy(
   for (const entry of entries) {
     const schedule = asRecord(entry);
     const scheduleId = schedule?.['scheduleId'];
+    const view = schedule?.['availabilityView'];
     if (typeof scheduleId !== 'string' || schedule?.['error'] != null) continue;
+    if (typeof view !== 'string' || view.length === 0) continue;
     const attendee = scheduleId.trim().toLowerCase();
     if (!requested.delete(attendee)) continue;
-    const items: unknown = schedule?.['scheduleItems'];
-    result.push({ attendee, intervals: mergeIntervals(Array.isArray(items) ? items : []) });
+    result.push({ attendee, intervals: busyIntervals(view, windowStartMs, windowEndMs) });
   }
   return result;
 }
 
-function mergeIntervals(items: readonly unknown[]): Interval[] {
-  const spans = items
-    .map((raw) => {
-      const item = asRecord(raw);
-      const status = item?.['status'];
-      if (typeof status === 'string' && NOT_BUSY_STATUSES.has(status)) return undefined;
-      const start = parseGraphUtc(asRecord(item?.['start'])?.['dateTime']);
-      const end = parseGraphUtc(asRecord(item?.['end'])?.['dateTime']);
-      return start !== undefined && end !== undefined && end > start
-        ? { start, end }
-        : undefined;
-    })
-    .filter((span): span is { start: number; end: number } => span !== undefined)
-    .sort((a, b) => a.start - b.start);
-
-  const merged: { start: number; end: number }[] = [];
-  for (const span of spans) {
-    const last = merged[merged.length - 1];
-    if (last && span.start <= last.end) {
-      merged[merged.length - 1] = { start: last.start, end: Math.max(last.end, span.end) };
-    } else {
-      merged.push(span);
-    }
+/**
+ * Turn an availability view into busy intervals. Slot `i` covers
+ * `[start + i * slot, start + (i + 1) * slot)`, cut off at the end of the
+ * window; neighbouring busy slots become one interval, so the result shows
+ * neither how many appointments there are nor their exact bounds.
+ */
+function busyIntervals(view: string, windowStartMs: number, windowEndMs: number): Interval[] {
+  const intervals: Interval[] = [];
+  let runStart: number | undefined;
+  const close = (endMs: number): void => {
+    if (runStart === undefined) return;
+    intervals.push({
+      start: new Date(runStart).toISOString(),
+      end: new Date(Math.min(endMs, windowEndMs)).toISOString(),
+    });
+    runStart = undefined;
+  };
+  for (let i = 0; i < view.length; i += 1) {
+    const slotStart = windowStartMs + i * AVAILABILITY_SLOT_MS;
+    if (slotStart >= windowEndMs) break;
+    if (NOT_BUSY_SLOTS.has(view.charAt(i))) close(slotStart);
+    else runStart ??= slotStart;
   }
-  return merged.map((span) => ({
-    start: new Date(span.start).toISOString(),
-    end: new Date(span.end).toISOString(),
-  }));
+  close(windowStartMs + view.length * AVAILABILITY_SLOT_MS);
+  return intervals;
 }
 
-/** Graph answers `2026-11-20T09:00:00.0000000` in the zone asked for (UTC). */
-function parseGraphUtc(value: unknown): number | undefined {
-  if (typeof value !== 'string') return undefined;
-  const match = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.exec(value);
-  if (!match) return undefined;
-  const ms = Date.parse(`${match[0]}Z`);
-  return Number.isNaN(ms) ? undefined : ms;
+/** A Graph `dateTime` this service produced itself (`toGraphDateTime`), in UTC. */
+function utcMs(graphDateTime: string): number {
+  return Date.parse(`${graphDateTime}Z`);
 }
 
 function describeGraphError(
