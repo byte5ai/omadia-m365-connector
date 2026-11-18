@@ -3,6 +3,53 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## 0.9.2
+
+Fixes for rollout defect D10 of native facilitators (byte5ai/omadia#2043): after
+a reset, the next provisioning produced a bot the Bot Connector rejects with 401
+for good, while Azure reported it healthy. The cause was a chain: a purge asked
+milliseconds after the delete answered `already-absent`, the next run restored
+the soft-deleted application with its old client id, and the bot resource was
+re-created under that app id. Verified against a stateful fake of Entra, Azure
+Resource Manager and the Bot Connector; nothing ran against a tenant.
+
+### Added
+
+- **`probeBot({ appId })`**: asks the Bot Connector, as the bot, whether it knows
+  the bot. `rejected` for a Connector 401 or an `invalid_client` at the token
+  endpoint, `known` for any 2xx or a 400/403/404/405, `unverified` otherwise.
+  The kernel calls it when present (byte5ai/omadia#2097). Not verified against
+  a tenant: what a healthy bot answers for the fabricated member id the probe
+  sends; details in `docs/teams-provisioner.md`.
+- **`findDeletedAppRegistration({ appId })`**: looks for an application in the
+  recycle bin. Throws `RecycleBinUnreadableError` when the bin cannot be read.
+  The kernel's reset confirms a purge with it; without it that confirmation
+  was skipped.
+
+### Fixed
+
+- **A purge no longer reports `already-absent` for an application deleted
+  moments ago.** After a delete made through the connector it looks into the
+  recycle bin up to 6 times (about 30 s), purges the tombstone when it appears,
+  and answers the new outcome `unconfirmed` (with `detail`) when it does not.
+- **`createAppRegistration` never restores a soft-deleted application.** A
+  tombstone holding the `uniqueName` is permanently deleted and a new
+  application is created, with a new client id.
+- **`createBot` refuses an app id whose bot resource was deleted**
+  (`BotAppIdRetiredError`, `bot_app_id_retired: …`). `deleteBot` records the
+  app id in the plugin vault under `teams_retired_bot_app:<appId>`.
+- **A failed Teams-channel enablement keeps the bot resource** instead of
+  deleting it, so the re-run does not create a second one under the same app id.
+
+### Changed
+
+- `purgeDeletedAppRegistration` answers `unconfirmed` instead of
+  `already-absent` when the recycle bin cannot be read.
+- `deleteAppRegistration` and `deleteBot` each make one read before the delete
+  (object id, app id).
+- A bot deleted before 0.9.2 is not recorded as retired; the guard covers
+  deletes made from this version on.
+
 ## 0.9.1
 
 Fixes for two defects of the Teams provisioner found at the rollout of native

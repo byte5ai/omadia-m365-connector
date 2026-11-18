@@ -320,6 +320,10 @@ describe('createTeamsProvisioner — capability assembly', () => {
       // take the app back out of the tenant catalog.
       'purgeDeletedAppRegistration',
       'removeFromCatalog',
+      // 0.9.2 (byte5ai/omadia#2043 D10) — the Bot Connector probe and the
+      // recycle-bin lookup a reset confirms its purge with.
+      'probeBot',
+      'findDeletedAppRegistration',
     ] as const) {
       assert.equal(typeof provisioner[step], 'function', `missing step ${step}`);
     }
@@ -434,7 +438,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         mail for native facilitators (#18, epic byte5ai/omadia#2043).
     // 0.9.1 — Graph errors arrive whole and structured; the chat listing pages
     //         to the end and reports truncation (byte5ai/omadia#2043 D7, D8).
-    assert.equal(pkg.version, '0.9.1');
+    // 0.9.2 — a deleted identity is over: honest purge, no restore, no second
+    //         bot under a used app id, and `probeBot` (byte5ai/omadia#2043 D10).
+    assert.equal(pkg.version, '0.9.2');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

@@ -504,8 +504,13 @@ describe('deleteAppRegistration — the idempotent rollback half', () => {
 
     assert.equal(result.outcome, 'deleted');
     assert.equal(vault.size, 0);
-    const del = graphCalls(calls)[0]!;
-    assert.equal(del.init?.method, 'DELETE');
+    // 0.9.2: the object id is read first, so the purge that follows knows
+    // this application was deleted moments ago.
+    assert.deepEqual(
+      graphCalls(calls).map((c) => c.init?.method),
+      ['GET', 'DELETE'],
+    );
+    const del = graphCalls(calls)[1]!;
     assert.ok(del.url.endsWith(`/applications(appId='${APP_ID}')`));
   });
 
@@ -723,37 +728,43 @@ describe('createAppRegistration — the recycle bin (#916)', () => {
     deletedDateTime: '2026-08-28T10:19:32Z',
   };
 
-  it('soft-deleted holder → restores it and adopts the registration', async () => {
+  const NEW_APP_BODY = {
+    ...APP_BODY,
+    id: 'bbbbbbbb-0000-4000-8000-000000000002',
+    appId: '22222222-0000-4000-8000-000000000002',
+  };
+
+  // 0.9.2 (byte5ai/omadia#2043 D10): until 0.9.1 the tombstone was RESTORED,
+  // which brought the old client id back; the bot re-created under it was
+  // rejected by the Bot Connector for good.
+  it('soft-deleted holder → purges it and creates a NEW registration, never restores', async () => {
     const routes: Route[] = [
-      route('passwordCredentials', { status: 200, body: { passwordCredentials: [] } }),
-      route('/restore', { status: 200, body: APP_BODY }),
+      route('/deletedItems/del-0001', { status: 204 }),
       route('/deletedItems/microsoft.graph.application', {
         status: 200,
         body: { value: [DELETED_ITEM] },
       }),
       route('/addPassword', { status: 200, body: PASSWORD_BODY }),
-      route('/servicePrincipals', { status: 409, body: {} }),
-      route(
-        "/applications(uniqueName='",
-        { status: 404, body: {} },
-        { status: 200, body: APP_BODY },
-      ),
-      route('/applications', UNIQUE_NAME_TAKEN),
+      route('/servicePrincipals', { status: 201, body: {} }),
+      route("/applications(uniqueName='", { status: 404, body: {} }),
+      route('/applications/', { status: 200, body: NEW_APP_BODY }),
+      route('/applications', UNIQUE_NAME_TAKEN, { status: 201, body: NEW_APP_BODY }),
     ];
     const { client, calls } = harness(routes);
     const result = await client.createAppRegistration(CREATE_INPUT);
 
-    assert.equal(result.outcome, 'already-existed');
-    assert.equal(result.value.appId, APP_ID);
-    const restore = graphCalls(calls).find((c) => c.url.includes('/restore'));
-    assert.ok(restore, 'expected the recycle-bin restore');
-    assert.equal(restore!.init?.method, 'POST');
-    assert.ok(restore!.url.includes('deletedItems/del-0001/restore'));
+    assert.equal(result.outcome, 'created');
+    assert.equal(result.value.appId, NEW_APP_BODY.appId);
+    assert.notEqual(result.value.appId, DELETED_ITEM.appId, 'the old client id came back');
+    const graph = graphCalls(calls);
+    assert.ok(!graph.some((c) => c.url.includes('/restore')), 'the tombstone was restored');
+    const purge = graph.find((c) => c.url.endsWith('/directory/deletedItems/del-0001'));
+    assert.equal(purge?.init?.method, 'DELETE');
   });
 
-  it('restore fails → an error that names the object and the 30-day window', async () => {
+  it('purge fails → an error that names the object and the 30-day window, and no restore', async () => {
     const routes: Route[] = [
-      route('/restore', { status: 400, body: { error: 'nope' } }),
+      route('/deletedItems/del-0001', { status: 400, body: { error: 'nope' } }),
       route('/deletedItems/microsoft.graph.application', {
         status: 200,
         body: { value: [DELETED_ITEM] },
@@ -761,7 +772,7 @@ describe('createAppRegistration — the recycle bin (#916)', () => {
       route("/applications(uniqueName='", { status: 404, body: {} }),
       route('/applications', UNIQUE_NAME_TAKEN),
     ];
-    const { client } = harness(routes);
+    const { client, calls } = harness(routes);
     const err = await rejection(client.createAppRegistration(CREATE_INPUT));
 
     assert.ok(err instanceof UniqueNameReservedError);
@@ -771,6 +782,32 @@ describe('createAppRegistration — the recycle bin (#916)', () => {
     assert.equal(err.retentionDays, 30);
     assert.match(err.message, /30 days/);
     assert.match(err.message, /soft-deleted application 'del-0001'/);
+    assert.match(err.message, /Do not restore it/);
+    assert.ok(!graphCalls(calls).some((c) => c.url.includes('/restore')));
+  });
+
+  it('name still taken after the purge → says so after the bounded wait', async () => {
+    const routes: Route[] = [
+      route('/deletedItems/del-0001', { status: 204 }),
+      route(
+        '/deletedItems/microsoft.graph.application',
+        { status: 200, body: { value: [DELETED_ITEM] } },
+        { status: 200, body: { value: [] } },
+      ),
+      route("/applications(uniqueName='", { status: 404, body: {} }),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ];
+    const { client, calls } = harness(routes, { maxAttempts: 3 });
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof UniqueNameReservedError);
+    assert.match(err.message, /still taken after 3 attempts/);
+    assert.match(err.message, /was purged, but Entra has not released the name yet/);
+    // One first POST, then one per attempt.
+    const posts = graphCalls(calls).filter(
+      (c) => c.init?.method === 'POST' && c.url.endsWith('/applications'),
+    );
+    assert.equal(posts.length, 4);
   });
 
   it('recycle bin unreadable → still explains WHY the name is taken', async () => {

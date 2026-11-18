@@ -699,6 +699,62 @@ export class DeletedObjectIdMismatchError extends TeamsProvisionerError {
 }
 
 /**
+ * The application recycle bin could not be read, so nothing can be said about
+ * whether it holds an application (since 0.9.2).
+ *
+ * Thrown where "not found" would be read as "the name and the client id are
+ * free". Reading `directory/deletedItems` needs `Application.ReadWrite.All`;
+ * `Application.ReadWrite.OwnedBy` alone does not cover it.
+ */
+export class RecycleBinUnreadableError extends TeamsProvisionerError {
+  /** The application (client) id that was looked for. */
+  public readonly appId: string;
+
+  constructor(appId: string) {
+    super(
+      `recycle_bin_unreadable: could not read the application recycle bin while looking ` +
+        `for '${appId}' (directory/deletedItems needs Application.ReadWrite.All). Whether a ` +
+        'soft-deleted application still holds its name and client id is unknown',
+    );
+    this.name = 'RecycleBinUnreadableError';
+    this.appId = appId;
+  }
+}
+
+/**
+ * `createBot` was asked to create a bot resource under an app id whose bot
+ * resource was deleted before (since 0.9.2).
+ *
+ * The Bot Connector keeps rejecting such a bot with 401 while Azure Resource
+ * Manager reports the new resource as healthy, and it does not recover
+ * (byte5ai/omadia#2043, rollout defect D10: observed for 52 minutes, then
+ * given up). The way out is a new app registration, i.e. a new client id.
+ * Deterministic, never transient.
+ */
+export class BotAppIdRetiredError extends TeamsProvisionerError {
+  /** The handle that was to be created. */
+  public readonly botName: string;
+  /** The app id that already had a bot resource. */
+  public readonly msaAppId: string;
+  /** When that earlier bot resource was deleted (ISO-8601), when recorded. */
+  public readonly retiredAt?: string;
+
+  constructor(botName: string, msaAppId: string, retiredAt?: string) {
+    super(
+      `bot_app_id_retired: app id '${msaAppId}' already had an Azure bot resource, which was ` +
+        `deleted${retiredAt !== undefined ? ` at ${retiredAt}` : ''}. A bot re-created under the ` +
+        `same app id is rejected by the Bot Connector (401) although Azure reports it healthy, ` +
+        `so '${botName}' was not created. Delete this identity completely, including its app ` +
+        'registration, and provision it again: it gets a new app id',
+    );
+    this.name = 'BotAppIdRetiredError';
+    this.botName = botName;
+    this.msaAppId = msaAppId;
+    if (retiredAt !== undefined) this.retiredAt = retiredAt;
+  }
+}
+
+/**
  * HTTP statuses that mean "the same call can succeed later": throttling,
  * request timeouts and the 5xx family. Deliberately NOT 404 — a bare
  * not-found is a legitimate terminal answer for most steps; the ONE 404 that
@@ -727,6 +783,9 @@ export function isTransientProvisioningFailure(err: unknown): boolean {
   if (err instanceof DirectoryReplicationError) return true;
   // A taken global bot handle is a verdict, not a hiccup — never retry it.
   if (err instanceof BotHandleUnavailableError) return false;
+  // Same for an app id that already had a bot: only a new registration helps.
+  if (err instanceof BotAppIdRetiredError) return false;
+  if (err instanceof RecycleBinUnreadableError) return false;
   // Same shape of verdict for the chat direction: a missing/invisible chat and
   // a wrong-kind target id both answer identically until a human changes the
   // id. Listed explicitly so neither leans on the message-pattern fallback.

@@ -68,17 +68,19 @@ import {
 import {
   GRAPH_BASE,
   UNIQUE_NAME_CONFLICT_RULES,
-  findDeletedApplicationByAppId,
-  findDeletedApplicationByUniqueName,
+  lookUpDeletedApplication,
   purgeDeletedApplication,
-  restoreDeletedApplication,
+  resolveReplicationOptions,
   retryWhileReplicating,
   waitForApplicationAddressable,
+  type DeletedApplication,
+  type DeletedApplicationLookup,
   type ReplicationOptions,
 } from './directory.js';
 import {
   DELETED_ITEM_RETENTION_DAYS,
   DeletedObjectIdMismatchError,
+  RecycleBinUnreadableError,
   UniqueNameReservedError,
   isTransientProvisioningFailure,
 } from './errors.js';
@@ -123,7 +125,20 @@ export interface AppRegistrationClientOptions {
    * runner's own retry cadence.
    */
   readonly replication?: ReplicationOptions;
+  /** Clock for "deleted moments ago". Tests inject one. */
+  readonly now?: () => number;
 }
+
+/**
+ * How long a delete made through this client counts as "moments ago": within
+ * it, an application that is neither live nor in the recycle bin is treated as
+ * not replicated yet, never as gone (byte5ai/omadia#2043, rollout defect D10).
+ */
+const RECENT_DELETE_WINDOW_MS = 10 * 60_000;
+/** Looks into the recycle bin for a tombstone this client expects there. */
+const PURGE_CONFIRM_ATTEMPTS = 6;
+/** Looks for a tombstone nobody announced, before the bin's answer is believed. */
+const PURGE_RECHECK_ATTEMPTS = 2;
 
 export interface CreateAppRegistrationInput {
   readonly displayName: string;
@@ -194,8 +209,21 @@ export interface DeleteAppRegistrationResult {
   readonly outcome: DeleteAppRegistrationOutcome;
 }
 
-/** Idempotent purge signal — an entry already gone is a purge already done. */
-export type PurgeDeletedAppRegistrationOutcome = 'purged' | 'already-absent';
+/**
+ * What a purge established.
+ *
+ * - `'purged'`: Entra removed the recycle-bin entry now.
+ * - `'already-absent'`: the recycle bin was READ and does not hold the entry,
+ *   and this client did not delete the application moments ago.
+ * - `'unconfirmed'` (since 0.9.2): neither of the above could be established.
+ *   The application was deleted moments ago and its entry has not appeared in
+ *   the recycle bin yet, or the bin could not be read. The `uniqueName` and
+ *   the client id may still be held: ask again, do not provision on top.
+ */
+export type PurgeDeletedAppRegistrationOutcome =
+  | 'purged'
+  | 'already-absent'
+  | 'unconfirmed';
 
 export interface PurgeDeletedAppRegistrationInput {
   /**
@@ -213,7 +241,24 @@ export interface PurgeDeletedAppRegistrationInput {
 
 export interface PurgeDeletedAppRegistrationResult {
   readonly outcome: PurgeDeletedAppRegistrationOutcome;
+  /** Why the outcome is `'unconfirmed'`. */
+  readonly detail?: string;
 }
+
+export interface FindDeletedAppRegistrationInput {
+  /** Entra application (client) id to look for in the recycle bin. */
+  readonly appId: string;
+}
+
+/** A recycle bin that was READ, and what it holds for the application. */
+export type FindDeletedAppRegistrationResult =
+  | {
+      readonly found: true;
+      /** Directory object id — what {@link PurgeDeletedAppRegistrationInput} takes. */
+      readonly objectId: string;
+      readonly deletedDateTime?: string;
+    }
+  | { readonly found: false };
 
 /**
  * Create/find, secret-rotate and roll back Entra app registrations. One step
@@ -226,8 +271,16 @@ export class AppRegistrationClient {
   private readonly tenantId: string;
   private readonly log: (msg: string) => void;
   private readonly replication: ReplicationOptions;
+  private readonly now: () => number;
+  /**
+   * Applications deleted through this client, by lower-cased app id AND
+   * object id → time of the delete. In memory on purpose: it only has to
+   * outlive Entra's replication of that delete, which is seconds.
+   */
+  private readonly recentDeletes = new Map<string, number>();
 
   constructor(opts: AppRegistrationClientOptions) {
+    this.now = opts.now ?? Date.now;
     this.http = opts.http;
     this.secrets = opts.secrets;
     this.tenantId = requireNonEmpty(opts.tenantId, 'tenantId');
@@ -245,9 +298,10 @@ export class AppRegistrationClient {
    * `secretRef` is returned), and ensure the service principal exists.
    *
    * The `Idempotent` outcome reflects the REGISTRATION: `'already-existed'`
-   * means the app was found via `uniqueName` (possibly restored from the
-   * recycle bin) — the secret is still rotated (deterministic vault key,
-   * intended overwrite) and the service principal still ensured.
+   * means a LIVE app was found via `uniqueName` — the secret is still rotated
+   * (deterministic vault key, intended overwrite) and the service principal
+   * still ensured. A soft-deleted app holding the name is purged and replaced
+   * by a new registration (`'created'`, new client id), never restored.
    *
    * Safe to re-run, and interruption-friendly: `onRegistrationCreated` fires
    * the moment the registration exists so the caller can persist `appId`
@@ -367,6 +421,10 @@ export class AppRegistrationClient {
     input: DeleteAppRegistrationInput,
   ): Promise<DeleteAppRegistrationResult> {
     const appId = requireAppId(input.appId);
+    // The purge that follows a delete addresses the OBJECT id, so learn it
+    // while the application can still be read: it is what lets that purge
+    // know "this was deleted moments ago" (see `recentDeletes`).
+    const objectId = await this.objectIdOfLiveApplication(appId);
     const response = await this.http.request({
       resource: 'graph',
       method: 'DELETE',
@@ -378,6 +436,10 @@ export class AppRegistrationClient {
     });
     if (response.kind === 'conflict') {
       throw new Error('graph applications.delete unexpected 409');
+    }
+    // Live a moment ago and deleted now, by this call or by someone racing it.
+    if (response.status !== 404 || objectId !== undefined) {
+      this.rememberDelete(appId, objectId);
     }
     if (input.secretRef !== undefined) {
       await deleteAppPassword(this.secrets, input.secretRef);
@@ -399,7 +461,11 @@ export class AppRegistrationClient {
    * intent is to free the slug, not to keep the app recoverable — a purge is
    * irreversible, and the appId dies with the object.
    *
-   * Idempotent: an entry that is not in the bin answers `'already-absent'`.
+   * Idempotent: an entry the bin provably does not hold answers
+   * `'already-absent'`. Since 0.9.2 that needs a bin that was read; right
+   * after a delete made through this client the bin is asked up to
+   * {@link PURGE_CONFIRM_ATTEMPTS} times for the tombstone, which is purged
+   * when it appears, and `'unconfirmed'` is the answer when it does not.
    *
    * WITH ONE GUARD. Passing an `appId` here would 404 exactly like an entry
    * that was genuinely purged, so a bare 404 is not evidence of anything. This
@@ -412,25 +478,151 @@ export class AppRegistrationClient {
     input: PurgeDeletedAppRegistrationInput,
   ): Promise<PurgeDeletedAppRegistrationResult> {
     const objectId = requireNonEmpty(input.objectId, 'objectId');
-    const outcome = await purgeDeletedApplication(this.http, objectId, [
-      APP_REGISTRATION_SCOPE,
-    ]);
-    if (outcome === 'purged') return { outcome };
+    const purge = (): Promise<'purged' | 'already-absent'> =>
+      purgeDeletedApplication(this.http, objectId, [APP_REGISTRATION_SCOPE]);
+    if ((await purge()) === 'purged') return this.purged(objectId);
 
-    // 404. Either it was already purged, or we were handed the wrong GUID.
-    const misaddressed = await findDeletedApplicationByAppId(
+    // 404. One of: purged before, the wrong GUID, or a delete whose tombstone
+    // has not replicated into the recycle bin yet. Only the bin can tell, and
+    // only when it can be read; a bare 404 is evidence of nothing. That last
+    // case is the one 0.9.1 reported as 'already-absent' milliseconds after a
+    // delete, and the next run revived the application (D10).
+    const deletedMomentsAgo = this.wasDeletedRecently(objectId);
+    const { intervalMs, sleep } = resolveReplicationOptions(this.replication);
+    const attempts = deletedMomentsAgo ? PURGE_CONFIRM_ATTEMPTS : PURGE_RECHECK_ATTEMPTS;
+    let lookup: DeletedApplicationLookup = { readable: false };
+
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      if (attempt > 0) await sleep(Math.min(intervalMs * 2 ** (attempt - 1), 8000));
+      lookup = await this.lookUpDeleted(
+        (candidate) =>
+          candidate.objectId.toLowerCase() === objectId.toLowerCase() ||
+          candidate.appId?.toLowerCase() === objectId.toLowerCase(),
+        objectId,
+      );
+      const tombstone = lookup.found;
+      if (tombstone === undefined) continue;
+      if (tombstone.objectId.toLowerCase() !== objectId.toLowerCase()) {
+        throw new DeletedObjectIdMismatchError(objectId, tombstone.objectId);
+      }
+      if ((await purge()) === 'purged') return this.purged(objectId);
+      // Listed but not purgeable yet: the two paths replicate separately.
+    }
+
+    if (lookup.found !== undefined) {
+      return this.unconfirmed(
+        objectId,
+        'the recycle bin lists the application, but the permanent delete answered 404',
+      );
+    }
+    if (!lookup.readable) {
+      return this.unconfirmed(
+        objectId,
+        'the recycle bin could not be read (it needs Application.ReadWrite.All), ' +
+          'so a 404 on the permanent delete proves nothing',
+      );
+    }
+    if (deletedMomentsAgo) {
+      return this.unconfirmed(
+        objectId,
+        `the application was deleted moments ago and its entry did not appear in the ` +
+          `recycle bin within ${String(attempts)} looks`,
+      );
+    }
+    return { outcome: 'already-absent' };
+  }
+
+  /**
+   * Is the application in the recycle bin (since 0.9.2)? Answers only for a
+   * bin that was READ: when it cannot be, this throws
+   * {@link RecycleBinUnreadableError} instead of answering `found: false`,
+   * because "not found" would read as "the name and the client id are free".
+   */
+  async findDeletedAppRegistration(
+    input: FindDeletedAppRegistrationInput,
+  ): Promise<FindDeletedAppRegistrationResult> {
+    const appId = requireAppId(input.appId).toLowerCase();
+    const lookup = await this.lookUpDeleted(
+      (candidate) => candidate.appId?.toLowerCase() === appId,
+      appId,
+    );
+    if (lookup.found !== undefined) {
+      return {
+        found: true,
+        objectId: lookup.found.objectId,
+        ...(lookup.found.deletedDateTime !== undefined
+          ? { deletedDateTime: lookup.found.deletedDateTime }
+          : {}),
+      };
+    }
+    if (!lookup.readable) throw new RecycleBinUnreadableError(appId);
+    return { found: false };
+  }
+
+  private lookUpDeleted(
+    predicate: (candidate: DeletedApplication) => boolean,
+    label: string,
+  ): Promise<DeletedApplicationLookup> {
+    return lookUpDeletedApplication(
       this.http,
-      objectId,
+      predicate,
+      label,
       [APP_REGISTRATION_SCOPE],
       this.log,
     );
-    if (misaddressed !== undefined) {
-      throw new DeletedObjectIdMismatchError(objectId, misaddressed.objectId);
+  }
+
+  private purged(objectId: string): PurgeDeletedAppRegistrationResult {
+    this.recentDeletes.delete(objectId.toLowerCase());
+    return { outcome: 'purged' };
+  }
+
+  private unconfirmed(
+    objectId: string,
+    detail: string,
+  ): PurgeDeletedAppRegistrationResult {
+    this.log(
+      `provisioner directory.deletedItems.delete: purge of '${objectId}' unconfirmed — ${detail}`,
+    );
+    return { outcome: 'unconfirmed', detail };
+  }
+
+  /** `id` of the live application behind `appId`, when it can be read. */
+  private async objectIdOfLiveApplication(
+    appId: string,
+  ): Promise<string | undefined> {
+    try {
+      const response = await this.http.request({
+        resource: 'graph',
+        method: 'GET',
+        url: `${GRAPH_BASE}/applications(appId='${appId}')?$select=id`,
+        step: 'applications.get',
+        missingScopesOn403: [APP_REGISTRATION_SCOPE],
+        extraOkStatuses: [404],
+      });
+      if (response.kind !== 'ok' || response.status === 404) return undefined;
+      const id = (response.json as Record<string, unknown> | null)?.['id'];
+      return typeof id === 'string' && id !== '' ? id : undefined;
+    } catch (err) {
+      // The delete must not depend on this read.
+      this.log(
+        `provisioner applications.delete: could not read the object id of '${appId}' ` +
+          `before deleting it (${String(err)})`,
+      );
+      return undefined;
     }
-    // The probe is best-effort (it needs a scope the provisioner may not
-    // have); a miss means we have no evidence AGAINST 'already-absent', which
-    // is the honest answer for an idempotent delete.
-    return { outcome: 'already-absent' };
+  }
+
+  private rememberDelete(appId: string, objectId: string | undefined): void {
+    const at = this.now();
+    this.recentDeletes.set(appId.toLowerCase(), at);
+    if (objectId !== undefined) this.recentDeletes.set(objectId.toLowerCase(), at);
+  }
+
+  /** Was this app id or object id deleted through this client moments ago? */
+  private wasDeletedRecently(id: string): boolean {
+    const at = this.recentDeletes.get(id.toLowerCase());
+    return at !== undefined && this.now() - at < RECENT_DELETE_WINDOW_MS;
   }
 
   /**
@@ -457,10 +649,27 @@ export class AppRegistrationClient {
     return this.parseApplication(response, 'applications.get', tenantMode);
   }
 
-  /** `POST /applications`; a taken `uniqueName` → find + adopt the existing app. */
+  /** `POST /applications`; a taken `uniqueName` → {@link resolveTakenUniqueName}. */
   private async registerApplication(
     input: CreateAppRegistrationInput,
   ): Promise<{ registration: AppRegistration; outcome: IdempotentOutcome }> {
+    const created = await this.postApplication(input);
+    if (created !== undefined) return { registration: created, outcome: 'created' };
+
+    // The uniqueName idempotency key is already taken.
+    if (input.uniqueName === undefined) {
+      throw new Error(
+        'graph applications.create conflict without a uniqueName — cannot resolve ' +
+          'the conflicting registration; pass a stable uniqueName for idempotent re-runs',
+      );
+    }
+    return this.resolveTakenUniqueName(input, input.uniqueName);
+  }
+
+  /** One `POST /applications`; `undefined` = the `uniqueName` is taken. */
+  private async postApplication(
+    input: CreateAppRegistrationInput,
+  ): Promise<AppRegistration | undefined> {
     const response = await this.http.request({
       resource: 'graph',
       method: 'POST',
@@ -476,113 +685,142 @@ export class AppRegistrationClient {
       },
       missingScopesOn403: [APP_REGISTRATION_SCOPE],
       // Entra reports a taken uniqueName as 400, not 409 — without these
-      // rules the adopt branch below can never be reached.
+      // rules the taken-name branch can never be reached.
       conflictOn: UNIQUE_NAME_CONFLICT_RULES,
     });
-
-    if (response.kind === 'ok') {
-      return {
-        registration: this.parseApplication(
-          response,
-          'applications.create',
-          input.tenantMode,
-        ),
-        outcome: 'created',
-      };
-    }
-
-    // The uniqueName idempotency key is already taken — find and adopt.
-    if (input.uniqueName === undefined) {
-      throw new Error(
-        'graph applications.create conflict without a uniqueName — cannot resolve ' +
-          'the conflicting registration; pass a stable uniqueName for idempotent re-runs',
-      );
-    }
-    return {
-      registration: await this.adoptByUniqueName(input, input.uniqueName),
-      outcome: 'already-existed',
-    };
+    if (response.kind !== 'ok') return undefined;
+    return this.parseApplication(response, 'applications.create', input.tenantMode);
   }
 
   /**
-   * Resolve the registration behind a taken `uniqueName`.
+   * Resolve a taken `uniqueName`. Two possible owners of the name:
    *
-   * Two possible owners of the name:
+   * - a LIVE application — the normal idempotent re-run: adopt it (fresh
+   *   secret, service principal ensured). Not when this client deleted that
+   *   application moments ago and the delete has only not replicated yet:
+   *   that one is on its way into the recycle bin and is waited for.
+   * - a SOFT-DELETED application — invisible in `GET /applications`, holding
+   *   the name for {@link DELETED_ITEM_RETENTION_DAYS} days. It is PURGED and
+   *   a new application is created, with a new client id.
    *
-   * - a LIVE application — the normal idempotent re-run: look it up by the
-   *   alternate key and adopt it (fresh secret, service principal ensured).
-   * - a SOFT-DELETED application — invisible in `GET /applications` yet still
-   *   holding the name for {@link DELETED_ITEM_RETENTION_DAYS} days. Restoring
-   *   it is the only way to free the name early, and it returns the SAME
-   *   object (same appId, same uniqueName) — exactly what re-provisioning the
-   *   agent slug is supposed to yield. Restricted to an object whose
-   *   `uniqueName` matches ours exactly, i.e. one this provisioner owns.
+   * NEVER RESTORED (since 0.9.2). Until 0.9.1 the tombstone was restored,
+   * which brought back the same client id. A bot resource re-created under an
+   * app id that had one before is rejected by the Bot Connector for good
+   * (401), while Azure reports it healthy (byte5ai/omadia#2043, rollout
+   * defect D10). A deleted identity is over; its name goes to a new one.
+   * Restricted to a tombstone whose `uniqueName` matches ours exactly, i.e.
+   * one this provisioner owns.
    *
-   * If neither resolves, the operator finally learns WHY the name is taken
-   * instead of reading "already exists" about an object they cannot see.
+   * The purge and the freed name both replicate, so this polls on the
+   * replication budget. If the name is still not free at the end, the
+   * operator learns WHY instead of reading "already exists" about an object
+   * they cannot see.
    */
-  private async adoptByUniqueName(
+  private async resolveTakenUniqueName(
     input: CreateAppRegistrationInput,
     uniqueName: string,
-  ): Promise<AppRegistration> {
-    const live = await this.findByUniqueName(uniqueName, input.tenantMode);
-    if (live !== undefined) return live;
+  ): Promise<{ registration: AppRegistration; outcome: IdempotentOutcome }> {
+    const { maxAttempts, intervalMs, sleep } = resolveReplicationOptions(this.replication);
+    const retiredAppIds = new Set<string>();
+    let lastTombstone: DeletedApplication | undefined;
 
-    const deleted = await findDeletedApplicationByUniqueName(
-      this.http,
-      uniqueName,
-      [APP_REGISTRATION_SCOPE],
-      this.log,
-    );
-    if (deleted === undefined) {
-      throw new UniqueNameReservedError(uniqueName, {
-        hint:
-          `'${uniqueName}' is already taken but no matching application is visible. ` +
-          `A deleted Entra app keeps its uniqueName reserved for ${String(DELETED_ITEM_RETENTION_DAYS)} days ` +
-          `while sitting in the recycle bin, and the recycle bin could not be read ` +
-          `(it needs Application.ReadWrite.All, not just ${APP_REGISTRATION_SCOPE}). ` +
-          `Check 'directory/deletedItems/microsoft.graph.application' in the tenant, then ` +
-          `restore that object, or permanently delete it to free the name immediately, ` +
-          `or provision under a different name.`,
-      });
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      if (attempt > 0) await sleep(Math.min(intervalMs * 2 ** (attempt - 1), 8000));
+
+      const live = await this.findByUniqueName(uniqueName, input.tenantMode);
+      const liveIsBeingDeleted =
+        live !== undefined &&
+        (this.wasDeletedRecently(live.appId) || retiredAppIds.has(live.appId.toLowerCase()));
+      if (live !== undefined && !liveIsBeingDeleted) {
+        return { registration: live, outcome: 'already-existed' };
+      }
+
+      const lookup = await this.lookUpDeleted(
+        (candidate) => candidate.uniqueName === uniqueName,
+        uniqueName,
+      );
+      if (lookup.found !== undefined) {
+        lastTombstone = lookup.found;
+        if (lookup.found.appId !== undefined) {
+          retiredAppIds.add(lookup.found.appId.toLowerCase());
+        }
+        await this.purgeTombstone(lookup.found, uniqueName);
+      } else if (!lookup.readable && lastTombstone === undefined && live === undefined) {
+        throw this.nameReservedUnseen(uniqueName);
+      }
+      if (live !== undefined) continue;
+
+      const created = await this.postApplication(input);
+      if (created === undefined) continue;
+      if (retiredAppIds.has(created.appId.toLowerCase())) {
+        throw new Error(
+          `graph applications.create: the new registration for '${uniqueName}' came back with ` +
+            `client id '${created.appId}' of the application that was just purged — refusing to use it`,
+        );
+      }
+      return { registration: created, outcome: 'created' };
     }
 
+    throw new UniqueNameReservedError(uniqueName, {
+      ...(lastTombstone !== undefined ? { deletedObjectId: lastTombstone.objectId } : {}),
+      ...(lastTombstone?.deletedDateTime !== undefined
+        ? { deletedDateTime: lastTombstone.deletedDateTime }
+        : {}),
+      hint:
+        `'${uniqueName}' is still taken after ${String(maxAttempts)} attempts` +
+        (lastTombstone !== undefined
+          ? `: soft-deleted application '${lastTombstone.objectId}' held it and was purged, but ` +
+            `Entra has not released the name yet`
+          : `, and no live application and no recycle-bin entry with that name is visible`) +
+        `. Run provisioning again in a minute, or provision under a different name.`,
+    });
+  }
+
+  /** Permanently delete the tombstone that holds `uniqueName`. */
+  private async purgeTombstone(
+    tombstone: DeletedApplication,
+    uniqueName: string,
+  ): Promise<void> {
+    const deletedAt =
+      tombstone.deletedDateTime !== undefined ? ` (deleted ${tombstone.deletedDateTime})` : '';
     this.log(
       `provisioner applications.create: '${uniqueName}' is held by soft-deleted app ` +
-        `'${deleted.objectId}'${deleted.deletedDateTime !== undefined ? ` (deleted ${deleted.deletedDateTime})` : ''} — restoring it`,
+        `'${tombstone.objectId}'${deletedAt} — purging it; the new registration gets a new client id`,
     );
     try {
-      await restoreDeletedApplication(this.http, deleted.objectId, [
-        APP_REGISTRATION_SCOPE,
-      ]);
+      await purgeDeletedApplication(this.http, tombstone.objectId, [APP_REGISTRATION_SCOPE]);
     } catch (err) {
       throw new UniqueNameReservedError(
         uniqueName,
         {
-          deletedObjectId: deleted.objectId,
-          ...(deleted.deletedDateTime !== undefined
-            ? { deletedDateTime: deleted.deletedDateTime }
+          deletedObjectId: tombstone.objectId,
+          ...(tombstone.deletedDateTime !== undefined
+            ? { deletedDateTime: tombstone.deletedDateTime }
             : {}),
           hint:
-            `'${uniqueName}' is reserved by soft-deleted application '${deleted.objectId}'` +
-            `${deleted.deletedDateTime !== undefined ? ` (deleted ${deleted.deletedDateTime})` : ''}. ` +
-            `Entra holds the name for ${String(DELETED_ITEM_RETENTION_DAYS)} days after a delete and restoring ` +
-            `it failed (${String(err)}). Restore it manually, or permanently delete it ` +
-            `(DELETE /directory/deletedItems/${deleted.objectId}) which frees the name ` +
-            `immediately, or provision under a different name.`,
+            `'${uniqueName}' is reserved by soft-deleted application '${tombstone.objectId}'${deletedAt}. ` +
+            `Entra holds the name for ${String(DELETED_ITEM_RETENTION_DAYS)} days after a delete, and ` +
+            `permanently deleting it failed (${String(err)}). Delete it permanently by hand ` +
+            `(DELETE /directory/deletedItems/${tombstone.objectId}), which frees the name ` +
+            `immediately, or provision under a different name. Do not restore it: a bot ` +
+            `re-created under its old client id is rejected by Teams.`,
         },
         err,
       );
     }
+  }
 
-    // The restore is itself replicated — the app is not readable instantly.
-    const restored = await retryWhileReplicating(
-      'applications.findByUniqueName',
-      deleted.objectId,
-      () => this.findByUniqueName(uniqueName, input.tenantMode),
-      this.replication,
-    );
-    return restored;
+  private nameReservedUnseen(uniqueName: string): UniqueNameReservedError {
+    return new UniqueNameReservedError(uniqueName, {
+      hint:
+        `'${uniqueName}' is already taken but no matching application is visible. ` +
+        `A deleted Entra app keeps its uniqueName reserved for ${String(DELETED_ITEM_RETENTION_DAYS)} days ` +
+        `while sitting in the recycle bin, and the recycle bin could not be read ` +
+        `(it needs Application.ReadWrite.All, not just ${APP_REGISTRATION_SCOPE}). ` +
+        `Check 'directory/deletedItems/microsoft.graph.application' in the tenant and ` +
+        `permanently delete that object to free the name, or provision under a different ` +
+        `name. Do not restore it: a bot re-created under its old client id is rejected by Teams.`,
+    });
   }
 
   /** `GET /applications(uniqueName='…')` — `undefined` when no live app holds it. */

@@ -284,17 +284,99 @@ adoptable.
 **The recycle bin.** A deleted application is only SOFT-deleted, and its
 `uniqueName` stays reserved for 30 days while the object is invisible in
 `GET /applications`. On a conflict the step therefore looks in
-`directory/deletedItems/microsoft.graph.application` and **restores** the
-holder when it is one of ours (exact `uniqueName` match) — a restore returns
-the original object, which is exactly what re-provisioning the same agent slug
-should yield. If the recycle bin cannot be read (it needs
-`Application.ReadWrite.All`, which this connector deliberately does not ask
-for) or the restore fails, the step raises `UniqueNameReservedError`, whose
-message says *why* the name is unavailable, for how long, and which object to
-act on — instead of a bare "already exists" about an object the operator
-cannot find. Permanently deleting that recycle-bin entry frees the name
-immediately (verified against a live tenant), but it destroys the app and its
-`appId` with it, so it is the operator's escape hatch, not the provisioner's.
+`directory/deletedItems/microsoft.graph.application`. Since 0.9.2 it
+**permanently deletes** the holder when it is one of ours (exact `uniqueName`
+match) and creates a NEW application, which gets a new client id. Until 0.9.1
+it restored the holder; see the next section for why that is over. If the
+recycle bin cannot be read (it needs `Application.ReadWrite.All`), the
+permanent delete fails, or Entra has not released the name after the
+replication budget, the step raises `UniqueNameReservedError`, whose message
+says *why* the name is unavailable and which object to act on — instead of a
+bare "already exists" about an object the operator cannot find.
+
+### A deleted identity is over (since 0.9.2, byte5ai/omadia#2043 D10)
+
+At the rollout of native facilitators a reset soft-deleted an app registration
+and asked for the purge milliseconds later. The tombstone had not replicated
+into the recycle bin, the purge answered 404, the connector reported
+`already-absent`, the next run restored the application (same client id) and
+re-created the bot resource under that app id. The Bot Connector answered
+`401 Authorization has been denied for this request` for that bot from then on
+(observed for 52 minutes, no recovery), Teams showed "invalid bot", and Azure
+Resource Manager reported the resource as healthy. Four rules follow.
+
+**1. A purge says only what it established.** `purgeDeletedAppRegistration`
+answers:
+
+| Outcome | Meaning |
+|---|---|
+| `purged` | Entra removed the recycle-bin entry now |
+| `already-absent` | the recycle bin was read and does not hold the entry, and this connector did not delete the application in the last 10 minutes |
+| `unconfirmed` (new) | neither could be established; `detail` says why. Ask again; do not provision on top |
+
+After a delete made through the same connector process the purge looks into
+the recycle bin up to 6 times (about 30 s), purges the tombstone when it
+appears, and answers `unconfirmed` when it does not. A recycle bin that cannot
+be read also answers `unconfirmed`: until 0.9.1 that was `already-absent`.
+"Deleted moments ago" is kept in memory; after a restart the purge falls back
+to two looks and the recycle bin's answer.
+
+**2. `findDeletedAppRegistration({ appId })`** (new) looks for the application
+in the recycle bin and answers `{ found: true, objectId }` or
+`{ found: false }`. It throws `RecycleBinUnreadableError` when the bin cannot
+be read, because "not found" would read as "the name and the client id are
+free". The kernel's reset uses it to confirm a purge.
+
+**3. `createAppRegistration` never restores.** See "The recycle bin" above. A
+live application under the name is adopted as before, except one this
+connector deleted moments ago whose delete has not replicated: that one is
+waited for and purged.
+
+**4. No second bot resource under an app id that had one.** `deleteBot` reads
+the bot's `msaAppId` before deleting and records it as retired, in the plugin
+vault under `teams_retired_bot_app:<appId>` (a timestamp and the handle, no
+secret). `createBot` throws `BotAppIdRetiredError` (`bot_app_id_retired: …`)
+before the PUT when the app id is recorded and no bot resource exists under
+the handle. Also, a failed Teams-channel enablement no longer deletes the bot
+resource the call had just created: the next run upserts it. Limits: the
+record exists only for bots deleted through 0.9.2 or later, and without
+`permissions.secrets.runtime_write` it lives in memory.
+
+### Bot Connector probe — `probeBot` (since 0.9.2)
+
+`probeBot({ appId })` asks the Bot Connector, as the bot, whether it knows the
+bot. It answers `{ status: 'known' | 'rejected' | 'unverified', detail? }`
+(`rejected` also carries `httpStatus`) and does not throw for anything the
+probe runs into.
+
+1. Token: `POST https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token`,
+   `grant_type=client_credentials`, the bot's app id, the secret stored under
+   `teams_bot_password:<appId>`, `scope=https://api.botframework.com/.default`
+   ([Authenticate requests with the Bot Connector API](https://learn.microsoft.com/azure/bot-service/rest-api/bot-framework-rest-connector-authentication), single-tenant).
+2. `POST https://smba.trafficmanager.net/teams/v3/conversations` with
+   `{ bot: { id: "28:<appId>" }, members: [{ id: "29:omadia-probe" }], channelData: { tenant: { id } }, isGroup: false }`
+   (body shape from [Send proactive messages](https://learn.microsoft.com/microsoftteams/platform/bots/how-to/conversations/send-proactive-messages)).
+   The member does not exist, so nothing can be created.
+
+| Answer | Result | Basis |
+|---|---|---|
+| Connector `401` | `rejected` | observed at the rollout for the dead bot, with a real member id |
+| Connector `2xx`, `400`, `403`, `404`, `405` | `known` | observed for healthy bots with a real member id: `403 BadArgument` "Bot is not installed in user's personal scope", and `201` |
+| Token `invalid_client` | `rejected`, AADSTS code in `detail` | Entra's verdict on the bot's own credential |
+| no stored secret, other token failure, `429`, `5xx`, timeout, network | `unverified` | nothing was learned |
+
+**Not verified against a tenant:** what a healthy bot answers for the
+fabricated member id. The mapping does not depend on which 4xx that is; it
+would be wrong only if a healthy bot answered 401 to it.
+
+**No memberless probe.** The Connector reference lists
+`GET /v3/conversations`, which needs no member, and says "only Direct Line and
+Web Chat support the get conversations endpoint"
+([Bot Connector API reference](https://learn.microsoft.com/azure/bot-service/rest-api/bot-framework-rest-connector-api-reference)).
+What Teams answers there is unknown, so it is not used.
+
+The service URL is the public-cloud one. GCC, GCC High and DoD have their own
+and are not supported by the probe.
 
 ### Rollback is narrow, on purpose
 

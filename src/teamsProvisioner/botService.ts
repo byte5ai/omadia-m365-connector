@@ -40,8 +40,15 @@
  */
 
 import { ARM_MANAGEMENT_HOST, type ArmConfigResult } from './config.js';
-import { BotHandleUnavailableError, ProvisioningRequestError } from './errors.js';
+import type { SecretsAccessor } from '@omadia/plugin-api';
+
+import {
+  BotAppIdRetiredError,
+  BotHandleUnavailableError,
+  ProvisioningRequestError,
+} from './errors.js';
 import type { ProvisioningHttp, ProvisioningOkResponse } from './http.js';
+import { RetiredBotApps } from './retiredBotApps.js';
 import type {
   AzureBot,
   BotProvisioningOutcome,
@@ -125,6 +132,13 @@ export interface BotServiceClientOptions {
    */
   readonly armConfig: ArmConfigResult;
   readonly log?: (msg: string) => void;
+  /**
+   * Plugin vault accessor — where the app ids of deleted bot resources are
+   * recorded (see `retiredBotApps.ts`). Without it the record is in memory.
+   */
+  readonly secrets?: SecretsAccessor;
+  /** Clock for the retired-app-id records. Tests inject one. */
+  readonly now?: () => number;
 }
 
 /**
@@ -137,6 +151,7 @@ export class BotServiceClient {
   private readonly http: Pick<ProvisioningHttp, 'request'>;
   private readonly armConfig: ArmConfigResult;
   private readonly log: (msg: string) => void;
+  private readonly retired: RetiredBotApps;
 
   constructor(opts: BotServiceClientOptions) {
     this.http = opts.http;
@@ -146,6 +161,11 @@ export class BotServiceClient {
       ((msg: string): void => {
         console.error(msg);
       });
+    this.retired = new RetiredBotApps({
+      log: this.log,
+      ...(opts.secrets !== undefined ? { secrets: opts.secrets } : {}),
+      ...(opts.now !== undefined ? { now: opts.now } : {}),
+    });
   }
 
   /** `true` when the ARM setup fields are configured — feeds `TeamsProvisioner.canCreateBots`. */
@@ -164,9 +184,16 @@ export class BotServiceClient {
    * already existed — the channel enablement still runs (itself idempotent,
    * a 409 counts as already-enabled).
    *
-   * On a channel-enablement failure a bot THIS call created is rolled back
-   * (best-effort, logged), and the original error is rethrown; a
-   * pre-existing bot is left untouched.
+   * On a channel-enablement failure the bot resource is KEPT (since 0.9.2)
+   * and the original error is rethrown: the next run upserts it and enables
+   * the channel. Until 0.9.1 a bot this call had created was deleted again,
+   * and the re-run then created it a second time under the same app id — the
+   * sequence after which the Bot Connector rejects a bot for good.
+   *
+   * NEVER A SECOND BOT UNDER A USED APP ID (since 0.9.2). When the app id is
+   * recorded as having had a bot resource that was deleted, and no bot
+   * resource exists under this handle now, the call throws
+   * {@link BotAppIdRetiredError} before the PUT.
    *
    * In registration-only mode the typed `RegistrationOnlyOutcome` is returned
    * before any token acquisition.
@@ -180,6 +207,7 @@ export class BotServiceClient {
     requireNonEmpty(input.msaAppId, 'msaAppId');
     requireNonEmpty(input.msaAppTenantId, 'msaAppTenantId');
     requireNonEmpty(input.messagingEndpoint, 'messagingEndpoint');
+    await this.refuseRetiredAppId(botName, input.msaAppId);
 
     let response;
     try {
@@ -227,7 +255,11 @@ export class BotServiceClient {
     try {
       await this.enableMsTeamsChannel(botName);
     } catch (err) {
-      await this.rollbackPartialCreate(botName, outcome);
+      this.log(
+        `provisioner botServices.channels.put: enabling Teams on '${botName}' failed — keeping ` +
+          `the bot resource for the next run (deleting and re-creating it under the same app ` +
+          `id is what Teams rejects): ${String(err)}`,
+      );
       throw err;
     }
 
@@ -246,6 +278,9 @@ export class BotServiceClient {
       return this.armConfig;
     }
     const name = requireBotName(botName);
+    // Read the app id while the resource still exists: after the delete it is
+    // recorded as retired, so no later run creates a bot under it again.
+    const msaAppId = await this.msaAppIdOf(name);
     const response = await this.http.request({
       resource: 'arm',
       method: 'DELETE',
@@ -257,6 +292,14 @@ export class BotServiceClient {
     });
     if (response.kind === 'conflict') {
       throw new Error('arm botServices.delete unexpected 409');
+    }
+    if (msaAppId !== undefined) {
+      await this.retired.retire(msaAppId, name);
+    } else if (response.status !== 404) {
+      this.log(
+        `provisioner botServices.delete: '${name}' was deleted, but its app id could not be ` +
+          'read beforehand, so it is not recorded as retired',
+      );
     }
     return {
       kind: 'deleted',
@@ -319,22 +362,28 @@ export class BotServiceClient {
   }
 
   /**
-   * Best-effort rollback after a partial create: only a bot THIS call created
-   * (`'created'`) is deleted — a pre-existing handle is never destroyed by a
-   * failed channel enablement. Failures are logged; the caller rethrows the
-   * original error.
+   * Throw {@link BotAppIdRetiredError} when `msaAppId` already had a bot
+   * resource that was deleted and none exists under `botName` now. A resource
+   * that exists is upserted as before: nothing is re-created.
    */
-  private async rollbackPartialCreate(
-    botName: string,
-    outcome: IdempotentOutcome,
-  ): Promise<void> {
-    if (outcome !== 'created') return;
+  private async refuseRetiredAppId(botName: string, msaAppId: string): Promise<void> {
+    const record = await this.retired.find(msaAppId);
+    if (record === undefined) return;
+    if ((await this.msaAppIdOf(botName))?.toLowerCase() === msaAppId.toLowerCase()) return;
+    throw new BotAppIdRetiredError(botName, msaAppId, record.retiredAt);
+  }
+
+  /** `msaAppId` of the bot resource `botName`, when it exists and can be read. */
+  private async msaAppIdOf(botName: string): Promise<string | undefined> {
     try {
-      await this.deleteBot(botName);
+      const found = await this.getBot(botName);
+      return found.kind === 'found' ? found.bot.msaAppId : undefined;
     } catch (err) {
+      // Neither the delete nor the create may depend on this read.
       this.log(
-        `provisioner rollback: botServices.delete of '${botName}' failed: ${String(err)}`,
+        `provisioner botServices.get: could not read '${botName}' (${String(err)})`,
       );
+      return undefined;
     }
   }
 
