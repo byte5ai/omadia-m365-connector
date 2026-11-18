@@ -128,6 +128,10 @@ export class CapabilityUnavailableError extends TeamsProvisionerError {
  * matching. The message text is unchanged from the plain `Error` this
  * replaced (byte5ai/omadia#916), so existing log lines and assertions keep
  * reading the same.
+ *
+ * Since 0.9.1 it also carries {@link ProvisioningGraphError}, the parsed
+ * error envelope, so a caller classifies on fields instead of on where a
+ * message string happened to be cut.
  */
 export class ProvisioningRequestError extends TeamsProvisionerError {
   /** Which API answered. */
@@ -136,6 +140,8 @@ export class ProvisioningRequestError extends TeamsProvisionerError {
   public readonly step: string;
   /** The HTTP status that was not accepted. */
   public readonly status: number;
+  /** The error envelope of the answer, when its body was one. */
+  public readonly graphError?: ProvisioningGraphError;
 
   constructor(
     resource: 'graph' | 'arm',
@@ -143,13 +149,38 @@ export class ProvisioningRequestError extends TeamsProvisionerError {
     status: number,
     message: string,
     cause?: unknown,
+    graphError?: ProvisioningGraphError,
   ) {
     super(message, cause);
     this.name = 'ProvisioningRequestError';
     this.resource = resource;
     this.step = step;
     this.status = status;
+    if (graphError !== undefined) this.graphError = graphError;
   }
+}
+
+/**
+ * What a Graph or ARM error envelope (`{ error: { code, message, innerError } }`)
+ * said, as fields. The kernel reads `code`, `innerCode`, `message` and `body`
+ * (byte5ai/omadia#2095); the request ids are for a support case with Microsoft.
+ *
+ * Every string went through `redactSecrets` and is bounded. It never holds a
+ * token and never the REQUEST body, only what the API answered.
+ */
+export interface ProvisioningGraphError {
+  /** `error.code`, e.g. `BadRequest`. */
+  readonly code?: string;
+  /** `error.innerError.code`, e.g. `InvalidRequest`. */
+  readonly innerCode?: string;
+  /** `error.message`. */
+  readonly message?: string;
+  /** `request-id` of the answer (inner error, else the response header). */
+  readonly requestId?: string;
+  /** `client-request-id` of the answer (inner error, else the response header). */
+  readonly clientRequestId?: string;
+  /** The whole response body as text. */
+  readonly body?: string;
 }
 
 /**

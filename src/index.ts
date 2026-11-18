@@ -206,9 +206,11 @@ export type {
   RemoveFromCatalogOutcome,
   RemoveFromCatalogResult,
   // Install-target enumeration (0.8.0).
+  ChatList,
   ChatSummary,
   ChatSummaryType,
   ListChatsInput,
+  TeamList,
   TeamSummary,
   AppPackageIcons,
   AppPackageParamValue,

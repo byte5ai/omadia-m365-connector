@@ -85,6 +85,7 @@ import {
   ProvisioningRequestError,
 } from './errors.js';
 import type { ProvisioningHttp } from './http.js';
+import { redactUnknown } from './redact.js';
 
 /**
  * Graph APPLICATION permission the team listing needs — the same role
@@ -96,12 +97,46 @@ export const TEAM_LIST_SCOPE = 'Team.ReadBasic.All';
 const TEAM_LIST_STEP = 'teams.list';
 const CHAT_LIST_STEP = 'chats.list';
 
+const CHAT_MEMBERS_STEP = 'chats.members.list';
+
 /**
- * Page-follow budget. `GET /teams` pages at 100 by default, so 20 pages is
- * ~2000 teams — far past any tenant a human picks from in a dropdown, and a
- * hard stop is what keeps a paging bug from becoming an unbounded loop.
+ * Page bounds. A bound is what keeps a paging bug from becoming an unbounded
+ * loop; hitting one is REPORTED on the result (`truncated`), never only logged.
+ *
+ * Teams page at 100, so 20 pages is 2,000 teams. Chats page at 50 at most and
+ * Graph often returns fewer: at the 0.9.0 rollout 20 pages held 725 chats and
+ * the list stopped there, short and unmarked (byte5ai/omadia#2043, rollout
+ * defect D8). 200 pages is up to 10,000 chats.
  */
-const MAX_LIST_PAGES = 20;
+const MAX_TEAM_PAGES = 20;
+const MAX_CHAT_PAGES = 200;
+/** Wall-clock bound of one chat listing, paging and member lookups together. */
+const CHAT_LIST_TIME_BUDGET_MS = 60_000;
+/** Most chats without a topic whose members are looked up in one listing. */
+const MAX_MEMBER_LOOKUPS = 100;
+const MEMBER_LOOKUP_CONCURRENCY = 5;
+/** Which untitled chats get their names first when the lookups run out. */
+const MEMBER_LOOKUP_ORDER: readonly ChatSummaryType[] = ['group', 'oneOnOne', 'meeting'];
+
+/**
+ * A listing plus whether it is complete. The marks are NON-ENUMERABLE
+ * properties on the array, so a caller written against 0.8.0 (iterate,
+ * `JSON.stringify`, deep-compare) sees the same array as before.
+ */
+export type TeamList = readonly TeamSummary[] & {
+  /** `true` when a bound stopped the listing before Graph's last page. */
+  readonly truncated: boolean;
+};
+
+export type ChatList = readonly ChatSummary[] & {
+  /** `true` when a bound stopped the listing before Graph's last page. */
+  readonly truncated: boolean;
+  /**
+   * How many chats without a topic came back without `memberNames`: the
+   * lookup budget ran out, or Graph refused or returned no names.
+   */
+  readonly withoutMemberNames: number;
+};
 
 /** One team, reduced to what a picker renders. */
 export interface TeamSummary {
@@ -126,14 +161,13 @@ export interface ChatSummary {
   readonly topic: string | null;
   readonly chatType: ChatSummaryType;
   /**
-   * Display names of the chat's members, when Graph expanded them. Present
-   * for the sake of the untitled chats — without it a 1:1 conversation is an
-   * opaque `19:…` string in the picker, which is the problem this whole
-   * module exists to remove.
+   * Display names of the chat's members. Present for the sake of the
+   * untitled chats — without it a 1:1 conversation is an opaque `19:…` string
+   * in the picker, which is the problem this whole module exists to remove.
    *
-   * Optional because the expansion is best-effort: Graph caps
-   * `$expand=members` at 25 entries per chat regardless of paging, and a chat
-   * whose members it declines to expand still belongs in the list.
+   * Since 0.9.1 only a chat WITHOUT a topic carries it, and only when its
+   * lookup was within budget and answered: the listing reports the rest as
+   * `withoutMemberNames`. A chat with a topic comes without it.
    */
   readonly memberNames?: readonly string[];
 }
@@ -166,6 +200,8 @@ export interface InstallTargetsClientOptions {
    */
   readonly adminConsentUrlFor?: (tokens: DelegatedTokenSet) => string;
   readonly log?: (msg: string) => void;
+  /** Clock for the time budget of the chat listing. Tests inject one. */
+  readonly now?: () => number;
 }
 
 /** Enumerate the places an agent can be installed. One client per provisioner. */
@@ -173,9 +209,11 @@ export class InstallTargetsClient {
   private readonly http: Pick<ProvisioningHttp, 'request'>;
   private readonly adminConsentUrlFor?: (tokens: DelegatedTokenSet) => string;
   private readonly log: (msg: string) => void;
+  private readonly now: () => number;
 
   constructor(opts: InstallTargetsClientOptions) {
     this.http = opts.http;
+    this.now = opts.now ?? Date.now;
     if (opts.adminConsentUrlFor !== undefined) {
       this.adminConsentUrlFor = opts.adminConsentUrlFor;
     }
@@ -202,40 +240,31 @@ export class InstallTargetsClient {
    *
    * @throws {ConsentMissingError} 403, carrying {@link TEAM_LIST_SCOPE}.
    */
-  async listTeams(): Promise<readonly TeamSummary[]> {
-    const teams: TeamSummary[] = [];
-    let url = `${GRAPH_BASE}/teams?$select=id,displayName&$top=100`;
-
-    for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
-      const response = await this.http.request({
-        resource: 'graph',
-        method: 'GET',
-        url,
-        step: TEAM_LIST_STEP,
-        missingScopesOn403: [TEAM_LIST_SCOPE],
-      });
-      if (response.kind !== 'ok') {
-        throw new Error(`graph ${TEAM_LIST_STEP} unexpected conflict`);
-      }
-      const { items, nextLink } = readPage(response.json);
-      for (const item of items) {
-        const team = parseTeam(item);
-        if (team !== undefined) teams.push(team);
-      }
-      if (nextLink === undefined) return teams;
-      url = nextLink;
-    }
-
-    this.log(
-      `provisioner ${TEAM_LIST_STEP}: stopped after ${String(MAX_LIST_PAGES)} ` +
-        `pages with ${String(teams.length)} teams — the list may be truncated`,
-    );
-    return teams;
+  async listTeams(): Promise<TeamList> {
+    const { items, truncated } = await this.followPages({
+      firstUrl: `${GRAPH_BASE}/teams?$select=id,displayName&$top=100`,
+      step: TEAM_LIST_STEP,
+      maxPages: MAX_TEAM_PAGES,
+      fetchPage: async (url) => {
+        const response = await this.http.request({
+          resource: 'graph',
+          method: 'GET',
+          url,
+          step: TEAM_LIST_STEP,
+          missingScopesOn403: [TEAM_LIST_SCOPE],
+        });
+        if (response.kind !== 'ok') {
+          throw new Error(`graph ${TEAM_LIST_STEP} unexpected conflict`);
+        }
+        return response.json;
+      },
+    });
+    return markList(items.flatMap((item) => parseTeam(item) ?? []), { truncated });
   }
 
   /**
-   * `GET /me/chats?$expand=members` — the signed-in administrator's chats,
-   * delegated, all pages.
+   * `GET /me/chats` — the signed-in administrator's chats, delegated, paged to
+   * the end.
    *
    * See the module doc for why this is delegated and cannot be otherwise. The
    * three pre-flight checks all exist to fail with something an operator can
@@ -258,11 +287,23 @@ export class InstallTargetsClient {
    * understand cannot be routed to an install method — offering it would put a
    * dead option in the picker.
    *
+   * MEMBERS (changed in 0.9.1). Until 0.9.0 every page carried
+   * `$expand=members`, for every chat. A picker needs member names only where
+   * there is no topic to show, so the bulk listing no longer expands, and the
+   * chats WITHOUT a topic get their names from `GET /chats/{id}/members`
+   * afterwards — at most {@link MAX_MEMBER_LOOKUPS} of them, group chats
+   * first. A chat with a topic carries no `memberNames` any more. A lookup
+   * that fails costs that chat its names, never the listing.
+   *
+   * COMPLETENESS. The result says whether it is whole: `truncated` when the
+   * page or time bound stopped it, `withoutMemberNames` for the untitled chats
+   * left unnamed (see {@link ChatList}).
+   *
    * @throws {DelegatedScopeRequiredError} no credential, or one too narrow.
    * @throws {DelegatedTokenExpiredError} stale token, or Graph answered 401.
    * @throws {DelegatedConsentRequiredError} 403 — consent missing/withdrawn.
    */
-  async listChats(input?: ListChatsInput): Promise<readonly ChatSummary[]> {
+  async listChats(input?: ListChatsInput): Promise<ChatList> {
     const tokens = input?.tokens;
     if (tokens === undefined) {
       throw new DelegatedScopeRequiredError(
@@ -283,44 +324,164 @@ export class InstallTargetsClient {
       throw new DelegatedTokenExpiredError('access-token-expired');
     }
 
-    const chats: ChatSummary[] = [];
-    // $top is capped at 50 on this endpoint, and $select is NOT among the
-    // parameters it supports — only $expand/$top/$filter/$orderby are. So the
-    // shape is trimmed here rather than at the API.
-    let url = `${GRAPH_BASE}/me/chats?$expand=members&$top=50`;
+    const deadline = this.now() + CHAT_LIST_TIME_BUDGET_MS;
+    const { items, truncated } = await this.followPages({
+      // $top is capped at 50 on this endpoint, and $select is NOT among the
+      // parameters it supports — only $expand/$top/$filter/$orderby are. So
+      // the shape is trimmed here rather than at the API.
+      firstUrl: `${GRAPH_BASE}/me/chats?$top=50`,
+      step: CHAT_LIST_STEP,
+      maxPages: MAX_CHAT_PAGES,
+      deadline,
+      fetchPage: async (url) => {
+        try {
+          const response = await this.http.request({
+            resource: 'graph',
+            method: 'GET',
+            url,
+            step: CHAT_LIST_STEP,
+            // SECRET — forwarded, never cached, never logged by the http layer.
+            bearerToken: tokens.accessToken,
+            missingScopesOn403: [CHAT_READ_DELEGATED_SCOPE],
+          });
+          if (response.kind !== 'ok') {
+            throw new Error(`graph ${CHAT_LIST_STEP} unexpected conflict`);
+          }
+          return response.json;
+        } catch (err) {
+          throw this.translateDelegatedFailure(err, tokens);
+        }
+      },
+    });
 
-    for (let page = 0; page < MAX_LIST_PAGES; page += 1) {
-      let response;
-      try {
-        response = await this.http.request({
-          resource: 'graph',
-          method: 'GET',
-          url,
-          step: CHAT_LIST_STEP,
-          // SECRET — forwarded, never cached, never logged by the http layer.
-          bearerToken: tokens.accessToken,
-          missingScopesOn403: [CHAT_READ_DELEGATED_SCOPE],
-        });
-      } catch (err) {
-        throw this.translateDelegatedFailure(err, tokens);
+    const listed = items.flatMap((item) => parseChat(item) ?? []);
+    const names = await this.lookUpMemberNames(listed, tokens, deadline);
+    const chats = listed.map((chat) => {
+      const memberNames = names.get(chat.id);
+      return memberNames === undefined ? chat : { ...chat, memberNames };
+    });
+    const withoutMemberNames = chats.filter(
+      (chat) => chat.topic === null && chat.memberNames === undefined,
+    ).length;
+    if (withoutMemberNames > 0) {
+      this.log(
+        `provisioner ${CHAT_MEMBERS_STEP}: ${String(withoutMemberNames)} of ` +
+          `${String(chats.length)} chats have neither a topic nor member names`,
+      );
+    }
+    return markList(chats, { truncated, withoutMemberNames });
+  }
+
+  /**
+   * Member display names for the chats that have no topic, by chat id.
+   * Best-effort and bounded: {@link MAX_MEMBER_LOOKUPS} chats, the listing's
+   * deadline, and no further lookups once Graph refuses one for a reason that
+   * would repeat (throttling, an expired token, a missing consent). A single
+   * chat that answers 404 is skipped.
+   */
+  private async lookUpMemberNames(
+    chats: readonly ChatSummary[],
+    tokens: DelegatedTokenSet,
+    deadline: number,
+  ): Promise<ReadonlyMap<string, readonly string[]>> {
+    const untitled = chats.filter(
+      (chat) => chat.topic === null && chat.memberNames === undefined,
+    );
+    const queue = MEMBER_LOOKUP_ORDER.flatMap((type) =>
+      untitled.filter((chat) => chat.chatType === type),
+    ).slice(0, MAX_MEMBER_LOOKUPS);
+
+    const names = new Map<string, readonly string[]>();
+    for (let start = 0; start < queue.length; start += MEMBER_LOOKUP_CONCURRENCY) {
+      if (this.now() >= deadline) {
+        this.log(
+          `provisioner ${CHAT_MEMBERS_STEP}: time budget spent after ${String(start)} lookups`,
+        );
+        break;
       }
-      if (response.kind !== 'ok') {
-        throw new Error(`graph ${CHAT_LIST_STEP} unexpected conflict`);
+      const batch = queue.slice(start, start + MEMBER_LOOKUP_CONCURRENCY);
+      const results = await Promise.all(
+        batch.map((chat) => this.memberNamesOf(chat.id, tokens)),
+      );
+      results.forEach((result, index) => {
+        const chat = batch[index];
+        if (chat !== undefined && result.names !== undefined) {
+          names.set(chat.id, result.names);
+        }
+      });
+      const repeating = results.find((result) => result.stop !== undefined);
+      if (repeating?.stop !== undefined) {
+        this.log(
+          `provisioner ${CHAT_MEMBERS_STEP}: stopped looking up members — ${repeating.stop}`,
+        );
+        break;
       }
-      const { items, nextLink } = readPage(response.json);
-      for (const item of items) {
-        const chat = parseChat(item);
-        if (chat !== undefined) chats.push(chat);
+    }
+    return names;
+  }
+
+  /** `GET /chats/{id}/members` (delegated `Chat.ReadBasic`). Never throws. */
+  private async memberNamesOf(
+    chatId: string,
+    tokens: DelegatedTokenSet,
+  ): Promise<{ names?: readonly string[]; stop?: string }> {
+    try {
+      const response = await this.http.request({
+        resource: 'graph',
+        method: 'GET',
+        url: `${GRAPH_BASE}/chats/${encodeURIComponent(chatId)}/members`,
+        step: CHAT_MEMBERS_STEP,
+        // SECRET — forwarded, never cached, never logged by the http layer.
+        bearerToken: tokens.accessToken,
+        missingScopesOn403: [CHAT_READ_DELEGATED_SCOPE],
+      });
+      if (response.kind !== 'ok') return {};
+      const names = parseMemberNames(readPage(response.json).items);
+      return names === undefined ? {} : { names };
+    } catch (err) {
+      if (err instanceof ProvisioningRequestError && err.status === 404) return {};
+      return { stop: redactUnknown(err) };
+    }
+  }
+
+  /**
+   * Follow `@odata.nextLink` from `firstUrl` to the last page, or to a bound:
+   * `maxPages`, the `deadline`, or a next link that points at a page already
+   * read. Reports which through `truncated`.
+   */
+  private async followPages(input: {
+    readonly firstUrl: string;
+    readonly step: string;
+    readonly maxPages: number;
+    readonly deadline?: number;
+    readonly fetchPage: (url: string) => Promise<unknown>;
+  }): Promise<{ items: readonly unknown[]; truncated: boolean }> {
+    const items: unknown[] = [];
+    const seen = new Set<string>();
+    let url: string | undefined = input.firstUrl;
+    let stoppedBy: string | undefined;
+
+    while (url !== undefined) {
+      if (seen.size >= input.maxPages) stoppedBy = `${String(input.maxPages)} pages`;
+      else if (seen.has(url)) stoppedBy = 'a next link that repeats';
+      else if (seen.size > 0 && input.deadline !== undefined && this.now() >= input.deadline) {
+        stoppedBy = 'its time budget';
       }
-      if (nextLink === undefined) return chats;
-      url = nextLink;
+      if (stoppedBy !== undefined) break;
+
+      seen.add(url);
+      const page = readPage(await input.fetchPage(url));
+      items.push(...page.items);
+      url = page.nextLink;
     }
 
-    this.log(
-      `provisioner ${CHAT_LIST_STEP}: stopped after ${String(MAX_LIST_PAGES)} ` +
-        `pages with ${String(chats.length)} chats — the list may be truncated`,
-    );
-    return chats;
+    if (stoppedBy !== undefined) {
+      this.log(
+        `provisioner ${input.step}: stopped by ${stoppedBy} after ${String(seen.size)} ` +
+          `pages with ${String(items.length)} entries — the list is truncated`,
+      );
+    }
+    return { items, truncated: stoppedBy !== undefined };
   }
 
   /**
@@ -356,6 +517,18 @@ export class InstallTargetsClient {
 // because a malformed row in a picker is a support ticket and a dropped one
 // is not.
 // ---------------------------------------------------------------------------
+
+/** Attach `marks` to `items` as non-enumerable, read-only properties. */
+function markList<T, M extends Record<string, unknown>>(
+  items: readonly T[],
+  marks: M,
+): readonly T[] & Readonly<M> {
+  const descriptors = Object.fromEntries(
+    Object.entries(marks).map(([key, value]) => [key, { value, enumerable: false }]),
+  );
+  return Object.defineProperties([...items], descriptors) as unknown as readonly T[] &
+    Readonly<M>;
+}
 
 /** An OData collection page: its items and the link to the next one. */
 function readPage(json: unknown): {
@@ -419,7 +592,7 @@ function parseChat(item: unknown): ChatSummary | undefined {
   };
 }
 
-/** `$expand=members` → the display names, or `undefined` when there are none. */
+/** A member collection → the display names, or `undefined` when there are none. */
 function parseMemberNames(value: unknown): readonly string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const names: string[] = [];

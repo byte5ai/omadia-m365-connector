@@ -432,7 +432,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         refuses every install of our seven-RSC packages.
     // 0.9.0 — `facilitation.followup@1`: free/busy, invitations and protocol
     //         mail for native facilitators (#18, epic byte5ai/omadia#2043).
-    assert.equal(pkg.version, '0.9.0');
+    // 0.9.1 — Graph errors arrive whole and structured; the chat listing pages
+    //         to the end and reports truncation (byte5ai/omadia#2043 D7, D8).
+    assert.equal(pkg.version, '0.9.1');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
