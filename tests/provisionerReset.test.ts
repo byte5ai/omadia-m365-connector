@@ -187,8 +187,8 @@ describe('AppRegistrationClient.deleteAppRegistration (reused rollback half)', (
     });
     // The DELETE direction is keyed by appId — which is exactly why the purge
     // below must not be, and why mixing them up is so easy.
-    assert.ok(calls[0]?.url.includes(`(appId='${APP_ID}')`));
-    assert.equal(calls[0]?.init?.method, 'DELETE');
+    const del = calls.find((c) => c.init?.method === 'DELETE');
+    assert.ok(del?.url.includes(`(appId='${APP_ID}')`));
   });
 
   it('answers already-deleted on 404 so a second reset pass succeeds', async () => {
@@ -292,11 +292,10 @@ describe('AppRegistrationClient.purgeDeletedAppRegistration', () => {
     );
   });
 
-  it('still answers already-absent when the recycle-bin probe is not permitted', async () => {
-    // The bin listing is not covered by Application.ReadWrite.OwnedBy, so a
-    // tenant that granted only the provisioner's scope gets 403 there. A
-    // diagnostic that cannot run must not become a failure of its own: with no
-    // evidence AGAINST 'already-absent', that is the honest answer.
+  // 0.9.2: until 0.9.1 this answered 'already-absent'. With a bin that cannot
+  // be read, a 404 on the purge is evidence of nothing: the entry may be
+  // sitting there holding the name and the client id.
+  it('answers unconfirmed, not already-absent, when the recycle bin cannot be read', async () => {
     const { client } = appHarness([
       route(`${DELETED_ITEMS}/${OBJECT_ID}`, { status: 404 }),
       route(RECYCLE_BIN_LIST, {
@@ -304,10 +303,9 @@ describe('AppRegistrationClient.purgeDeletedAppRegistration', () => {
         body: { error: { code: 'Authorization_RequestDenied' } },
       }),
     ]);
-    assert.deepEqual(
-      await client.purgeDeletedAppRegistration({ objectId: OBJECT_ID }),
-      { outcome: 'already-absent' },
-    );
+    const result = await client.purgeDeletedAppRegistration({ objectId: OBJECT_ID });
+    assert.equal(result.outcome, 'unconfirmed');
+    assert.match(result.detail ?? '', /recycle bin could not be read/);
   });
 
   it('maps 403 on the purge itself to ConsentMissingError', async () => {

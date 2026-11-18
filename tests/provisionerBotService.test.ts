@@ -305,21 +305,18 @@ describe('BotServiceClient.createBot', () => {
     assert.equal(err.retryAfterSeconds, 7);
   });
 
-  it('rolls back a created bot when the channel enablement fails, rethrowing', async () => {
+  // 0.9.2 (byte5ai/omadia#2043 D10): until 0.9.1 the bot this call had created
+  // was deleted again here, and the re-run created it a second time under the
+  // same app id — after which the Bot Connector rejects the bot for good.
+  it('keeps a created bot when the channel enablement fails, rethrowing', async () => {
     const { client, calls } = harness([
       route('/channels/MsTeamsChannel', { status: 403, body: { error: 'RBAC' } }),
-      route(
-        '/botServices/omadia-agent-hr',
-        { status: 201, body: BOT_BODY },
-        { status: 200, body: {} },
-      ),
+      route('/botServices/omadia-agent-hr', { status: 201, body: BOT_BODY }),
     ]);
     const err = await rejection(client.createBot(CREATE_INPUT));
     assert.ok(err instanceof ConsentMissingError);
     assert.deepEqual(err.missingScopes, [BOT_SERVICES_CHANNELS_WRITE_ACTION]);
-    const deletes = armCalls(calls).filter((c) => methodOf(c) === 'DELETE');
-    assert.equal(deletes.length, 1);
-    assert.equal(deletes[0]?.url, BOT_URL);
+    assert.equal(armCalls(calls).filter((c) => methodOf(c) === 'DELETE').length, 0);
   });
 
   it('leaves a pre-existing bot untouched when the channel enablement fails', async () => {
@@ -514,9 +511,9 @@ describe('BotServiceClient.deleteBot', () => {
       kind: 'deleted',
       outcome: 'deleted',
     });
-    const del = armCalls(calls)[0];
-    assert.equal(del?.url, BOT_URL);
-    assert.equal(methodOf(del as FetchCall), 'DELETE');
+    // 0.9.2: the app id is read first, to record it as retired.
+    assert.deepEqual(armCalls(calls).map(methodOf), ['GET', 'DELETE']);
+    assert.equal(armCalls(calls)[1]?.url, BOT_URL);
   });
 
   it('is idempotent: a 404 answers already-deleted, never an error', async () => {

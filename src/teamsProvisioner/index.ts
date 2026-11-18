@@ -42,6 +42,8 @@ import {
   type DeleteAppRegistrationInput,
   type DeleteAppRegistrationResult,
   type ProvisionedAppRegistration,
+  type FindDeletedAppRegistrationInput,
+  type FindDeletedAppRegistrationResult,
   type PurgeDeletedAppRegistrationInput,
   type PurgeDeletedAppRegistrationResult,
 } from './appRegistration.js';
@@ -89,6 +91,7 @@ import {
   type TeamList,
 } from './targets.js';
 import { ProvisioningHttp } from './http.js';
+import { probeBot, type ProbeBotInput, type ProbeBotResult } from './botProbe.js';
 import {
   ChatInstallClient,
   TeamInstallClient,
@@ -177,6 +180,21 @@ export interface TeamsProvisionerAccessor {
 
   /** Probe an existing bot resource by handle. */
   getBot(botName: string): Promise<GetBotResult>;
+
+  /**
+   * Ask the Bot Connector, AS the bot, whether it knows the bot (since 0.9.2).
+   *
+   * `getBot` reads Azure Resource Manager, which reports a bot as healthy that
+   * the Bot Connector rejects with 401 and Teams shows as invalid: a bot
+   * re-created under an app id that had a bot before (byte5ai/omadia#2043,
+   * rollout defect D10). `rejected` is that verdict; `unverified` means
+   * nothing was learned (no stored secret, network, 5xx) and must not block.
+   * Never throws for anything the probe itself runs into. See `botProbe.ts`
+   * for the requests, the mapping and what of it is observed.
+   *
+   * FEATURE-DETECT it: absent before 0.9.2.
+   */
+  probeBot(input: ProbeBotInput): Promise<ProbeBotResult>;
 
   /**
    * Chain step 4 — publish the app package into the tenant catalog.
@@ -446,6 +464,18 @@ export interface TeamsProvisionerAccessor {
   ): Promise<PurgeDeletedAppRegistrationResult>;
 
   /**
+   * Is the application in the recycle bin (since 0.9.2)? The lookup a reset
+   * needs between the delete and the purge, and after an interruption.
+   * `found: false` is only answered for a recycle bin that was read; when it
+   * cannot be read this throws `RecycleBinUnreadableError`.
+   *
+   * FEATURE-DETECT it: absent before 0.9.2.
+   */
+  findDeletedAppRegistration(
+    input: FindDeletedAppRegistrationInput,
+  ): Promise<FindDeletedAppRegistrationResult>;
+
+  /**
    * Reverse of {@link uploadToCatalog} (since 0.8.0) — remove the published
    * app from the tenant catalog.
    *
@@ -533,7 +563,13 @@ export function createTeamsProvisioner(
       ? { replication: { sleep: options.sleep } }
       : {}),
   });
-  const bots = new BotServiceClient({ http, armConfig, log: options.log });
+  const bots = new BotServiceClient({
+    http,
+    armConfig,
+    log: options.log,
+    // Where the app ids of deleted bot resources are recorded (0.9.2).
+    secrets: options.secrets,
+  });
 
   // Delegated publish plumbing (byte5ai/omadia#924). The publisher app is
   // resolved LAZILY, on the first sign-in — activation stays side-effect free,
@@ -596,6 +632,16 @@ export function createTeamsProvisioner(
     createBot: (input) => bots.createBot(input),
     deleteBot: (botName) => bots.deleteBot(botName),
     getBot: (botName) => bots.getBot(botName),
+    probeBot: (input) =>
+      probeBot(
+        {
+          tenantId: options.graphCredential.tenantId,
+          secrets: options.secrets,
+          log: options.log,
+          ...(options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
+        },
+        input,
+      ),
     uploadToCatalog: (input) => catalog.uploadToCatalog(input),
     uploadToCatalogDelegated: (input) => catalog.uploadToCatalogDelegated(input),
     getCatalogApp: (input) => catalog.getCatalogApp(input),
@@ -631,6 +677,8 @@ export function createTeamsProvisioner(
     listChats: (input) => targets.listChats(input),
     purgeDeletedAppRegistration: (input) =>
       appRegistrations.purgeDeletedAppRegistration(input),
+    findDeletedAppRegistration: (input) =>
+      appRegistrations.findDeletedAppRegistration(input),
     removeFromCatalog: (input) => catalog.removeFromCatalog(input),
   };
 }
@@ -693,9 +741,19 @@ export {
   // Enumeration + reset taxonomy (0.8.0).
   DelegatedScopeRequiredError,
   DeletedObjectIdMismatchError,
+  // 0.9.2 — an identity that was deleted is over: no second bot under its
+  // app id, and no "not found" from a recycle bin that was not read.
+  BotAppIdRetiredError,
+  RecycleBinUnreadableError,
   DELETED_ITEM_RETENTION_DAYS,
   isTransientProvisioningFailure,
 } from './errors.js';
+// 0.9.2 — the Bot Connector probe.
+export {
+  TEAMS_BOT_CONNECTOR_SERVICE_URL,
+  BOT_CONNECTOR_TOKEN_SCOPE,
+} from './botProbe.js';
+export type { ProbeBotInput, ProbeBotResult } from './botProbe.js';
 // 0.9.1 — the parsed Graph/ARM error envelope on `ProvisioningRequestError`.
 export type { ProvisioningGraphError } from './errors.js';
 
@@ -780,6 +838,8 @@ export type {
   DeleteAppRegistrationOutcome,
   DeleteAppRegistrationResult,
   ProvisionedAppRegistration,
+  FindDeletedAppRegistrationInput,
+  FindDeletedAppRegistrationResult,
   PurgeDeletedAppRegistrationInput,
   PurgeDeletedAppRegistrationOutcome,
   PurgeDeletedAppRegistrationResult,

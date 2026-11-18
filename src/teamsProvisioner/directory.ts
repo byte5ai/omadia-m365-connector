@@ -13,9 +13,11 @@
  *    `uniqueName` stays reserved for {@link DELETED_ITEM_RETENTION_DAYS} days
  *    while the object is invisible in `GET /applications`. That is why an
  *    operator saw "already exists" for an app they could not find anywhere.
- *    {@link findDeletedApplicationByUniqueName} and
- *    {@link restoreDeletedApplication} make that state observable and, where
- *    permissions allow, recoverable.
+ *    {@link lookUpDeletedApplication} makes that state observable and
+ *    {@link purgeDeletedApplication} ends it. {@link restoreDeletedApplication}
+ *    is used for the publisher app only: an agent's own registration is never
+ *    restored (since 0.9.2), because a bot re-created under a client id that
+ *    had one before is rejected by the Bot Connector.
  *
  * Everything here goes through the shared {@link ProvisioningHttp} choke
  * point — no second token cache, no fetch of its own.
@@ -174,7 +176,8 @@ export async function retryWhileReplicating<T>(
 export interface DeletedApplication {
   /** Directory object id — what `restore` and `purge` address. */
   readonly objectId: string;
-  readonly uniqueName: string;
+  /** Absent for an application that was created without one. */
+  readonly uniqueName?: string;
   readonly appId?: string;
   readonly displayName?: string;
   /** ISO-8601 timestamp of the delete, when Graph reported one. */
@@ -205,6 +208,30 @@ async function scanDeletedApplications(
   scopes: readonly string[],
   log: (msg: string) => void,
 ): Promise<DeletedApplication | undefined> {
+  return (await lookUpDeletedApplication(http, predicate, label, scopes, log)).found;
+}
+
+/**
+ * What a look into the recycle bin established. `readable: false` means the
+ * bin could not be read (no permission, a failed page, more entries than the
+ * page bound): then an absent `found` is NOT evidence that the entry is gone.
+ */
+export interface DeletedApplicationLookup {
+  readonly readable: boolean;
+  readonly found?: DeletedApplication;
+}
+
+/**
+ * {@link scanDeletedApplications} with the one distinction a caller needs
+ * before it may say "not in the recycle bin": whether the bin was read at all.
+ */
+export async function lookUpDeletedApplication(
+  http: Pick<ProvisioningHttp, 'request'>,
+  predicate: (candidate: DeletedApplication) => boolean,
+  label: string,
+  scopes: readonly string[],
+  log: (msg: string) => void,
+): Promise<DeletedApplicationLookup> {
   let url =
     `${GRAPH_BASE}/directory/deletedItems/microsoft.graph.application` +
     `?$select=id,appId,displayName,uniqueName,deletedDateTime&$top=100`;
@@ -218,29 +245,34 @@ async function scanDeletedApplications(
         step: 'directory.deletedItems.list',
         missingScopesOn403: scopes,
       });
-      if (response.kind !== 'ok') return undefined;
+      if (response.kind !== 'ok') return { readable: false };
       const body = response.json;
-      if (!body || typeof body !== 'object') return undefined;
+      if (!body || typeof body !== 'object') return { readable: false };
       const record = body as Record<string, unknown>;
 
       const items = Array.isArray(record['value']) ? record['value'] : [];
       for (const item of items) {
         const parsed = parseDeletedApplication(item);
-        if (parsed !== undefined && predicate(parsed)) return parsed;
+        if (parsed !== undefined && predicate(parsed)) {
+          return { readable: true, found: parsed };
+        }
       }
 
       const nextLink = record['@odata.nextLink'];
-      if (typeof nextLink !== 'string' || nextLink.length === 0) return undefined;
+      if (typeof nextLink !== 'string' || nextLink.length === 0) {
+        return { readable: true };
+      }
       url = nextLink;
     }
-    return undefined;
+    // More entries than the page bound: the rest was not looked at.
+    return { readable: false };
   } catch (err) {
     // A probe is a diagnostic, never a failure mode of its own.
     log(
       `provisioner directory.deletedItems.list: recycle-bin probe for ` +
         `'${label}' unavailable (${String(err)})`,
     );
-    return undefined;
+    return { readable: false };
   }
 }
 
@@ -342,15 +374,13 @@ function parseDeletedApplication(item: unknown): DeletedApplication | undefined 
   const record = item as Record<string, unknown>;
   const objectId = record['id'];
   const uniqueName = record['uniqueName'];
-  if (typeof objectId !== 'string' || typeof uniqueName !== 'string') {
-    return undefined;
-  }
+  if (typeof objectId !== 'string') return undefined;
   const appId = record['appId'];
   const displayName = record['displayName'];
   const deletedDateTime = record['deletedDateTime'];
   return {
     objectId,
-    uniqueName,
+    ...(typeof uniqueName === 'string' ? { uniqueName } : {}),
     ...(typeof appId === 'string' ? { appId } : {}),
     ...(typeof displayName === 'string' ? { displayName } : {}),
     ...(typeof deletedDateTime === 'string' ? { deletedDateTime } : {}),
