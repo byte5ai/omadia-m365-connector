@@ -84,9 +84,9 @@ import {
 } from './teamLookup.js';
 import {
   InstallTargetsClient,
-  type ChatSummary,
+  type ChatList,
   type ListChatsInput,
-  type TeamSummary,
+  type TeamList,
 } from './targets.js';
 import { ProvisioningHttp } from './http.js';
 import {
@@ -378,11 +378,13 @@ export interface TeamsProvisionerAccessor {
    * The counterpart to {@link getTeam}: that one names an id you have, this
    * one produces the ids that exist. Application permissions
    * (`Team.ReadBasic.All`, already in the setup guide), all pages followed.
+   * Since 0.9.1 the array carries a non-enumerable `truncated`: `true` when
+   * the page bound stopped the listing early.
    *
    * FEATURE-DETECT it, as with every method here — the middleware mirrors this
    * contract structurally rather than importing it.
    */
-  listTeams(): Promise<readonly TeamSummary[]>;
+  listTeams(): Promise<TeamList>;
 
   /**
    * The chats the signed-in administrator is in (since 0.8.0) — the chat half
@@ -407,9 +409,14 @@ export interface TeamsProvisionerAccessor {
    * it. A stale token throws `DelegatedTokenExpiredError` — renew via
    * {@link refreshDelegatedToken}, persist, retry.
    *
+   * Since 0.9.1: paged to the end (bounded at 200 pages and 60 seconds), and
+   * the array carries two non-enumerable marks, `truncated` (a bound stopped
+   * it) and `withoutMemberNames` (untitled chats left unnamed). Member names
+   * come only with chats that have no topic.
+   *
    * FEATURE-DETECT it, as above.
    */
-  listChats(input?: ListChatsInput): Promise<readonly ChatSummary[]>;
+  listChats(input?: ListChatsInput): Promise<ChatList>;
 
   /**
    * Free a soft-deleted Entra app's `uniqueName` for good (since 0.8.0) —
@@ -689,6 +696,8 @@ export {
   DELETED_ITEM_RETENTION_DAYS,
   isTransientProvisioningFailure,
 } from './errors.js';
+// 0.9.1 — the parsed Graph/ARM error envelope on `ProvisioningRequestError`.
+export type { ProvisioningGraphError } from './errors.js';
 
 // Delegated catalog publishing (byte5ai/omadia#924). The DelegatedAuthClient
 // and PublisherAppClient classes stay internal — the accessor is the surface.
@@ -780,9 +789,11 @@ export type {
 // operator never types a team or chat id by hand again.
 export { TEAM_LIST_SCOPE } from './targets.js';
 export type {
+  ChatList,
   ChatSummary,
   ChatSummaryType,
   ListChatsInput,
+  TeamList,
   TeamSummary,
 } from './targets.js';
 

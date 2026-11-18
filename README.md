@@ -143,8 +143,15 @@ the connector's own code is verified against a fake Graph.
 npm install
 npm run typecheck   # tsc --noEmit (src) + tsc -p tsconfig.tests.json (tests incl. type-level assertions)
 npm run build        # tsc
-npm test             # esbuild-transpiled node:test suite (scripts/test.mjs)
+npm test             # esbuild-transpiled node:test suite (scripts/test.mjs); needs the build
+npm run package      # out/<id>-<version>.zip
 ```
+
+`npm test` also runs `npm run package` and checks every entry of the zip
+against a mirror of the kernel's zip ingest rules
+(`tests/support/kernelZipIngest.ts`), so a package the kernel would refuse
+with `422 zip.forbidden_extension` fails here and not after publishing.
+Changes per version: [`CHANGELOG.md`](./CHANGELOG.md).
 
 `@omadia/plugin-api` is a **peer dependency**, provided by the omadia host at
 runtime. For local typechecking, `tsconfig.json` maps it to

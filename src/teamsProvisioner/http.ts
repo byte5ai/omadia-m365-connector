@@ -36,8 +36,8 @@
  *
  * Invariants: token-based REST only (no `az` CLI, no child_process, no msal —
  * msal stays confined to the delegated OBO flow in `graphObo.ts`); error
- * messages NEVER contain the client secret or a bearer token, bodies are
- * bounded via `truncate(body, 200)` following the `GraphClient` precedent.
+ * messages NEVER contain the client secret or a bearer token, and bodies are
+ * redacted and bounded ({@link ERROR_DETAIL_MAX_CHARS}) before they reach one.
  */
 
 import {
@@ -51,6 +51,7 @@ import {
   ConsentMissingError,
   ProvisioningRequestError,
   ProvisioningThrottledError,
+  type ProvisioningGraphError,
 } from './errors.js';
 import { redactSecrets } from './redact.js';
 
@@ -64,7 +65,58 @@ import { redactSecrets } from './redact.js';
  * redaction runs on the ERROR path only, so the success path pays nothing.
  */
 function safeDetail(bodyText: string): string {
-  return truncate(redactSecrets(bodyText), 200);
+  return truncate(redactSecrets(bodyText), ERROR_DETAIL_MAX_CHARS);
+}
+
+/**
+ * How much of an error body a message keeps. It was 200 until 0.9.0, which cut
+ * a Teams answer in the middle of the URL that named the failing check
+ * (byte5ai/omadia#2043, rollout defect D7). A Graph error envelope with its
+ * request ids is well under 2,000 characters.
+ */
+const ERROR_DETAIL_MAX_CHARS = 2000;
+/** Bound of {@link ProvisioningGraphError.body}. */
+const ERROR_BODY_MAX_CHARS = 4000;
+/** How much of the request URL a message keeps. Ids only: tokens travel in headers. */
+const ERROR_URL_MAX_CHARS = 500;
+/** Longest request id kept; a GUID is 36. */
+const REQUEST_ID_MAX_CHARS = 100;
+
+/**
+ * The error envelope of a failed answer as fields, or `undefined` when the
+ * body is not one (an HTML gateway page, an empty body).
+ */
+function graphErrorOf(
+  bodyText: string,
+  response: Response,
+): ProvisioningGraphError | undefined {
+  const envelope = recordOf(recordOf(parseJson(bodyText))?.['error']);
+  if (envelope === undefined) return undefined;
+  const inner = recordOf(envelope['innerError'] ?? envelope['innererror']);
+  const text = (value: unknown, max: number): string | undefined =>
+    typeof value === 'string' && value.trim() !== ''
+      ? truncate(redactSecrets(value.trim()), max)
+      : undefined;
+  const requestId = (name: string): string | undefined =>
+    text(inner?.[name] ?? response.headers.get(name), REQUEST_ID_MAX_CHARS);
+
+  const fields: ProvisioningGraphError = {
+    code: text(envelope['code'], REQUEST_ID_MAX_CHARS),
+    innerCode: text(inner?.['code'], REQUEST_ID_MAX_CHARS),
+    message: text(envelope['message'], ERROR_DETAIL_MAX_CHARS),
+    requestId: requestId('request-id'),
+    clientRequestId: requestId('client-request-id'),
+    body: text(bodyText, ERROR_BODY_MAX_CHARS),
+  };
+  return Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== undefined),
+  );
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 
 /** Which API a request targets — also the audience key for token + errors. */
@@ -395,7 +447,9 @@ export class ProvisioningHttp {
         req.resource,
         req.step,
         response.status,
-        `${req.resource} ${req.step} ${String(response.status)} ${req.method} ${truncate(req.url, 120)} body=${safeDetail(bodyText)}`,
+        `${req.resource} ${req.step} ${String(response.status)} ${req.method} ${truncate(redactSecrets(req.url), ERROR_URL_MAX_CHARS)} body=${safeDetail(bodyText)}`,
+        undefined,
+        graphErrorOf(bodyText, response),
       );
     }
   }
@@ -480,6 +534,8 @@ export class ProvisioningHttp {
           `${req.step} poll`,
           poll.status,
           `${req.resource} ${req.step} poll ${String(poll.status)} body=${safeDetail(bodyText)}`,
+          undefined,
+          graphErrorOf(bodyText, poll),
         );
       }
 
@@ -533,6 +589,8 @@ export class ProvisioningHttp {
         `${req.step} final read`,
         response.status,
         `${req.resource} ${req.step} final read ${String(response.status)} body=${safeDetail(bodyText)}`,
+        undefined,
+        graphErrorOf(bodyText, response),
       );
     }
     return safeJson(response);

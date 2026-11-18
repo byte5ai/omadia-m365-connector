@@ -8,8 +8,10 @@ import {
 } from '../src/teamsProvisioner/http.js';
 import {
   ConsentMissingError,
+  ProvisioningRequestError,
   ProvisioningThrottledError,
 } from '../src/teamsProvisioner/errors.js';
+import { redactSecrets } from '../src/teamsProvisioner/redact.js';
 
 // The single token+fetch choke point: dual-audience token plumbing
 // (graph.microsoft.com vs management.azure.com, per-(tenant,clientId,scope)
@@ -652,3 +654,154 @@ describe('ProvisioningHttp non-409 conflict rules (#916)', () => {
     assert.match((err as Error).message, /applications\.create 400/);
   });
 });
+
+// byte5ai/omadia#2043, rollout defect D7. A team install was refused by the
+// team's resource-specific consent check. What reached the kernel from 0.9.0
+// was `…backend request [redacted]. Workload Unknown. Request Url:
+// https://teamsgraph.teams.microsoft.com/v1.0/groups/c6031502-025…`: the
+// request name was redacted as a "long opaque credential" (it is 62 letters)
+// and the URL that names the check a second time was cut at 200 characters.
+// The kernel could not tell the refusal from a replication delay.
+describe('ProvisioningHttp keeps what a Graph error says (0.9.1)', () => {
+  const TEAM_ID = 'c6031502-025c-4297-92c6-b734e17e46c5';
+  const BACKEND_REQUEST = 'IsUserAuthorizedToGrantGroupResourceSpecificPermissionsRequest';
+  // The body Graph answered at the rollout (request ids replaced).
+  const RSC_REFUSAL = {
+    error: {
+      code: 'BadRequest',
+      message:
+        `Failed to execute TeamsGraphService backend request ${BACKEND_REQUEST}. Workload Unknown. ` +
+        `Request Url: https://teamsgraph.teams.microsoft.com/v1.0/groups/${TEAM_ID}/isUserAuthorizedToGrantResourceSpecificPermissions, ` +
+        'Request Method: POST, Response Status Code: BadRequest, Response Headers: Strict-Transport-Security: max-age=2592000\r\n' +
+        'request-id: 5f0c1d2e-0000-4000-8000-000000000001\r\n, Reason Phrase: Bad Request, ' +
+        'Request ID 5f0c1d2e-0000-4000-8000-000000000001.',
+      innerError: {
+        code: 'InvalidRequest',
+        date: '2026-11-18T17:01:42',
+        'request-id': '9a1b2c3d-0000-4000-8000-000000000002',
+        'client-request-id': '9a1b2c3d-0000-4000-8000-000000000003',
+      },
+    },
+  };
+  const INSTALL: ProvisioningRequest = {
+    resource: 'graph',
+    method: 'POST',
+    url: `https://graph.microsoft.com/v1.0/teams/${TEAM_ID}/installedApps`,
+    step: 'teams.installedApps.add',
+    jsonBody: {
+      'teamsApp@odata.bind': 'https://graph.microsoft.com/v1.0/appCatalogs/teamsApps/app-1',
+      consentedPermissionSet: { resourceSpecificPermissions: [] },
+    },
+    missingScopesOn403: ['TeamsAppInstallation.ReadWriteAndConsentForTeam.All'],
+  };
+
+  it('the message carries the backend request name and the whole Teams URL', async () => {
+    const { http } = harness([route('/installedApps', { status: 400, body: RSC_REFUSAL })]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    assert.equal(err.status, 400);
+    assert.ok(err.message.includes(BACKEND_REQUEST), err.message);
+    assert.ok(err.message.includes(`/groups/${TEAM_ID}/isUserAuthorizedToGrantResourceSpecificPermissions`));
+    assert.ok(err.message.includes('"InvalidRequest"'));
+    assert.ok(err.message.includes(INSTALL.url));
+    assert.ok(!err.message.includes('[redacted]'));
+    // The pattern the kernel classifies with (teamsProvisioningJob.ts).
+    assert.match(err.message, /isUserAuthorizedToGrant\w*ResourceSpecificPermissions/i);
+    assert.match(err.message, /backend request (\w+Request)\b/);
+  });
+
+  it('graphError carries code, inner code, message, request ids and body as fields', async () => {
+    const { http } = harness([route('/installedApps', { status: 400, body: RSC_REFUSAL })]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    assert.deepEqual(err.graphError, {
+      code: 'BadRequest',
+      innerCode: 'InvalidRequest',
+      message: RSC_REFUSAL.error.message,
+      requestId: '9a1b2c3d-0000-4000-8000-000000000002',
+      clientRequestId: '9a1b2c3d-0000-4000-8000-000000000003',
+      body: JSON.stringify(RSC_REFUSAL),
+    });
+  });
+
+  it('holds no token and nothing of the request body', async () => {
+    const { http } = harness([route('/installedApps', { status: 400, body: RSC_REFUSAL })]);
+    const err = await rejection(http.request({ ...INSTALL, bearerToken: 'delegated-secret-token-value' }));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    const everything = `${err.message} ${JSON.stringify(err.graphError)}`;
+    for (const secret of ['delegated-secret-token-value', 'graph-secret-value', 'tok:', 'consentedPermissionSet', 'odata.bind']) {
+      assert.ok(!everything.includes(secret), `${secret} reached the error`);
+    }
+  });
+
+  it('redacts a credential the API echoes, in the message and in every field', async () => {
+    const jwt = 'eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.c2lnbmF0dXJl';
+    const opaque = `0.AAAA${'x9_'.repeat(30)}`;
+    const { http } = harness([
+      route('/installedApps', {
+        status: 400,
+        body: {
+          error: { code: 'BadRequest', message: `token ${jwt} rejected, refresh ${opaque}`, access_token: jwt },
+        },
+      }),
+    ]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    const everything = `${err.message} ${JSON.stringify(err.graphError)}`;
+    assert.ok(!everything.includes(jwt));
+    assert.ok(!everything.includes('x9_x9_x9_'));
+    assert.match(err.graphError?.message ?? '', /token \[redacted\] rejected/);
+  });
+
+  it('bounds the message detail at 2,000 and the body field at 4,000 characters', async () => {
+    const { http } = harness([
+      route('/installedApps', {
+        status: 400,
+        body: { error: { code: 'BadRequest', message: 'word '.repeat(2000) } },
+      }),
+    ]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    assert.equal(err.graphError?.message?.length, 2000);
+    assert.equal(err.graphError?.body?.length, 4000);
+    assert.ok(err.message.length < 2000 + 300, String(err.message.length));
+  });
+
+  it('takes the request ids from the response headers when the body has none', async () => {
+    const { http } = harness([
+      route('/installedApps', {
+        status: 400,
+        body: { error: { code: 'BadRequest', message: 'no inner error', innererror: { code: 'Lowercase' } } },
+        headers: { 'request-id': 'header-request-id', 'client-request-id': 'header-client-id' },
+      }),
+    ]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    assert.equal(err.graphError?.innerCode, 'Lowercase');
+    assert.equal(err.graphError?.requestId, 'header-request-id');
+    assert.equal(err.graphError?.clientRequestId, 'header-client-id');
+  });
+
+  it('a body that is no error envelope yields no graphError, and the text stays in the message', async () => {
+    const { http } = harness([route('/installedApps', { status: 502, body: 'Bad Gateway' })]);
+    const err = await rejection(http.request(INSTALL));
+
+    assert.ok(err instanceof ProvisioningRequestError);
+    assert.equal(err.graphError, undefined);
+    assert.ok(err.message.includes('Bad Gateway'));
+  });
+
+  it('redaction keeps a long name made of letters and still removes long credentials', () => {
+    assert.equal(redactSecrets(`request ${BACKEND_REQUEST}.`), `request ${BACKEND_REQUEST}.`);
+    const refreshToken = `M.R3_BAY.${'aB3dE6gH9_kL-'.repeat(8)}`;
+    assert.ok(!redactSecrets(`refresh ${refreshToken}`).includes('aB3dE6gH9'));
+    assert.equal(redactSecrets('a'.repeat(59) + '1'), '[redacted]');
+  });
+});
+

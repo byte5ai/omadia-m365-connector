@@ -348,6 +348,31 @@ snake_case messages). Base class `TeamsProvisionerError` for catch-all.
 | `ArmNotConfiguredError` | ARM step demanded while setup fields missing | `missingSetupFields` |
 | `CapabilityUnavailableError` | Vault write/delete attempted but the kernel did not hand out `secrets.set`/`secrets.delete` (manifest lacks `permissions.secrets.runtime_write`) | `missingPermission`, `operation: 'set' \| 'delete'` |
 
+Any other refused status throws `ProvisioningRequestError` (`resource`, `step`,
+`status`). Since 0.9.1 it also carries `graphError` when the answer was a
+Graph/ARM error envelope: `code`, `innerCode`, `message`, `requestId`,
+`clientRequestId` and `body`. Every string is redacted and bounded (message
+2,000 characters, body 4,000); none holds a token or the request body. A caller
+classifies on these fields, not on the message text. The message keeps up to
+2,000 characters of the body (200 until 0.9.0, which cut a Teams consent
+refusal before its reason; byte5ai/omadia#2043 D7).
+
+### Install-target listings and their bounds (since 0.9.1)
+
+`listTeams` and `listChats` return an array with non-enumerable marks, so an
+older caller sees a plain array:
+
+| Mark | On | Meaning |
+|---|---|---|
+| `truncated` | both | `true` when the listing stopped before Graph's last page: 20 pages for teams, 200 pages or 60 seconds for chats, or a next link that repeats |
+| `withoutMemberNames` | `listChats` | number of chats with neither a topic nor member names |
+
+`listChats` reads `GET /me/chats?$top=50` without `$expand`. Chats without a
+topic get `memberNames` from `GET /chats/{id}/members` (delegated
+`Chat.ReadBasic`, per Microsoft's reference for that call; not run against a
+tenant): at most 100 per listing, group chats first. A lookup that answers 404
+is skipped; any other refusal ends the lookups and the listing still returns.
+
 Anything else propagates verbatim (matching `GraphOboClient`). ⚠️ Name
 collision by design: `graphObo.ts` already exports `ConsentRequiredError`
 (delegated calendar flow); `ConsentMissingError` is the provisioning-flow

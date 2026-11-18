@@ -84,8 +84,17 @@ const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]*/g
  * 36, an ARM resource id contains slashes, and a `user_code` is ~9. Real
  * refresh tokens and device codes are hundreds of characters of unbroken
  * base64url.
+ *
+ * ONE EXEMPTION: a run of letters only. Graph relays the names of its backend
+ * requests, and `IsUserAuthorizedToGrantGroupResourceSpecificPermissionsRequest`
+ * is 62 letters. 0.9.0 replaced it with `[redacted]` in the one error where
+ * that name was the whole diagnosis (byte5ai/omadia#2043, rollout defect D7).
+ * A credential is base64url of random bytes: the chance that 60 of its
+ * characters hold no digit, `-` or `_` is about 4 in a million, and real ones
+ * are several times longer.
  */
 const LONG_OPAQUE_PATTERN = /\b[A-Za-z0-9_-]{60,}\b/g;
+const LETTERS_ONLY = /^[A-Za-z]+$/;
 
 /**
  * Strip anything credential-shaped from `text`.
@@ -102,7 +111,7 @@ export function redactSecrets(text: string): string {
     .replace(FORM_FIELD_PATTERN, (_match, field: string) => `${field}=${REDACTED}`)
     .replace(BEARER_PATTERN, `Bearer ${REDACTED}`)
     .replace(JWT_PATTERN, REDACTED)
-    .replace(LONG_OPAQUE_PATTERN, REDACTED);
+    .replace(LONG_OPAQUE_PATTERN, (run) => (LETTERS_ONLY.test(run) ? run : REDACTED));
 }
 
 /**
