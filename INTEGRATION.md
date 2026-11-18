@@ -325,6 +325,42 @@ itself is executed by the wiring unit so parallel W0b units never collide in
 > per REST `appRoleAssignments` zuweisen und die Middleware neu starten —
 > Portal-/CLI-Consent greift manchmal stillschweigend nicht.
 
+## `facilitation.followup` (since 0.9.0)
+
+A third service, for native facilitators only (epic byte5ai/omadia#2043). The
+contract (`FacilitationFollowupService`, `FollowupGrant`) lives in
+`@omadia/plugin-api` ≥ 1.55.0; this connector is its Microsoft 365 provider.
+
+```ts
+import {
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+  type FacilitationFollowupService,
+} from '@omadia/plugin-api';
+
+const followup = ctx.services.get<FacilitationFollowupService>(
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+);
+const result = await followup.sendMail(
+  { facilitationId, allowed },          // the grant, with every call
+  { recipients, subject, body },
+);
+if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | provider_error */ }
+```
+
+- Three operations: `freeBusy` (busy intervals only), `createInvitation`,
+  `sendMail`. Each is one app-only `POST` on the organiser mailbox from the
+  setup field `facilitation_organizer_mailbox`; without that field every call
+  answers `not_configured`.
+- Anyone outside `grant.allowed` refuses the whole call with
+  `recipient_not_allowed` before any Graph request.
+- Graph application permissions: `Calendars.ReadWrite` and `Mail.Send`,
+  restricted to the organiser mailbox where the tenant allows it.
+
+Operations, refusals, permissions, consent steps and the manual verification
+checklist: [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
+The permissions and consent steps there are taken from documentation and are
+not tenant-verified.
+
 ## Was NICHT geht
 
 - ❌ **Importing the Microsoft Graph SDK directly** (`@microsoft/microsoft-graph-client`)

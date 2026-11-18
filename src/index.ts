@@ -2,7 +2,7 @@
  * @omadia/integration-microsoft365 — public surface.
  *
  * Ships both the library exports (clients, types, errors) and the
- * plugin-form `activate()` entry point. The plugin registers TWO services:
+ * plugin-form `activate()` entry point. The plugin registers THREE services:
  *
  *   - `Microsoft365Accessor` under the ServiceRegistry name
  *     `microsoft365.graph` — consumers read it via
@@ -10,6 +10,10 @@
  *   - `TeamsProvisionerAccessor` under `teamsProvisioner` (manifest
  *     capability `teamsProvisioner@1`) — per-agent Teams bot provisioning,
  *     consumed by the middleware agent factory (byte5ai/omadia#863-865).
+ *   - `FacilitationFollowupService` (contract in `@omadia/plugin-api`) under
+ *     `facilitation.followup` (manifest capability `facilitation.followup@1`)
+ *     — free/busy, invitations and protocol mail for native facilitators
+ *     (byte5ai/omadia#2043), see `docs/facilitation-followup.md`.
  *
  * ⚠️ Error-name pair on this surface: `ConsentRequiredError` (graphObo.ts,
  * delegated calendar flow, thrown when a USER has not consented) vs
@@ -53,6 +57,26 @@ export type {
   CreatedEvent,
   MailboxSettings,
 } from './graphCalendarClient.js';
+
+// facilitation.followup@1 — app-only follow-up operations for native
+// facilitators (byte5ai/omadia#2043). The service contract itself is exported
+// by `@omadia/plugin-api`.
+export {
+  createFacilitationFollowupService,
+  createAppOnlyGraphTransport,
+  readOrganizerMailbox,
+  FACILITATION_ORGANIZER_MAILBOX_FIELD,
+  FACILITATION_FOLLOWUP_SERVICE_NAME,
+  FACILITATION_FOLLOWUP_CAPABILITY,
+} from './facilitationFollowup/index.js';
+export type {
+  FacilitationFollowupOptions,
+  OrganizerMailboxConfig,
+  FollowupGraphOperation,
+  FollowupGraphRequest,
+  FollowupGraphResponse,
+  FollowupGraphTransport,
+} from './facilitationFollowup/index.js';
 
 export { SlotCache } from './slotCache.js';
 export type { CachedSlot, SlotCacheOptions } from './slotCache.js';

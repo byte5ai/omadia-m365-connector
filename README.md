@@ -24,6 +24,7 @@ service registry, consumed by the Teams channel and calendar-related tools.
 | Graph calls | `@microsoft/microsoft-graph-client`, wrapped by `graphClient.ts` / `graphCalendarClient.ts` |
 | Caching | `slotCache.ts` — short-lived cache for calendar free/busy slot lookups |
 | Service surface | `accessor.ts` exposes `Microsoft365Accessor`, registered as the `microsoft365.graph` service |
+| Facilitation follow-ups | `facilitationFollowup/` — app-only free/busy, invitations and protocol mail, published as `facilitation.followup` |
 | Entry point | `plugin.ts` → bundled to `dist/plugin.js` on `npm run build` |
 
 This package has no user-facing tools of its own — it is implicitly installed
@@ -121,6 +122,19 @@ Two field-tested gotchas:
   roles only appear in a *fresh* token. Restart the middleware (or wait for
   token expiry) after granting consent, otherwise the `403`s persist even
   though consent is in place.
+
+## Follow-ups for native facilitators (since 0.9.0)
+
+The connector also publishes `facilitation.followup` (capability
+`facilitation.followup@1`): free/busy as busy intervals only, event
+invitations, and protocol mail, for the people a facilitation's grant lists
+and nobody else. It runs app-only from one organiser mailbox you set in the
+optional setup field `facilitation_organizer_mailbox`, needs the application
+permissions `Calendars.ReadWrite` and `Mail.Send`, and never reads mailbox or
+calendar contents. Setup, least-privilege options and a manual verification
+checklist are in [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
+The permissions and consent steps are taken from Microsoft's documentation and
+have not been verified against a tenant.
 
 ## Build & install
 

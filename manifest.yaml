@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.8.2"
+  version: "0.9.0"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -46,6 +46,11 @@ service_types:
 # src/teamsProvisioner/types.ts).
 provides:
   - "teamsProvisioner@1"
+  # facilitation.followup@1 (epic byte5ai/omadia#2043) — free/busy, invitations
+  # and protocol mail for native facilitators. Deliberately NOT listed under
+  # `service_types`: that registry offers services to builder-generated agents,
+  # and this one is for the facilitation engine only.
+  - "facilitation.followup@1"
 
 setup:
   guide:
@@ -132,6 +137,23 @@ setup:
       working with the old credential in the meantime; only the chat list
       reports the gap, and it reports it as a typed
       "sign in again" rather than a permission error.
+
+      ### 5. Follow-ups for facilitators (optional, since 0.9.0)
+
+      A native facilitator can send the confirmed protocol and schedule the
+      follow-up meetings a group agreed on (`facilitation.followup@1`). It does
+      so from ONE mailbox you name in the field **Facilitation organiser
+      mailbox** — a shared or dedicated mailbox, not a person's. Leave the
+      field empty and the capability answers "not configured"; nothing else
+      changes.
+
+      Application permissions needed: `Calendars.ReadWrite` (free/busy lookup
+      and creating the invitation) and `Mail.Send` (protocol mail). Both are
+      tenant-wide by default. Restrict the app to the organiser mailbox with
+      Exchange Online **RBAC for Applications** (or a legacy application access
+      policy) — see `docs/facilitation-followup.md` for the steps. The
+      connector itself only ever calls the organiser mailbox and never reads
+      mail or calendar contents.
 
       Extending an existing app registration requires **renewed admin consent**:
       click **Grant admin consent for <Tenant>** again. If Graph still
@@ -230,6 +252,23 @@ setup:
       mit dem alten Credential weiter; nur die Chat-Liste meldet die Lücke, und
       zwar als typisiertes "bitte neu anmelden" statt als Berechtigungsfehler.
 
+      ### 5. Follow-ups für Facilitatoren (optional, ab 0.9.0)
+
+      Ein nativer Facilitator kann das bestätigte Protokoll verschicken und die
+      vereinbarten Folgetermine anlegen (`facilitation.followup@1`). Er tut das
+      aus GENAU EINEM Postfach, das ihr im Feld **Organisator-Postfach für
+      Facilitation** angebt — ein geteiltes oder eigens angelegtes Postfach,
+      nicht das einer Person. Bleibt das Feld leer, meldet die Funktion "nicht
+      konfiguriert"; sonst ändert sich nichts.
+
+      Nötige Application-Permissions: `Calendars.ReadWrite` (Frei/Gebucht und
+      Anlegen der Einladung) und `Mail.Send` (Protokoll-Mail). Beide gelten
+      zunächst mandantenweit. Beschränkt die App mit **RBAC for Applications**
+      in Exchange Online (oder einer älteren Application Access Policy) auf das
+      Organisator-Postfach — die Schritte stehen in
+      `docs/facilitation-followup.md`. Der Connector selbst ruft nur das
+      Organisator-Postfach auf und liest nie Mail- oder Kalenderinhalte.
+
       Erweiterte Berechtigungen einer bestehenden App-Registration erfordern
       **erneuten Admin-Consent**: **Grant admin consent for <Tenant>**
       erneut klicken. Antwortet Graph danach weiterhin mit 403, die App-Rollen
@@ -256,6 +295,16 @@ setup:
       label: "App (Client) Secret"
       help: "Rotierbar im Azure Portal → App Registration → Certificates & secrets."
       required: true
+    # --- facilitation.followup@1: OPTIONAL organiser mailbox ---------------
+    # Key from FACILITATION_ORGANIZER_MAILBOX_FIELD in
+    # src/facilitationFollowup/config.ts. Optional and without a default:
+    # absent, the service is still published and answers `not_configured`.
+    - key: "facilitation_organizer_mailbox"
+      type: "string"
+      label: "Organisator-Postfach für Facilitation"
+      help: "Postfach, aus dem native Facilitatoren Protokolle versenden und Folgetermine anlegen (am besten ein eigenes, geteiltes Postfach). Leer lassen, wenn Facilitatoren weder Mail noch Kalender nutzen sollen."
+      required: false
+      pattern: "^[^@ ]+@[^@ ]+[.][^@ ]+$"
     # --- teamsProvisioner@1: OPTIONAL ARM fields ---------------------------
     # Verbatim from TEAMS_PROVISIONER_ARM_SETUP_FIELDS in
     # src/teamsProvisioner/config.ts (arm-config unit). ALL optional: absence
