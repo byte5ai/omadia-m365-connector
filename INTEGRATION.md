@@ -364,6 +364,11 @@ if (result.outcome === 'refused') { /* recipient_not_allowed | not_configured | 
   administrator with Exchange Online RBAC for Applications scoped to the
   organiser mailbox, and not in Entra ID as well.
 
+Since 0.10.0 a call that states `grant.grantId` is verified with the kernel's
+`grantVerification` service before every operation; a refusal or a missing
+answer comes back as `grant_refused`. A call without `grantId`, and a kernel
+without that service, keep the allow-list as the only check.
+
 Operations, refusals, permissions, consent steps and the manual verification
 checklist: [`docs/facilitation-followup.md`](docs/facilitation-followup.md).
 The Graph calls were checked live at platform level (scoped free/busy, Teams

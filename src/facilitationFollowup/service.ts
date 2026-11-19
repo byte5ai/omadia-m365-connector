@@ -13,6 +13,9 @@
  * window of 62 days or more (both are documented Graph limits).
  *
  * Order of checks in every operation, all before any Graph request:
+ *   0. when the call states `grant.grantId`: the kernel says the grant is live
+ *      and covers the operation and everyone it reaches, else `grant_refused`
+ *      (./grantVerification.ts; no answer from the kernel refuses too);
  *   1. everyone the call names is inside `grant.allowed`, else
  *      `recipient_not_allowed` for the whole call;
  *   2. an organiser mailbox is configured, else `not_configured`;
@@ -27,12 +30,14 @@ import type {
   FacilitationFollowupService,
   FollowupGrant,
   FollowupRefusal,
+  GrantVerificationService,
 } from '@omadia/plugin-api';
 
 import { truncate } from '../graphClient.js';
 import { redactSecrets } from '../teamsProvisioner/redact.js';
 import { checkAgainstGrant } from './addresses.js';
 import type { OrganizerMailboxConfig } from './config.js';
+import { createGrantGate } from './grantVerification.js';
 import type {
   FollowupGraphOperation,
   FollowupGraphResponse,
@@ -85,21 +90,41 @@ type Prepared<T> =
 export interface FacilitationFollowupOptions {
   readonly organizer: OrganizerMailboxConfig;
   readonly transport: FollowupGraphTransport;
-  /** Audit line per call: operation, facilitation, counts, outcome. No addresses, no content. */
+  /**
+   * The kernel's `grantVerification` service, looked up at every call.
+   * Absent, or answering `undefined`: a kernel without kernel-issued grants,
+   * where only the allow-list of the call applies.
+   */
+  readonly grantVerification?: () => GrantVerificationService | undefined;
+  /** For tests: how long the kernel may take to answer. */
+  readonly grantVerificationTimeoutMs?: number;
+  /**
+   * Audit line per call: operation, facilitation, counts, outcome and what
+   * the kernel said about the grant. No addresses, no content.
+   */
   readonly log?: (msg: string) => void;
 }
 
 export function createFacilitationFollowupService(
   opts: FacilitationFollowupOptions,
 ): FacilitationFollowupService {
+  const grantGate = createGrantGate({
+    ...(opts.grantVerification ? { lookup: opts.grantVerification } : {}),
+    ...(opts.grantVerificationTimeoutMs !== undefined
+      ? { timeoutMs: opts.grantVerificationTimeoutMs }
+      : {}),
+    ...(opts.log ? { log: opts.log } : {}),
+  });
+
   const audit = (
     operation: string,
     grant: FollowupGrant,
+    verification: string,
     people: number,
     outcome: string,
   ): void => {
     opts.log?.(
-      `[microsoft365] facilitation.followup op=${operation} facilitation=${loggableId(grant.facilitationId)} people=${String(people)} outcome=${outcome}`,
+      `[microsoft365] facilitation.followup op=${operation} facilitation=${loggableId(grant?.facilitationId)} people=${String(people)} outcome=${outcome} grant=${verification}`,
     );
   };
 
@@ -163,11 +188,16 @@ export function createFacilitationFollowupService(
 
   return {
     async freeBusy(grant, request) {
+      const verified = await grantGate.check(grant, 'free_busy', request.attendees);
+      if (verified.verdict === 'refused') {
+        audit('freeBusy', grant, verified.audit, countOf(request.attendees), verified.refusal.code);
+        return verified.refusal;
+      }
       const prepared = prepare(request.attendees, grant, () =>
         toUtcWindow(request.from, request.to, 'from', 'to', MAX_FREE_BUSY_WINDOW_DAYS),
       );
       if (!prepared.ready) {
-        audit('freeBusy', grant, countOf(request.attendees), prepared.refusal.code);
+        audit('freeBusy', grant, verified.audit, countOf(request.attendees), prepared.refusal.code);
         return prepared.refusal;
       }
       // One request per 20 schedules, one after the other. A failed request
@@ -187,7 +217,7 @@ export function createFacilitationFollowupService(
           PREFER_UTC_HEADER,
         );
         if ('outcome' in response) {
-          audit('freeBusy', grant, prepared.addresses.length, response.code);
+          audit('freeBusy', grant, verified.audit, prepared.addresses.length, response.code);
           return response;
         }
         busy.push(
@@ -202,6 +232,7 @@ export function createFacilitationFollowupService(
       audit(
         'freeBusy',
         grant,
+        verified.audit,
         prepared.addresses.length,
         busy.length === prepared.addresses.length
           ? 'ok'
@@ -211,13 +242,18 @@ export function createFacilitationFollowupService(
     },
 
     async createInvitation(grant, request) {
+      const verified = await grantGate.check(grant, 'create_invitation', request.attendees);
+      if (verified.verdict === 'refused') {
+        audit('createInvitation', grant, verified.audit, countOf(request.attendees), verified.refusal.code);
+        return verified.refusal;
+      }
       const prepared = prepare(request.attendees, grant, () => {
         if (!isNonEmptyString(request.subject)) return 'subject is empty';
         if (typeof request.body !== 'string') return 'body is not a string';
         return toUtcWindow(request.start, request.end, 'start', 'end');
       });
       if (!prepared.ready) {
-        audit('createInvitation', grant, countOf(request.attendees), prepared.refusal.code);
+        audit('createInvitation', grant, verified.audit, countOf(request.attendees), prepared.refusal.code);
         return prepared.refusal;
       }
       const response = await post('createEvent', prepared.mailbox, {
@@ -234,14 +270,14 @@ export function createFacilitationFollowupService(
           : {}),
       });
       if ('outcome' in response) {
-        audit('createInvitation', grant, prepared.addresses.length, response.code);
+        audit('createInvitation', grant, verified.audit, prepared.addresses.length, response.code);
         return response;
       }
       // Only the id and the join link of the event just created are read.
       const created = asRecord(response.json);
       const eventId = created?.['id'];
       if (!isNonEmptyString(eventId)) {
-        audit('createInvitation', grant, prepared.addresses.length, 'provider_error');
+        audit('createInvitation', grant, verified.audit, prepared.addresses.length, 'provider_error');
         return refuse('provider_error', 'graph createEvent answered without an event id');
       }
       const joinUrl = asRecord(created?.['onlineMeeting'])?.['joinUrl'];
@@ -252,6 +288,7 @@ export function createFacilitationFollowupService(
       audit(
         'createInvitation',
         grant,
+        verified.audit,
         prepared.addresses.length,
         isLinkMissing ? 'created_without_join_url' : 'created',
       );
@@ -263,13 +300,18 @@ export function createFacilitationFollowupService(
     },
 
     async sendMail(grant, request) {
+      const verified = await grantGate.check(grant, 'send_mail', request.recipients);
+      if (verified.verdict === 'refused') {
+        audit('sendMail', grant, verified.audit, countOf(request.recipients), verified.refusal.code);
+        return verified.refusal;
+      }
       const prepared = prepare(request.recipients, grant, () => {
         if (!isNonEmptyString(request.subject)) return 'subject is empty';
         if (!isNonEmptyString(request.body)) return 'body is empty';
         return true as const;
       });
       if (!prepared.ready) {
-        audit('sendMail', grant, countOf(request.recipients), prepared.refusal.code);
+        audit('sendMail', grant, verified.audit, countOf(request.recipients), prepared.refusal.code);
         return prepared.refusal;
       }
       const response = await post('sendMail', prepared.mailbox, {
@@ -283,10 +325,10 @@ export function createFacilitationFollowupService(
         saveToSentItems: true,
       });
       if ('outcome' in response) {
-        audit('sendMail', grant, prepared.addresses.length, response.code);
+        audit('sendMail', grant, verified.audit, prepared.addresses.length, response.code);
         return response;
       }
-      audit('sendMail', grant, prepared.addresses.length, 'sent');
+      audit('sendMail', grant, verified.audit, prepared.addresses.length, 'sent');
       return { outcome: 'sent' };
     },
   };

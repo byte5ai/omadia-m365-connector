@@ -3,6 +3,51 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## 0.10.0
+
+The connector verifies the kernel-issued grant (byte5ai/omadia#2078, spec 2043
+§5.11, M1 of the spec alignment). Verified against a fake kernel service and a
+fake Graph; nothing ran against a kernel or a tenant.
+
+### Added
+
+- **`facilitation.followup` asks the kernel before every operation.** When the
+  caller's `FollowupGrant` states `grantId`, `freeBusy`, `createInvitation` and
+  `sendMail` first call `grantVerification.verify({ grantId, operation,
+  recipients })` with `free_busy`, `create_invitation` or `send_mail` and every
+  address the call names (trimmed, lower-cased, de-duplicated). The kernel is
+  asked at every call, never cached. `freeBusy` asks once for all attendees,
+  not once per getSchedule request.
+- **New refusal code `grant_refused`.** Any answer other than `allowed: true`
+  ends the call before the token endpoint and Graph are reached. The message
+  carries the kernel's code and wording, for example
+  `the kernel refused the grant (revoked): this grant was revoked`; for
+  `recipient_not_covered`, `rejected` lists the addresses the kernel named.
+- **No answer refuses.** The kernel answering `unavailable`, `verify()`
+  throwing, no answer within 10 seconds, an answer of another shape, a failing
+  service lookup, or a service that was there and is gone: all `grant_refused`.
+- **The audit line states the verification.** A new last field `grant=` with
+  `allowed`, `refused:<kernel code>`, `refused:unavailable`,
+  `not_asked:no_grant_id` or `not_asked:no_kernel_service`.
+- Manifest: `optional_requires: ["grantVerification@^1"]`. The service is
+  looked up at every call, because the kernel publishes it after this plugin
+  activates.
+
+### Unchanged
+
+- **The allow-list of the call stays the second check.** After the kernel
+  allowed the operation, every address still has to be in `grant.allowed`,
+  else `recipient_not_allowed` as before.
+- **A caller without `grantId`** (an engine before kernel grants) is not
+  verified with the kernel: allow-list only, as in 0.9.x.
+- **A kernel without `grantVerification`** (before #2078): allow-list only,
+  also when the caller states a grant id. This is logged once per activation.
+
+### Changed
+
+- Every audit line of `facilitation.followup` ends with the new `grant=` field.
+  Anything that parses these lines to the end of the line has to allow for it.
+
 ## 0.9.3
 
 Fix for rollout defect D22 of native facilitators (byte5ai/omadia#2043).

@@ -11,6 +11,12 @@ export {
 } from './service.js';
 export type { FacilitationFollowupOptions } from './service.js';
 export {
+  createGrantGate,
+  GRANT_VERIFICATION_SERVICE_NAME,
+  GRANT_VERIFICATION_TIMEOUT_MS,
+} from './grantVerification.js';
+export type { GrantGate, GrantGateOptions, GrantVerdict } from './grantVerification.js';
+export {
   FACILITATION_ORGANIZER_MAILBOX_FIELD,
   readOrganizerMailbox,
 } from './config.js';
