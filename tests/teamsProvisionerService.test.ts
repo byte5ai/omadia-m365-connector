@@ -440,7 +440,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         to the end and reports truncation (byte5ai/omadia#2043 D7, D8).
     // 0.9.2 — a deleted identity is over: honest purge, no restore, no second
     //         bot under a used app id, and `probeBot` (byte5ai/omadia#2043 D10).
-    assert.equal(pkg.version, '0.9.2');
+    // 0.9.3 — a 403 on a follow-up write to a fresh registration is
+    //         replication, not missing consent (byte5ai/omadia#2043 D22).
+    assert.equal(pkg.version, '0.9.3');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

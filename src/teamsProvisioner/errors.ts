@@ -195,7 +195,7 @@ export interface ProvisioningGraphError {
  * a later run finds it under its `uniqueName`. Never a reason to roll back.
  */
 export class DirectoryReplicationError extends TeamsProvisionerError {
-  /** Step label that kept answering 404, e.g. `applications.addPassword`. */
+  /** Step label that kept answering "not there yet", e.g. `applications.addPassword`. */
   public readonly step: string;
   /** Directory object id that was not addressable yet. */
   public readonly objectId: string;
@@ -203,20 +203,50 @@ export class DirectoryReplicationError extends TeamsProvisionerError {
   public readonly attempts: number;
   /** Total time waited across those probes (ms). */
   public readonly waitedMs: number;
+  /**
+   * What the last probe answered, when the step recorded it (since 0.9.3):
+   * `404` (not found yet) or `403` (refused on an object this run created or
+   * found seconds ago, see {@link DirectoryReplicationLastAnswer}).
+   */
+  public readonly lastStatus?: number;
+  /** The last refusal as the API worded it, redacted and bounded. */
+  public readonly lastDetail?: string;
 
   constructor(
     step: string,
     objectId: string,
     attempts: number,
     waitedMs: number,
+    last?: DirectoryReplicationLastAnswer,
   ) {
-    super('directory_replication_pending');
+    // The 404 message is unchanged. A 403 says so in the message too: without
+    // that an operator cannot tell it from the 404 case, and it is the one
+    // that used to be reported as missing admin consent.
+    super(
+      last?.status === 403
+        ? `directory_replication_pending: graph ${step} still answered 403 after ` +
+            `${String(attempts)} attempts on an app registration this run created or found ` +
+            `seconds ago. The permission is in use (the registration was just written with ` +
+            `it), so this is not missing admin consent; run provisioning again` +
+            `${last.detail !== undefined ? ` — ${last.detail}` : ''}`
+        : 'directory_replication_pending',
+    );
     this.name = 'DirectoryReplicationError';
     this.step = step;
     this.objectId = objectId;
     this.attempts = attempts;
     this.waitedMs = waitedMs;
+    if (last !== undefined) {
+      this.lastStatus = last.status;
+      if (last.detail !== undefined) this.lastDetail = last.detail;
+    }
   }
+}
+
+/** The answer a replication wait ended on. */
+export interface DirectoryReplicationLastAnswer {
+  readonly status: number;
+  readonly detail?: string;
 }
 
 /** How long Entra keeps a deleted application in the recycle bin. */

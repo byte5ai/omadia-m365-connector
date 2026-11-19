@@ -14,6 +14,7 @@ import {
   DirectoryReplicationError,
   ProvisioningThrottledError,
   UniqueNameReservedError,
+  isTransientProvisioningFailure,
 } from '../src/teamsProvisioner/errors.js';
 
 // createAppRegistration: three chained Graph writes (POST /applications →
@@ -958,3 +959,134 @@ describe('createAppRegistration — superseded credentials on adoption (#916)', 
     assert.equal(vault.get(SECRET_REF), SECRET_TEXT);
   });
 });
+
+// byte5ai/omadia#2043, rollout defect D22. A fresh provisioning created the
+// registration, and 8 seconds later a follow-up write on it answered 403. The
+// connector reported `consent_missing` for Application.ReadWrite.OwnedBy, the
+// permission it had just created the registration with, and the page sent the
+// operator to a tenant administrator. The identical re-run succeeded.
+describe('a 403 on a follow-up write to a fresh registration is replication (0.9.3)', () => {
+  const REFUSED = {
+    status: 403,
+    body: {
+      error: {
+        code: 'Authorization_RequestDenied',
+        message: 'Insufficient privileges to complete the operation.',
+      },
+    },
+  };
+  const CREATE_ROUTES = (): Route[] => [
+    route("/applications(appId='", { status: 204 }),
+    route('/applications/', { status: 200, body: APP_BODY }),
+    route('/applications', { status: 201, body: APP_BODY }),
+  ];
+  const postsTo = (calls: FetchCall[], suffix: string): number =>
+    graphCalls(calls).filter((c) => c.init?.method === 'POST' && c.url.endsWith(suffix)).length;
+
+  it('addPassword answers 403 twice, then 200 → one registration, one secret, no error', async () => {
+    const { client, calls, vault, waits, logs } = harness([
+      route('/addPassword', REFUSED, REFUSED, { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', { status: 201, body: {} }),
+      ...CREATE_ROUTES(),
+    ]);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.outcome, 'created');
+    assert.equal(result.value.appId, APP_ID);
+    assert.equal(postsTo(calls, '/applications'), 1, 'the registration was created more than once');
+    assert.equal(postsTo(calls, '/addPassword'), 3);
+    assert.equal(vault.get(SECRET_REF), SECRET_TEXT);
+    assert.equal(vault.size, 1);
+    assert.equal(waits.length, 2, 'each refusal is waited out on the replication budget');
+    // D22 also asked for the refused call and Graph's wording in the log.
+    const line = logs.find((l) => l.includes('applications.addPassword: 403'));
+    assert.match(line ?? '', /not replicated yet, not as missing consent/);
+    assert.match(line ?? '', /Authorization_RequestDenied/);
+  });
+
+  it('addPassword answers 403 for the whole budget → DirectoryReplicationError, never ConsentMissingError', async () => {
+    const { client, calls } = harness(
+      [route('/addPassword', REFUSED), ...CREATE_ROUTES()],
+      { maxAttempts: 3 },
+    );
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof DirectoryReplicationError);
+    assert.ok(!(err instanceof ConsentMissingError));
+    assert.equal(err.step, 'applications.addPassword');
+    assert.equal(err.objectId, OBJECT_ID);
+    assert.equal(err.attempts, 3);
+    assert.equal(err.lastStatus, 403);
+    assert.match(err.lastDetail ?? '', /graph applications\.addPassword 403 .*Authorization_RequestDenied/);
+    assert.match(err.message, /^directory_replication_pending: graph applications\.addPassword still answered 403/);
+    assert.match(err.message, /not missing admin consent/);
+    assert.ok(isTransientProvisioningFailure(err));
+    assert.equal(postsTo(calls, '/addPassword'), 3);
+    assert.ok(
+      !graphCalls(calls).some((c) => c.init?.method === 'DELETE'),
+      'a transient failure must not roll the registration back',
+    );
+  });
+
+  it('servicePrincipals.create answers 403 twice, then 201 → no error, one secret', async () => {
+    const { client, calls, vault } = harness([
+      route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+      route('/servicePrincipals', REFUSED, REFUSED, { status: 201, body: {} }),
+      ...CREATE_ROUTES(),
+    ]);
+    const result = await client.createAppRegistration(CREATE_INPUT);
+
+    assert.equal(result.value.servicePrincipalOutcome, 'created');
+    assert.equal(postsTo(calls, '/servicePrincipals'), 3);
+    assert.equal(postsTo(calls, '/addPassword'), 1, 'the secret was minted more than once');
+    assert.equal(vault.size, 1);
+  });
+
+  it('servicePrincipals.create answers 403 for the whole budget → DirectoryReplicationError', async () => {
+    const { client } = harness(
+      [
+        route('/addPassword', { status: 200, body: PASSWORD_BODY }),
+        route('/servicePrincipals', REFUSED),
+        ...CREATE_ROUTES(),
+      ],
+      { maxAttempts: 3 },
+    );
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof DirectoryReplicationError);
+    assert.ok(!(err instanceof ConsentMissingError));
+    assert.equal(err.step, 'servicePrincipals.create');
+    assert.equal(err.lastStatus, 403);
+  });
+
+  it('a 404 budget keeps its message and reports the last status as 404', async () => {
+    const { client } = harness(
+      [route('/addPassword', { status: 404, body: {} }), ...CREATE_ROUTES()],
+      { maxAttempts: 2 },
+    );
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof DirectoryReplicationError);
+    assert.equal(err.message, 'directory_replication_pending');
+    assert.equal(err.lastStatus, 404);
+  });
+
+  it('applications.create 403 → ConsentMissingError as before, on the first answer', async () => {
+    const { client, calls } = harness([route('/applications', REFUSED)]);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+
+    assert.ok(err instanceof ConsentMissingError);
+    assert.deepEqual(err.missingScopes, ['Application.ReadWrite.OwnedBy']);
+    assert.equal(graphCalls(calls).length, 1);
+  });
+
+  it('applications.findByUniqueName 403 → ConsentMissingError as before', async () => {
+    const { client } = harness([
+      route("/applications(uniqueName='", REFUSED),
+      route('/applications', UNIQUE_NAME_TAKEN),
+    ]);
+    const err = await rejection(client.createAppRegistration(CREATE_INPUT));
+    assert.ok(err instanceof ConsentMissingError);
+  });
+});
+
