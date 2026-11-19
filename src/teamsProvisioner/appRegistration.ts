@@ -79,12 +79,15 @@ import {
 } from './directory.js';
 import {
   DELETED_ITEM_RETENTION_DAYS,
+  ConsentMissingError,
   DeletedObjectIdMismatchError,
+  DirectoryReplicationError,
   RecycleBinUnreadableError,
   UniqueNameReservedError,
   isTransientProvisioningFailure,
 } from './errors.js';
 import type { ProvisioningHttp, ProvisioningOkResponse } from './http.js';
+import { redactUnknown } from './redact.js';
 import {
   storeAppPassword,
   deleteAppPassword,
@@ -355,9 +358,7 @@ export class AppRegistrationClient {
         registration.appId,
         password.secretText,
       );
-      const servicePrincipalOutcome = await this.ensureServicePrincipal(
-        registration.appId,
-      );
+      const servicePrincipalOutcome = await this.ensureServicePrincipal(registration);
       if (outcome === 'already-existed') {
         await this.pruneStaleBotPasswords(registration, input, password.keyId);
       }
@@ -861,12 +862,70 @@ export class AppRegistrationClient {
     registration: AppRegistration,
     input: CreateAppRegistrationInput,
   ): Promise<{ secretText: string; keyId: string; endDateTime: string }> {
-    return retryWhileReplicating(
+    return this.retryOnFreshRegistration(
       'applications.addPassword',
       registration.objectId,
       () => this.tryAddPassword(registration, input),
-      this.replication,
     );
+  }
+
+  /**
+   * {@link retryWhileReplicating} for a follow-up write on the registration
+   * this `createAppRegistration` call just created or found, with ONE more
+   * answer read as "not replicated yet": a **403**.
+   *
+   * `applications.create` or `applications.findByUniqueName` succeeded
+   * seconds ago with {@link APP_REGISTRATION_SCOPE}, so the permission is
+   * granted. Entra replicates the new object and its OWNER independently of
+   * the write path, and until the owner has arrived, a write on "an
+   * application the caller owns" is refused. That 403 was reported as missing
+   * admin consent, a verdict that sends an operator to a global administrator
+   * for a permission the tenant already granted, and the identical re-run 90
+   * seconds later succeeded (byte5ai/omadia#2043, rollout defect D22).
+   *
+   * Same budget as the 404. When it runs out the error is the TRANSIENT
+   * `DirectoryReplicationError`, carrying the last status and Graph's wording.
+   * A 403 on `applications.create` / `applications.findByUniqueName` is not
+   * routed through here: there it IS missing consent.
+   */
+  private async retryOnFreshRegistration<T>(
+    step: string,
+    objectId: string,
+    attempt: () => Promise<T | undefined>,
+  ): Promise<T> {
+    let last: { status: number; detail?: string } = { status: 404 };
+    try {
+      return await retryWhileReplicating(
+        step,
+        objectId,
+        async () => {
+          try {
+            const result = await attempt();
+            if (result === undefined) last = { status: 404 };
+            return result;
+          } catch (err) {
+            if (!(err instanceof ConsentMissingError)) throw err;
+            last = { status: 403, detail: redactUnknown(err.cause ?? err) };
+            this.log(
+              `provisioner ${step}: 403 on registration '${objectId}' seconds after it was ` +
+                `written with ${APP_REGISTRATION_SCOPE} — reading it as not replicated yet, ` +
+                `not as missing consent (${last.detail ?? ''})`,
+            );
+            return undefined;
+          }
+        },
+        this.replication,
+      );
+    } catch (err) {
+      if (!(err instanceof DirectoryReplicationError)) throw err;
+      throw new DirectoryReplicationError(
+        err.step,
+        err.objectId,
+        err.attempts,
+        err.waitedMs,
+        last,
+      );
+    }
   }
 
   /** One `addPassword` attempt; `undefined` = "not replicated yet, retry". */
@@ -900,18 +959,26 @@ export class AppRegistrationClient {
   }
 
   /** `POST /servicePrincipals`; 409 = it already exists — the idempotent signal. */
-  private async ensureServicePrincipal(
-    appId: string,
+  private ensureServicePrincipal(
+    registration: AppRegistration,
   ): Promise<IdempotentOutcome> {
-    const response = await this.http.request({
-      resource: 'graph',
-      method: 'POST',
-      url: `${GRAPH_BASE}/servicePrincipals`,
-      step: 'servicePrincipals.create',
-      jsonBody: { appId },
-      missingScopesOn403: [APP_REGISTRATION_SCOPE],
-    });
-    return response.kind === 'conflict' ? 'already-existed' : 'created';
+    // A 403 here, seconds after the registration was written, is the same
+    // replication window as on addPassword — see retryOnFreshRegistration.
+    return this.retryOnFreshRegistration(
+      'servicePrincipals.create',
+      registration.objectId,
+      async () => {
+        const response = await this.http.request({
+          resource: 'graph',
+          method: 'POST',
+          url: `${GRAPH_BASE}/servicePrincipals`,
+          step: 'servicePrincipals.create',
+          jsonBody: { appId: registration.appId },
+          missingScopesOn403: [APP_REGISTRATION_SCOPE],
+        });
+        return response.kind === 'conflict' ? 'already-existed' : 'created';
+      },
+    );
   }
 
   /**

@@ -3,6 +3,33 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## 0.9.3
+
+Fix for rollout defect D22 of native facilitators (byte5ai/omadia#2043).
+Verified against a fake Graph; nothing ran against a tenant.
+
+### Fixed
+
+- **A 403 on a follow-up write to a fresh app registration is no longer
+  reported as missing admin consent.** `applications.addPassword` and
+  `servicePrincipals.create` run seconds after the registration was created or
+  found with `Application.ReadWrite.OwnedBy`, so the permission is granted; a
+  403 there is Entra not having replicated the new object's owner yet. It is
+  now retried on the same budget as the 404 (8 attempts, about 40 s). Live, the
+  403 came 8 seconds after the create and the identical re-run succeeded.
+- When that budget runs out the error is the transient
+  `DirectoryReplicationError`, not `ConsentMissingError`. It has two new
+  optional fields, `lastStatus` (403 or 404) and `lastDetail` (Graph's
+  wording), and for a 403 its message says so:
+  `directory_replication_pending: graph <step> still answered 403 after …`.
+  The message of the 404 case is unchanged.
+- The refused call and Graph's answer are logged at each such retry.
+
+### Unchanged
+
+- A 403 on `applications.create` or `applications.findByUniqueName` is still
+  `ConsentMissingError`, on the first answer.
+
 ## 0.9.2
 
 Fixes for rollout defect D10 of native facilitators (byte5ai/omadia#2043): after

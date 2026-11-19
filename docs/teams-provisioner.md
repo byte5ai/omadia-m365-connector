@@ -281,6 +281,15 @@ object until it is readable and retries `addPassword` through the same window
 `DirectoryReplicationError`, which is **transient**: the app exists and is
 adoptable.
 
+Since 0.9.3 a **403** on `addPassword` or on `POST /servicePrincipals` is read
+the same way and retried on the same budget. The registration was written
+seconds earlier with `Application.ReadWrite.OwnedBy`, so the permission is
+granted; what has not arrived yet is the new object's owner. Until 0.9.2 that
+403 was reported as `ConsentMissingError` and sent the operator to a tenant
+administrator (byte5ai/omadia#2043 D22). An exhausted budget raises
+`DirectoryReplicationError` with `lastStatus: 403`. A 403 on
+`POST /applications` or on the `uniqueName` lookup is still missing consent.
+
 **The recycle bin.** A deleted application is only SOFT-deleted, and its
 `uniqueName` stays reserved for 30 days while the object is invisible in
 `GET /applications`. On a conflict the step therefore looks in
