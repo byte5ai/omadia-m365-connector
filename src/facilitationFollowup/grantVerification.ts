@@ -9,9 +9,10 @@
  * three results; `grant.allowed` stays the provider's own second check.
  *
  *   allowed     the kernel said yes
- *   refused     the kernel said no, or gave no usable answer (fail closed)
- *   not_asked   there was nothing to ask: the caller stated no grant id, or
- *               this kernel has no `grantVerification` service
+ *   refused     the kernel said no, gave no usable answer, or offers no
+ *               `grantVerification` service at all (fail closed: a caller
+ *               that states a grant expects it to be checked)
+ *   not_asked   there was nothing to ask: the caller stated no grant id
  *
  * Nothing here throws.
  */
@@ -42,7 +43,8 @@ const MAX_KERNEL_CODE_LENGTH = 40;
 /**
  * `audit` is the value of the `grant=` field of the audit line:
  * `allowed`, `refused:<kernel code>`, `refused:unavailable`,
- * `not_asked:no_grant_id` or `not_asked:no_kernel_service`.
+ * `refused:no_kernel_service` or `not_asked:no_grant_id`. (The service adds
+ * `not_asked:refused_locally` for a call its own checks ended first.)
  */
 export type GrantVerdict =
   | { readonly verdict: 'allowed'; readonly audit: string }
@@ -55,7 +57,6 @@ export interface GrantGateOptions {
    * plugin activates). `undefined` means this kernel has none.
    */
   readonly lookup?: () => GrantVerificationService | undefined;
-  readonly log?: (msg: string) => void;
   readonly timeoutMs?: number;
 }
 
@@ -69,19 +70,16 @@ export interface GrantGate {
 
 export function createGrantGate(opts: GrantGateOptions): GrantGate {
   const timeoutMs = opts.timeoutMs ?? GRANT_VERIFICATION_TIMEOUT_MS;
-  // Both are one-way latches, never reset.
-  let hasSeenService = false;
-  let hasLoggedMissingService = false;
-
-  const unavailable = (reason: string): GrantVerdict => ({
+  const refusedWithoutAnswer = (audit: string, message: string): GrantVerdict => ({
     verdict: 'refused',
-    audit: 'refused:unavailable',
-    refusal: {
-      outcome: 'refused',
-      code: 'grant_refused',
-      message: `the grant could not be verified with the kernel (${reason}); nothing was sent`,
-    },
+    audit,
+    refusal: { outcome: 'refused', code: 'grant_refused', message },
   });
+  const unavailable = (reason: string): GrantVerdict =>
+    refusedWithoutAnswer(
+      'refused:unavailable',
+      `the grant could not be verified with the kernel (${reason}); nothing was sent`,
+    );
 
   return {
     async check(grant, operation, people) {
@@ -98,18 +96,11 @@ export function createGrantGate(opts: GrantGateOptions): GrantGate {
         return unavailable(`service lookup failed: ${safe(messageOf(err))}`);
       }
       if (service === undefined) {
-        // A kernel that answered once and now offers no service is a kernel
-        // that cannot be asked, not a kernel without grants.
-        if (hasSeenService) return unavailable(`service '${GRANT_VERIFICATION_SERVICE_NAME}' is gone`);
-        if (!hasLoggedMissingService) {
-          hasLoggedMissingService = true;
-          opts.log?.(
-            `[microsoft365] facilitation.followup: this kernel has no '${GRANT_VERIFICATION_SERVICE_NAME}' service; a stated grant id is not verified, only the allow-list of the call applies (logged once)`,
-          );
-        }
-        return { verdict: 'not_asked', audit: 'not_asked:no_kernel_service' };
+        return refusedWithoutAnswer(
+          'refused:no_kernel_service',
+          `the kernel offers no grant verification (no '${GRANT_VERIFICATION_SERVICE_NAME}' service), so the stated grant cannot be checked; nothing was sent`,
+        );
       }
-      hasSeenService = true;
       if (typeof service.verify !== 'function') return unavailable('the service has no verify()');
 
       let answer: unknown;

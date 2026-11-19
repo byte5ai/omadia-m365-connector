@@ -25,11 +25,13 @@ import {
 //
 // What this suite must prove:
 //   * with a grant id, the kernel is asked before every operation, with the
-//     operation and every address it reaches;
+//     operation and every address it reaches, as the last step before the
+//     token endpoint and Graph, and only for a call the local checks passed;
 //   * every refusal, and every missing answer, ends the call before the token
 //     endpoint and Graph are reached, with code `grant_refused`;
 //   * the allow-list of the call still refuses on its own;
-//   * without a grant id, or on a kernel without the service, nothing changed.
+//   * a stated grant id on a kernel without the service is refused;
+//   * without a grant id nothing changed.
 
 const pkgRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -127,11 +129,14 @@ function fakeGraph() {
 function setUp(
   lookup: (() => GrantVerificationService | undefined) | undefined,
   timeoutMs?: number,
+  isConfigured = true,
 ) {
   const graph = fakeGraph();
   const logs: string[] = [];
   const service: FacilitationFollowupService = createFacilitationFollowupService({
-    organizer: { kind: 'configured', mailbox: ORGANIZER },
+    organizer: isConfigured
+      ? { kind: 'configured', mailbox: ORGANIZER }
+      : { kind: 'not-configured', reason: 'setup field is empty' },
     transport: createAppOnlyGraphTransport({
       credential: { tenantId: 'tenant', clientId: 'client', clientSecret: 'secret' },
       fetchImpl: graph.fetchImpl,
@@ -275,18 +280,52 @@ describe('facilitation.followup under a kernel-issued grant (0.10.0)', () => {
     ]);
   });
 
-  it('second line: the kernel covers a recipient the call allow-list does not, and the call is still refused', async () => {
+  it('local checks come first: a call they refuse never reaches the kernel, so no use is recorded', async () => {
     const kernel = fakeKernel({
       [GRANT_ID]: { kind: 'protocol_dispatch', recipients: [ANNA, BEN, CARLA] },
     });
     const t = setUp(() => kernel.service);
-    const answer = await t.service.sendMail(GRANT, mail([ANNA, CARLA]));
-    assert.equal(answer.outcome === 'refused' && answer.code, 'recipient_not_allowed');
-    assert.deepEqual(answer.outcome === 'refused' ? answer.rejected : [], [CARLA]);
+    // The kernel grant covers Carla, the allow-list of the call does not.
+    const outside = await t.service.sendMail(GRANT, mail([ANNA, CARLA]));
+    assert.equal(outside.outcome === 'refused' && outside.code, 'recipient_not_allowed');
+    assert.deepEqual(outside.outcome === 'refused' ? outside.rejected : [], [CARLA]);
+    const empty = await t.service.sendMail(GRANT, { recipients: [ANNA], subject: '', body: 'x' });
+    assert.equal(empty.outcome === 'refused' && empty.code, 'provider_error');
+    const noList = await t.service.sendMail(GRANT, mail(undefined as unknown as string[]));
+    assert.equal(noList.outcome === 'refused' && noList.code, 'provider_error');
+    const window = await t.service.freeBusy(GRANT, { attendees: [ANNA], from: 'tomorrow', to: WINDOW.to });
+    assert.equal(window.outcome === 'refused' && window.code, 'provider_error');
+
+    const unconfigured = setUp(() => kernel.service, undefined, false);
+    const noMailbox = await unconfigured.service.createInvitation(GRANT, invitation([ANNA]));
+    assert.equal(noMailbox.outcome === 'refused' && noMailbox.code, 'not_configured');
+
+    assert.deepEqual(kernel.asked, [], 'the kernel must not record a use for these calls');
     t.untouched();
-    assert.deepEqual(t.auditLines(), [
-      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=2 outcome=recipient_not_allowed grant=allowed',
-    ]);
+    unconfigured.untouched();
+    assert.ok(
+      [...t.auditLines(), ...unconfigured.auditLines()].every((l) =>
+        l.endsWith('grant=not_asked:refused_locally'),
+      ),
+    );
+    assert.equal(
+      t.auditLines()[0],
+      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=2 outcome=recipient_not_allowed grant=not_asked:refused_locally',
+    );
+  });
+
+  it('the kernel is the last step before the token and Graph requests', async () => {
+    const order: string[] = [];
+    const kernel = fakeKernel({ [GRANT_ID]: { kind: 'followup_scheduling', recipients: [ANNA, BEN] } });
+    const t = setUp(() => ({
+      verify: (request) => {
+        order.push(`kernel:${String(t.graph.tokenCalls.length + t.graph.graphCalls.length)}`);
+        return kernel.service.verify(request);
+      },
+    }));
+    await t.service.freeBusy(GRANT, { attendees: [ANNA, BEN], ...WINDOW });
+    assert.deepEqual(order, ['kernel:0'], 'asked once, before any request left the process');
+    assert.equal(t.graph.graphCalls.length, 1);
   });
 
   describe('kernel unreachable = refuse', () => {
@@ -348,7 +387,7 @@ describe('facilitation.followup under a kernel-issued grant (0.10.0)', () => {
       });
     }
 
-    it('a service that was there and is gone refuses; it is not read as an old kernel', async () => {
+    it('a service that was there and is gone refuses', async () => {
       const kernel = fakeKernel({ [GRANT_ID]: { kind: 'protocol_dispatch', recipients: [ANNA] } });
       let present = true;
       const t = setUp(() => (present ? kernel.service : undefined));
@@ -372,24 +411,6 @@ describe('facilitation.followup under a kernel-issued grant (0.10.0)', () => {
     t.untouched();
   });
 
-  it('a malformed recipient list goes to the kernel as it is and is refused there', async () => {
-    const asked: GrantVerificationRequest[] = [];
-    const t = setUp(() => ({
-      verify: (request) => {
-        asked.push(request);
-        return Promise.resolve({
-          allowed: false,
-          code: 'invalid_request',
-          message: 'recipients is a non-empty list of mail addresses',
-        });
-      },
-    }));
-    const answer = await t.service.sendMail(GRANT, mail(undefined as unknown as string[]));
-    assert.equal(answer.outcome === 'refused' && answer.code, 'grant_refused');
-    assert.deepEqual(asked[0]?.recipients, []);
-    t.untouched();
-  });
-
   it('the kernel message is redacted and cut before it is passed on', async () => {
     const secret = `eyJ${'A1b2'.repeat(40)}`;
     const t = setUp(() => ({
@@ -403,32 +424,60 @@ describe('facilitation.followup under a kernel-issued grant (0.10.0)', () => {
   });
 });
 
-describe('facilitation.followup without kernel grants (unchanged behaviour)', () => {
-  it('kernel without grantVerification: allow-list only, logged once', async () => {
+describe('facilitation.followup on a kernel without grantVerification', () => {
+  const NO_SERVICE = {
+    outcome: 'refused',
+    code: 'grant_refused',
+    message:
+      "the kernel offers no grant verification (no 'grantVerification' service), so the stated grant cannot be checked; nothing was sent",
+  };
+
+  it('a stated grant id is refused for all three operations: it cannot be checked', async () => {
     let lookups = 0;
     const t = setUp(() => {
       lookups += 1;
       return undefined;
     });
-    assert.deepEqual(await t.service.sendMail(GRANT, mail([ANNA])), { outcome: 'sent' });
-    assert.equal((await t.service.freeBusy(GRANT, { attendees: [ANNA], ...WINDOW })).outcome, 'ok');
-    const outside = await t.service.sendMail(GRANT, mail([CARLA]));
-    assert.equal(outside.outcome === 'refused' && outside.code, 'recipient_not_allowed');
+    assert.deepEqual(await t.service.sendMail(GRANT, mail([ANNA])), NO_SERVICE);
+    assert.deepEqual(await t.service.freeBusy(GRANT, { attendees: [ANNA], ...WINDOW }), NO_SERVICE);
+    assert.deepEqual(await t.service.createInvitation(GRANT, invitation([ANNA])), NO_SERVICE);
     assert.equal(lookups, 3, 'the service is looked up at every call');
-    const notes = t.logs.filter((l) => l.includes(`no '${GRANT_VERIFICATION_SERVICE_NAME}' service`));
-    assert.equal(notes.length, 1);
-    assert.deepEqual(
-      t.auditLines().map((l) => l.split(' grant=')[1]),
-      ['not_asked:no_kernel_service', 'not_asked:no_kernel_service', 'not_asked:no_kernel_service'],
+    t.untouched();
+    assert.ok(
+      t.auditLines().every((l) => l.endsWith('outcome=grant_refused grant=refused:no_kernel_service')),
     );
   });
 
   it('no lookup wired at all behaves the same', async () => {
     const t = setUp(undefined);
+    assert.deepEqual(await t.service.sendMail(GRANT, mail([ANNA])), NO_SERVICE);
+    t.untouched();
+  });
+
+  it('once the kernel publishes the service, the same call goes through', async () => {
+    const kernel = fakeKernel({ [GRANT_ID]: { kind: 'protocol_dispatch', recipients: [ANNA] } });
+    let published = false;
+    const t = setUp(() => (published ? kernel.service : undefined));
+    assert.deepEqual(await t.service.sendMail(GRANT, mail([ANNA])), NO_SERVICE);
+    published = true;
     assert.deepEqual(await t.service.sendMail(GRANT, mail([ANNA])), { outcome: 'sent' });
   });
 
-  it('caller without a grant id: the kernel is not asked, even when it has the service', async () => {
+  it('caller without a grant id: allow-list only, as before 0.10.0', async () => {
+    const t = setUp(() => undefined);
+    const legacy = { facilitationId: 'fac-42', allowed: [ANNA] };
+    assert.deepEqual(await t.service.sendMail(legacy, mail([ANNA])), { outcome: 'sent' });
+    const outside = await t.service.sendMail(legacy, mail([CARLA]));
+    assert.equal(outside.outcome === 'refused' && outside.code, 'recipient_not_allowed');
+    assert.deepEqual(
+      t.auditLines().map((l) => l.split(' grant=')[1]),
+      ['not_asked:no_grant_id', 'not_asked:no_grant_id'],
+    );
+  });
+});
+
+describe('facilitation.followup without a grant id on a kernel with grants', () => {
+  it('the kernel is not asked', async () => {
     const kernel = fakeKernel({});
     const t = setUp(() => kernel.service);
     const legacy = { facilitationId: 'fac-42', allowed: [ANNA] };
@@ -437,7 +486,6 @@ describe('facilitation.followup without kernel grants (unchanged behaviour)', ()
     assert.deepEqual(t.auditLines(), [
       '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=1 outcome=sent grant=not_asked:no_grant_id',
     ]);
-    assert.equal(t.logs.length, 1, 'no "kernel has no service" note for a caller without a grant id');
   });
 });
 

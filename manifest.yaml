@@ -55,9 +55,10 @@ provides:
 # grantVerification@1 (byte5ai/omadia#2078, since 0.10.0) — the kernel's word on
 # a kernel-issued grant, asked before every facilitation.followup operation
 # whose caller states a grant id. Under `optional_requires:` because a kernel
-# before #2078 has no such service: the lookup then answers `undefined` and the
-# allow-list of the call is the only check, as before 0.10.0. The entry is also
-# what lets the service gate hand the service out at all.
+# before #2078 has no such service and this plugin must still activate there:
+# the lookup then answers `undefined`, a call that states a grant id is
+# refused, and a call without one runs on its allow-list as before 0.10.0. The
+# entry is also what lets the service gate hand the service out at all.
 optional_requires:
   - "grantVerification@^1"
 

@@ -13,13 +13,15 @@
  * window of 62 days or more (both are documented Graph limits).
  *
  * Order of checks in every operation, all before any Graph request:
- *   0. when the call states `grant.grantId`: the kernel says the grant is live
- *      and covers the operation and everyone it reaches, else `grant_refused`
- *      (./grantVerification.ts; no answer from the kernel refuses too);
  *   1. everyone the call names is inside `grant.allowed`, else
  *      `recipient_not_allowed` for the whole call;
  *   2. an organiser mailbox is configured, else `not_configured`;
- *   3. the request itself is well-formed, else `provider_error`.
+ *   3. the request itself is well-formed, else `provider_error`;
+ *   4. when the call states `grant.grantId`: the kernel says the grant is live
+ *      and covers the operation and everyone it reaches, else `grant_refused`
+ *      (./grantVerification.ts; no answer and no such service refuse too).
+ *      This is the last step before the token and Graph requests, so a use
+ *      the kernel records as allowed is one that is about to be sent.
  *
  * Nothing here throws: transport and token failures come back as
  * `provider_error`, because the consumer branches on `outcome`.
@@ -92,8 +94,9 @@ export interface FacilitationFollowupOptions {
   readonly transport: FollowupGraphTransport;
   /**
    * The kernel's `grantVerification` service, looked up at every call.
-   * Absent, or answering `undefined`: a kernel without kernel-issued grants,
-   * where only the allow-list of the call applies.
+   * Absent, or answering `undefined`: a kernel without kernel-issued grants.
+   * A call that states a grant id is then refused; one without is not asked
+   * about and runs on its allow-list alone.
    */
   readonly grantVerification?: () => GrantVerificationService | undefined;
   /** For tests: how long the kernel may take to answer. */
@@ -113,7 +116,6 @@ export function createFacilitationFollowupService(
     ...(opts.grantVerificationTimeoutMs !== undefined
       ? { timeoutMs: opts.grantVerificationTimeoutMs }
       : {}),
-    ...(opts.log ? { log: opts.log } : {}),
   });
 
   const audit = (
@@ -127,6 +129,12 @@ export function createFacilitationFollowupService(
       `[microsoft365] facilitation.followup op=${operation} facilitation=${loggableId(grant?.facilitationId)} people=${String(people)} outcome=${outcome} grant=${verification}`,
     );
   };
+
+  /** `grant=` of a call that this service's own checks ended before the kernel was asked. */
+  const beforeKernel = (grant: FollowupGrant): string =>
+    (grant as { grantId?: unknown } | undefined)?.grantId === undefined
+      ? 'not_asked:no_grant_id'
+      : 'not_asked:refused_locally';
 
   const prepare = <T>(
     people: readonly string[],
@@ -188,17 +196,17 @@ export function createFacilitationFollowupService(
 
   return {
     async freeBusy(grant, request) {
-      const verified = await grantGate.check(grant, 'free_busy', request.attendees);
-      if (verified.verdict === 'refused') {
-        audit('freeBusy', grant, verified.audit, countOf(request.attendees), verified.refusal.code);
-        return verified.refusal;
-      }
       const prepared = prepare(request.attendees, grant, () =>
         toUtcWindow(request.from, request.to, 'from', 'to', MAX_FREE_BUSY_WINDOW_DAYS),
       );
       if (!prepared.ready) {
-        audit('freeBusy', grant, verified.audit, countOf(request.attendees), prepared.refusal.code);
+        audit('freeBusy', grant, beforeKernel(grant), countOf(request.attendees), prepared.refusal.code);
         return prepared.refusal;
+      }
+      const verified = await grantGate.check(grant, 'free_busy', prepared.addresses);
+      if (verified.verdict === 'refused') {
+        audit('freeBusy', grant, verified.audit, prepared.addresses.length, verified.refusal.code);
+        return verified.refusal;
       }
       // One request per 20 schedules, one after the other. A failed request
       // fails the lookup (it has no side effect, so the caller can repeat it);
@@ -242,19 +250,19 @@ export function createFacilitationFollowupService(
     },
 
     async createInvitation(grant, request) {
-      const verified = await grantGate.check(grant, 'create_invitation', request.attendees);
-      if (verified.verdict === 'refused') {
-        audit('createInvitation', grant, verified.audit, countOf(request.attendees), verified.refusal.code);
-        return verified.refusal;
-      }
       const prepared = prepare(request.attendees, grant, () => {
         if (!isNonEmptyString(request.subject)) return 'subject is empty';
         if (typeof request.body !== 'string') return 'body is not a string';
         return toUtcWindow(request.start, request.end, 'start', 'end');
       });
       if (!prepared.ready) {
-        audit('createInvitation', grant, verified.audit, countOf(request.attendees), prepared.refusal.code);
+        audit('createInvitation', grant, beforeKernel(grant), countOf(request.attendees), prepared.refusal.code);
         return prepared.refusal;
+      }
+      const verified = await grantGate.check(grant, 'create_invitation', prepared.addresses);
+      if (verified.verdict === 'refused') {
+        audit('createInvitation', grant, verified.audit, prepared.addresses.length, verified.refusal.code);
+        return verified.refusal;
       }
       const response = await post('createEvent', prepared.mailbox, {
         subject: request.subject,
@@ -300,19 +308,19 @@ export function createFacilitationFollowupService(
     },
 
     async sendMail(grant, request) {
-      const verified = await grantGate.check(grant, 'send_mail', request.recipients);
-      if (verified.verdict === 'refused') {
-        audit('sendMail', grant, verified.audit, countOf(request.recipients), verified.refusal.code);
-        return verified.refusal;
-      }
       const prepared = prepare(request.recipients, grant, () => {
         if (!isNonEmptyString(request.subject)) return 'subject is empty';
         if (!isNonEmptyString(request.body)) return 'body is empty';
         return true as const;
       });
       if (!prepared.ready) {
-        audit('sendMail', grant, verified.audit, countOf(request.recipients), prepared.refusal.code);
+        audit('sendMail', grant, beforeKernel(grant), countOf(request.recipients), prepared.refusal.code);
         return prepared.refusal;
+      }
+      const verified = await grantGate.check(grant, 'send_mail', prepared.addresses);
+      if (verified.verdict === 'refused') {
+        audit('sendMail', grant, verified.audit, prepared.addresses.length, verified.refusal.code);
+        return verified.refusal;
       }
       const response = await post('sendMail', prepared.mailbox, {
         message: {
