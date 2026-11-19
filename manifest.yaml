@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.9.3"
+  version: "0.10.0"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -51,6 +51,16 @@ provides:
   # `service_types`: that registry offers services to builder-generated agents,
   # and this one is for the facilitation engine only.
   - "facilitation.followup@1"
+
+# grantVerification@1 (byte5ai/omadia#2078, since 0.10.0) — the kernel's word on
+# a kernel-issued grant, asked before every facilitation.followup operation
+# whose caller states a grant id. Under `optional_requires:` because a kernel
+# before #2078 has no such service and this plugin must still activate there:
+# the lookup then answers `undefined`, a call that states a grant id is
+# refused, and a call without one runs on its allow-list as before 0.10.0. The
+# entry is also what lets the service gate hand the service out at all.
+optional_requires:
+  - "grantVerification@^1"
 
 setup:
   guide:

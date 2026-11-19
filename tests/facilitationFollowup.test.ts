@@ -245,7 +245,7 @@ describe('freeBusy', () => {
       }
     }
     assert.deepEqual(logs, [
-      '[microsoft365] facilitation.followup op=freeBusy facilitation=fac-42 people=2 outcome=ok',
+      '[microsoft365] facilitation.followup op=freeBusy facilitation=fac-42 people=2 outcome=ok grant=not_asked:no_grant_id',
     ]);
   });
 
@@ -500,7 +500,7 @@ describe('createInvitation', () => {
     assert.deepEqual(result, { outcome: 'created', eventId: 'AAMkAGI=' });
     assert.ok(!('joinUrl' in result), 'no joinUrl key, so the caller can tell');
     assert.deepEqual(logs, [
-      '[microsoft365] facilitation.followup op=createInvitation facilitation=fac-42 people=2 outcome=created_without_join_url',
+      '[microsoft365] facilitation.followup op=createInvitation facilitation=fac-42 people=2 outcome=created_without_join_url grant=not_asked:no_grant_id',
     ]);
   });
 
@@ -642,8 +642,8 @@ describe('refusal outside the grant', () => {
     await service.sendMail(GRANT, { recipients: [ANNA], ...mail });
     await service.sendMail(GRANT, { recipients: [OUTSIDER], ...mail });
     assert.deepEqual(logs, [
-      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=1 outcome=sent',
-      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=1 outcome=recipient_not_allowed',
+      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=1 outcome=sent grant=not_asked:no_grant_id',
+      '[microsoft365] facilitation.followup op=sendMail facilitation=fac-42 people=1 outcome=recipient_not_allowed grant=not_asked:no_grant_id',
     ]);
   });
 });

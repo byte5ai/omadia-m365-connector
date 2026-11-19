@@ -1,5 +1,6 @@
 import type {
   FacilitationFollowupService,
+  GrantVerificationService,
   PluginContext,
 } from '@omadia/plugin-api';
 
@@ -13,6 +14,7 @@ import { GraphCalendarClient } from './graphCalendarClient.js';
 import { SlotCache } from './slotCache.js';
 import {
   FACILITATION_FOLLOWUP_SERVICE_NAME,
+  GRANT_VERIFICATION_SERVICE_NAME,
   createAppOnlyGraphTransport,
   createFacilitationFollowupService,
   readOrganizerMailbox,
@@ -145,6 +147,10 @@ export async function activate(
     transport: createAppOnlyGraphTransport({
       credential: { tenantId, clientId, clientSecret },
     }),
+    // Looked up at every call: the kernel publishes the service after this
+    // plugin activates, and a kernel before byte5ai/omadia#2078 has none.
+    grantVerification: () =>
+      ctx.services.get<GrantVerificationService>(GRANT_VERIFICATION_SERVICE_NAME),
     log: (msg) => ctx.log(msg),
   });
   const disposeFollowup = ctx.services.provide<FacilitationFollowupService>(

@@ -442,7 +442,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         bot under a used app id, and `probeBot` (byte5ai/omadia#2043 D10).
     // 0.9.3 — a 403 on a follow-up write to a fresh registration is
     //         replication, not missing consent (byte5ai/omadia#2043 D22).
-    assert.equal(pkg.version, '0.9.3');
+    // 0.10.0 — the kernel's `grantVerification` is asked before every
+    //          follow-up operation under a kernel-issued grant (byte5ai/omadia#2078).
+    assert.equal(pkg.version, '0.10.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

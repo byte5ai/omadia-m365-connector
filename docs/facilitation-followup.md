@@ -25,7 +25,7 @@ has into mail and calendars.
 |---|---|
 | ServiceRegistry key | `facilitation.followup` |
 | Manifest capability | `facilitation.followup@1` |
-| Contract | `FacilitationFollowupService`, `FollowupGrant`, `FollowupRefusal` in `@omadia/plugin-api` ≥ 1.55.0 |
+| Contract | `FacilitationFollowupService`, `FollowupGrant`, `FollowupRefusal` in `@omadia/plugin-api` ≥ 1.55.0; `grantId` and `grant_refused` with the plugin-api of byte5ai/omadia#2119 |
 | Consumer | the facilitation engine plugin; it passes the grant with every call |
 | Auth | application permissions (client credentials) of the connector app |
 
@@ -101,9 +101,35 @@ endpoint:
 | `recipient_not_allowed` | At least one attendee or recipient is not in `grant.allowed`. The whole call is refused; `rejected` lists the addresses. Comparison is case-insensitive on the trimmed address. A string that is not one bare address (`a@x; b@y`, `Name <a@x>`) is rejected even if the grant contains it. |
 | `not_configured` | The setup field `facilitation_organizer_mailbox` is empty or not a mailbox address. |
 | `provider_error` | The request is unusable (no addresses, empty subject, bad time window, free/busy window of 62 days or more), or the token request or Graph call failed. The message carries the Graph status and error code. |
+| `grant_refused` | Since 0.10.0, checked last, directly before the token and Graph requests. The call states `grant.grantId` and the kernel did not allow it: the grant is unknown, revoked or expired, its execution scope has ended, an operator stopped it, it does not cover the operation, or it does not cover every address (`rejected` then lists them). Also when the kernel has no `grantVerification` service, could not be asked, or gave no usable answer within 10 seconds. The message carries the kernel's code. |
 
 Each call writes one audit line to the plugin log: operation, facilitation id,
-number of people, outcome. Addresses and content are not logged.
+number of people, outcome, and what the kernel said about the grant (`grant=`).
+Addresses and content are not logged.
+
+### Kernel-issued grants (since 0.10.0)
+
+With kernel grants (byte5ai/omadia#2078) the engine issues a grant under an
+execution scope and states its id as `grant.grantId`. The connector then asks
+the kernel's `grantVerification` service before every operation, with the
+operation (`free_busy`, `create_invitation`, `send_mail`) and every address
+the call reaches. The kernel records each question as a use of the grant.
+
+The connector's own checks (allow-list, organiser mailbox, request) run first
+and the kernel is asked last, directly before the token and Graph requests. A
+call the connector refuses itself never reaches the kernel, so a use the kernel
+records as allowed is one that was about to be sent. It can still fail at
+Graph; the connector's audit line then shows that outcome next to
+`grant=allowed`.
+
+| Situation | What happens | `grant=` in the audit line |
+|---|---|---|
+| The connector's own checks refuse the call | That refusal; the kernel is not asked | `not_asked:refused_locally` |
+| The kernel allows it | The request goes to Graph | `allowed` |
+| The kernel refuses | `grant_refused`, no request to Graph | `refused:<kernel code>` |
+| The kernel cannot be asked or does not answer | `grant_refused`, no request to Graph | `refused:unavailable` |
+| The kernel has no `grantVerification` service | `grant_refused`, no request to Graph: a stated grant has to be checked | `refused:no_kernel_service` |
+| The call states no `grantId` | Allow-list only, as before 0.10.0, on any kernel | `not_asked:no_grant_id` |
 
 ## What it cannot do
 
