@@ -9,7 +9,7 @@ Spec 2042 plugin boundary (byte5ai/omadia#2053). No tools are registered by this
 
 ### Changed
 
-- `compat.core` is now `>=1.76.0 <2.0`.
+- `compat.core` is now `>=1.77.0 <2.0`.
 - `permissions.network.outbound` gained `smba.trafficmanager.net`, the Bot Connector host `teamsProvisioner` reaches (`src/teamsProvisioner/botProbe.ts:60,162`). It was missing from the allow-list.
 
 ### Known, not changed
