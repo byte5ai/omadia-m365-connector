@@ -444,7 +444,9 @@ describe('manifest.yaml / package.json hub edits', () => {
     //         replication, not missing consent (byte5ai/omadia#2043 D22).
     // 0.10.0 — the kernel's `grantVerification` is asked before every
     //          follow-up operation under a kernel-issued grant (byte5ai/omadia#2078).
-    assert.equal(pkg.version, '0.10.0');
+    // 0.11.0 — spec 2042 plugin boundary: `compat.core` >=1.75.0, the Bot
+    //          Connector host joins the egress allow-list.
+    assert.equal(pkg.version, '0.11.0');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',

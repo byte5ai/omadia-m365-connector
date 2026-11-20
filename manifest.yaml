@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.10.0"
+  version: "0.11.0"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -17,7 +17,7 @@ identity:
     - "communication"
 
 compat:
-  core: ">=1.0 <2.0"
+  core: ">=1.75.0 <2.0"
   node: ">=20"
 
 lifecycle:
@@ -378,6 +378,9 @@ permissions:
       # teamsProvisioner@1 — ARM REST (Microsoft.BotService). Without this
       # entry the Azure-bot step's egress is denied.
       - "management.azure.com"
+      # teamsProvisioner@1 — Bot Connector probe (botProbe.ts,
+      # TEAMS_BOT_CONNECTOR_SERVICE_URL).
+      - "smba.trafficmanager.net"
   filesystem:
     scratch: false
   # teamsProvisioner@1 — the app-registration step persists each generated

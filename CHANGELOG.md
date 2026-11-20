@@ -3,6 +3,19 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## 0.11.0
+
+Spec 2042 plugin boundary (byte5ai/omadia#2053). No tools are registered by this plugin (service-only), so there are no `capabilities:` entries to add.
+
+### Changed
+
+- `compat.core` is now `>=1.75.0 <2.0`.
+- `permissions.network.outbound` gained `smba.trafficmanager.net`, the Bot Connector host `teamsProvisioner` reaches (`src/teamsProvisioner/botProbe.ts:60,162`). It was missing from the allow-list.
+
+### Known, not changed
+
+All network goes through global `fetch` or SDKs with their own transport, not `ctx.http`: `src/graphClient.ts:65,149`, `src/teamsProvisioner/http.ts:296`, `src/teamsProvisioner/delegatedAuth.ts:332`, `src/teamsProvisioner/botProbe.ts:99`, `src/facilitationFollowup/transport.ts:72` (all `opts.fetchImpl ?? fetch`), `@microsoft/microsoft-graph-client` (`src/graphCalendarClient.ts:1,102`) and `@azure/msal-node` (`src/graphObo.ts:1,83`). Moving them is a follow-up once the kernel observes the traffic.
+
 ## 0.10.0
 
 The connector verifies the kernel-issued grant (byte5ai/omadia#2078, spec 2043
