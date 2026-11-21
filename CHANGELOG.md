@@ -3,6 +3,12 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## Unreleased
+
+### Added
+
+- `GraphClient.fetchChannelMessage({ teamId, channelId, rootMessageId, messageId })`: reads a Teams channel message (thread root or reply) from `/teams/{team}/channels/{channel}/messages/{root}[/replies/{id}]`. A channel thread is not a chat: `fetchChatMessage` answers 404 "Invalid ThreadId" for it (live finding 2026-11-21, Teams attachment lookup at a facilitation start in a channel thread). Needs `ChannelMessage.Read.Group` (RSC, already in the Teams app package) or `ChannelMessage.Read.All`.
+
 ## 0.11.0
 
 Spec 2042 plugin boundary (byte5ai/omadia#2053). No tools are registered by this plugin (service-only), so there are no `capabilities:` entries to add.

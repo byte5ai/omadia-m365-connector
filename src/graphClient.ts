@@ -177,19 +177,39 @@ export class GraphClient {
         `graph chatMessage ${String(response.status)} chat=${chatId.slice(0, 60)} msg=${messageId.slice(0, 60)} body=${truncate(body, 200)}`,
       );
     }
-    const json = (await response.json()) as {
-      id?: unknown;
-      attachments?: unknown;
-    };
-    const attachments = Array.isArray(json.attachments)
-      ? json.attachments
-          .map((a) => normaliseGraphAttachment(a))
-          .filter((a): a is GraphChatMessageAttachment => a !== undefined)
-      : [];
-    return {
-      id: typeof json.id === 'string' ? json.id : messageId,
-      attachments,
-    };
+    return parseGraphMessage(await response.json(), messageId);
+  }
+
+  /**
+   * Fetch a Teams CHANNEL message (a thread root or one of its replies). The
+   * channel counterpart of {@link fetchChatMessage}: a channel conversation
+   * (`19:…@thread.tacv2;messageid=<root>`) is not a chat, and
+   * `/chats/{id}/messages/{id}` answers 404 "Invalid ThreadId" for it.
+   * Needs `ChannelMessage.Read.Group` (RSC) or `ChannelMessage.Read.All`.
+   *
+   * `teamId` is the team's AAD group id (`channelData.team.aadGroupId`),
+   * `channelId` the channel's thread id, `rootMessageId` the thread root and
+   * `messageId` the message itself (equal to the root for the root post).
+   */
+  async fetchChannelMessage(input: {
+    teamId: string;
+    channelId: string;
+    rootMessageId: string;
+    messageId: string;
+  }): Promise<{ id: string; attachments: GraphChatMessageAttachment[] }> {
+    const token = await this.accessToken();
+    const base = `https://graph.microsoft.com/v1.0/teams/${encodeURIComponent(input.teamId)}/channels/${encodeURIComponent(input.channelId)}/messages/${encodeURIComponent(input.rootMessageId)}`;
+    const url = input.messageId === input.rootMessageId ? base : `${base}/replies/${encodeURIComponent(input.messageId)}`;
+    const response = await this.fetchImpl(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!response.ok) {
+      const body = await safeBody(response);
+      throw new Error(
+        `graph channelMessage ${String(response.status)} channel=${input.channelId.slice(0, 60)} msg=${input.messageId.slice(0, 60)} body=${truncate(body, 200)}`,
+      );
+    }
+    return parseGraphMessage(await response.json(), input.messageId);
   }
 
   /**
@@ -412,4 +432,18 @@ function fileNameFromDisposition(header: string | null): string | undefined {
 export function truncate(value: string, max: number): string {
   if (value.length <= max) return value;
   return `${value.slice(0, max - 1)}…`;
+}
+
+/** The id and file attachments of a Graph chat or channel message. */
+function parseGraphMessage(
+  raw: unknown,
+  fallbackId: string,
+): { id: string; attachments: GraphChatMessageAttachment[] } {
+  const json = (raw ?? {}) as { id?: unknown; attachments?: unknown };
+  const attachments = Array.isArray(json.attachments)
+    ? json.attachments
+        .map((a) => normaliseGraphAttachment(a))
+        .filter((a): a is GraphChatMessageAttachment => a !== undefined)
+    : [];
+  return { id: typeof json.id === 'string' ? json.id : fallbackId, attachments };
 }
