@@ -31,7 +31,7 @@ export {
   type SlotCacheAccessor,
 } from './accessor.js';
 
-export { GraphClient, encodeSharingUrl } from './graphClient.js';
+export { GraphClient, GraphRequestError, GRAPH_NOT_PERMITTED, encodeSharingUrl } from './graphClient.js';
 export type {
   GraphClientOptions,
   GraphChatMessageAttachment,
