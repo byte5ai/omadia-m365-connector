@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import { strict as assert } from 'node:assert';
 
-import { GraphClient } from '../src/graphClient.js';
+import { GraphClient, GraphRequestError } from '../src/graphClient.js';
 
 // Chat vs. channel message lookup (live finding 2026-11-21): the Teams plugin
 // asked `/chats/{id}/messages/{id}` for a channel thread and got 404 "Invalid
@@ -55,6 +55,24 @@ describe('GraphClient channel message lookup', () => {
     await assert.rejects(
       client([], 404).fetchChannelMessage({ teamId: 't', channelId: 'c', rootMessageId: 'r', messageId: 'r' }),
       /graph channelMessage 404/,
+    );
+  });
+
+  it('marks a 403 as not permitted, keeping the message format', async () => {
+    await assert.rejects(
+      client([], 403).fetchChannelMessage({ teamId: 't', channelId: 'c', rootMessageId: 'r', messageId: 'r' }),
+      (err: unknown) =>
+        err instanceof GraphRequestError &&
+        err.status === 403 &&
+        err.code === 'not_permitted' &&
+        /^graph channelMessage 403 /.test(err.message),
+    );
+  });
+
+  it('a 404 carries its status but no not_permitted code', async () => {
+    await assert.rejects(
+      client([], 404).fetchChannelMessage({ teamId: 't', channelId: 'c', rootMessageId: 'r', messageId: 'r' }),
+      (err: unknown) => err instanceof GraphRequestError && err.status === 404 && err.code === undefined,
     );
   });
 

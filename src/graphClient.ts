@@ -128,6 +128,28 @@ export class AadTokenCache {
   }
 }
 
+/** Code of a {@link GraphRequestError} for HTTP 403: the app token may not read this resource. */
+export const GRAPH_NOT_PERMITTED = 'not_permitted';
+
+/**
+ * A non-2xx Graph answer. The message keeps the `graph <op> <status> …` format;
+ * `status` and `code` let callers tell "not permitted" (403, `code:
+ * 'not_permitted'`) from other failures without parsing the text. Example: a
+ * facilitator with its own Teams bot app may lack RSC `ChannelMessage.Read.Group`
+ * in a team the deployment app is not installed in.
+ */
+export class GraphRequestError extends Error {
+  readonly status: number;
+  readonly code: string | undefined;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'GraphRequestError';
+    this.status = status;
+    this.code = status === 403 ? GRAPH_NOT_PERMITTED : undefined;
+  }
+}
+
 export class GraphClient {
   private readonly tenantId: string;
   private readonly clientId: string;
@@ -205,7 +227,8 @@ export class GraphClient {
     });
     if (!response.ok) {
       const body = await safeBody(response);
-      throw new Error(
+      throw new GraphRequestError(
+        response.status,
         `graph channelMessage ${String(response.status)} channel=${input.channelId.slice(0, 60)} msg=${input.messageId.slice(0, 60)} body=${truncate(body, 200)}`,
       );
     }
