@@ -3,7 +3,7 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
-## Unreleased
+## 0.12.0
 
 ### Added
 
