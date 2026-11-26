@@ -3,6 +3,12 @@
 Versions before 0.9.1 are described in the commit history and in the
 "since x.y.z" notes of `README.md`, `INTEGRATION.md` and `docs/`.
 
+## 0.12.1
+
+### Fixed
+
+- `provides:` now lists `microsoft365.graph@1`, the versioned ref of the `microsoft365.graph` service type. The Plugin Builder derives a generated agent's `requires:` from the provider's `provides:` major (byte5ai/omadia#1779); without this entry a builder draft reading Graph failed codegen ("declares no 'microsoft365.graph@<major>' under provides:"), and before that the installed agent failed to activate with `capability_not_declared`. Existing consumers (the Teams channel, the calendar tools) are unaffected: they keep reaching the service as before.
+
 ## 0.12.0
 
 ### Added
