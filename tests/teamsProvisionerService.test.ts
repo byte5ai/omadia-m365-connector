@@ -448,11 +448,19 @@ describe('manifest.yaml / package.json hub edits', () => {
     //          Connector host joins the egress allow-list.
     // 0.12.0 — `fetchChannelMessage` reads Teams channel messages through
     //          Graph (`GraphRequestError` on non-2xx).
-    assert.equal(pkg.version, '0.12.0');
+    // 0.12.1 — `microsoft365.graph@1` under `provides:` (byte5ai/omadia#1779).
+    assert.equal(pkg.version, '0.12.1');
     assert.ok(
       manifest.includes(`version: "${pkg.version}"`),
       'manifest.yaml must carry the same version as package.json',
     );
+  });
+
+  it('declares microsoft365.graph as a versioned capability (byte5ai/omadia#1779)', () => {
+    // The Plugin Builder writes `requires: ['microsoft365.graph@^1']` for a
+    // draft that reads Graph, with the major taken from this entry.
+    assert.ok(manifest.includes('service: "microsoft365.graph"'));
+    assert.ok(manifest.includes('- "microsoft365.graph@1"'));
   });
 
   it('declares the teamsProvisioner service type and capability', () => {

@@ -3,7 +3,7 @@ schema_version: "1"
 identity:
   id: "@omadia/integration-microsoft365"
   name: "Microsoft 365 Connector"
-  version: "0.12.0"
+  version: "0.12.1"
   kind: "integration"
   domain: "m365"
   description: "Gemeinsamer Microsoft-Graph-Layer (Bot-Framework App-Registration) für alle Microsoft-365-Konsumenten. Stellt den Kernel-Service 'microsoft365.graph' (Microsoft365Accessor) bereit — konsumiert vom Teams-Channel und den Kalender-Tools."
@@ -45,6 +45,11 @@ service_types:
 # the `teamsProvisioner` service above (two-constant split, see
 # src/teamsProvisioner/types.ts).
 provides:
+  # microsoft365.graph@1 (since 0.12.1) — the versioned ref of the
+  # `microsoft365.graph` service type above. The Plugin Builder derives a
+  # generated agent's `requires:` from it (byte5ai/omadia#1779); without it a
+  # draft that reads Graph could not declare the service at all.
+  - "microsoft365.graph@1"
   - "teamsProvisioner@1"
   # facilitation.followup@1 (epic byte5ai/omadia#2043) — free/busy, invitations
   # and protocol mail for native facilitators. Deliberately NOT listed under
